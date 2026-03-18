@@ -1,0 +1,42 @@
+name: Build
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+    branches: [main]
+
+permissions:
+  contents: read
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    strategy:
+      matrix:
+        include:
+          - goos: linux
+            goarch: amd64
+          - goos: linux
+            goarch: arm64
+    steps:
+      - uses: actions/checkout@v5
+
+      - uses: actions/setup-go@v6
+        with:
+          go-version-file: go.mod
+
+      - name: Build
+        env:
+          CGO_ENABLED: "0"
+          GOOS: ${{ matrix.goos }}
+          GOARCH: ${{ matrix.goarch }}
+        run: |
+          go build -trimpath -ldflags "-s -w -X main.version=${{ github.sha }}" \
+            -o ovn-route-agent-${{ matrix.goos }}-${{ matrix.goarch }} .
+
+      - uses: actions/upload-artifact@v6
+        with:
+          name: ovn-route-agent-${{ matrix.goos }}-${{ matrix.goarch }}
+          path: ovn-route-agent-${{ matrix.goos }}-${{ matrix.goarch }}
+          retention-days: 7

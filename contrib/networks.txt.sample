@@ -1,0 +1,5 @@
+# Networks to route via vrf-provider (one CIDR per line)
+# Lines starting with # and empty lines are ignored.
+192.0.2.0/24
+198.51.100.0/24
+203.0.113.0/24

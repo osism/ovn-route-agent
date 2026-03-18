@@ -1,0 +1,51 @@
+# ovn-route-agent configuration file
+#
+# Configuration priority (highest wins):
+#   CLI flags > environment variables > config file > defaults
+#
+# Usage:
+#   ovn-route-agent --config /etc/ovn-route-agent/config.yaml
+
+# OVN Southbound DB remote (required)
+# Comma-separated for clustered setups (failover).
+ovn_sb_remote: "tcp:10.10.0.1:6642,tcp:10.10.0.2:6642,tcp:10.10.0.3:6642"
+
+# OVN Northbound DB remote (required)
+ovn_nb_remote: "tcp:10.10.0.1:6641,tcp:10.10.0.2:6641,tcp:10.10.0.3:6641"
+
+# Provider bridge device for kernel routes (default: br-ex)
+# bridge_dev: "br-ex"
+
+# VRF name for FRR static routes (default: vrf-provider)
+# vrf_name: "vrf-provider"
+
+# Nexthop IP for FRR static routes in the VRF (default: 169.254.0.1)
+# veth_nexthop: "169.254.0.1"
+
+# Filter FIPs by CIDRs (default: empty = all)
+# Only manage NAT IPs within these networks.
+# Accepts a single string or a list of CIDRs.
+# network_cidr: "192.0.2.0/24"
+# network_cidr:
+#   - "192.0.2.0/24"
+#   - "198.51.100.0/24"
+
+# Chassisredirect port filter (default: empty = track all routers)
+# When empty, the agent automatically discovers all chassisredirect port bindings
+# and manages routes for all routers whose gateway is active on this chassis.
+# Set to a specific port name (e.g. "cr-lrp-abc123") to restrict the agent to
+# tracking only that one router.
+# gateway_port: "cr-lrp-abc123"
+
+# Full reconciliation interval (default: 60s)
+# reconcile_interval: "60s"
+
+# Log level: debug, info, warn, error (default: info)
+# log_level: "info"
+
+# Dry-run mode: connect and reconcile but only log what would be done (default: false)
+# dry_run: false
+
+# Remove all managed routes on shutdown (default: true)
+# Set to false to keep routes in place when the agent stops.
+# cleanup_on_shutdown: true

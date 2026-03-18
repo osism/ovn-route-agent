@@ -1,0 +1,31 @@
+[Unit]
+Description=OVN Route Agent — Real-time Floating IP route synchronization via OVN
+Documentation=https://github.com/osism/ovn-route-agent
+After=network-online.target ovn-controller.service frr.service
+Wants=network-online.target
+Requires=frr.service
+
+[Service]
+Type=simple
+ExecStart=/usr/local/bin/ovn-route-agent --config /etc/ovn-route-agent/config.yaml
+Restart=always
+RestartSec=5
+
+# Environment overrides (optional, takes precedence over config file)
+EnvironmentFile=-/etc/default/ovn-route-agent
+
+# Security hardening
+NoNewPrivileges=no
+ProtectSystem=false
+# Needs root for netlink route manipulation and vtysh access
+# Consider CAP_NET_ADMIN + CAP_NET_RAW if running as non-root
+#User=root
+#AmbientCapabilities=CAP_NET_ADMIN CAP_NET_RAW
+
+# Logging
+StandardOutput=journal
+StandardError=journal
+SyslogIdentifier=ovn-route-agent
+
+[Install]
+WantedBy=multi-user.target
