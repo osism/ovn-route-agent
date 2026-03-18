@@ -14,6 +14,7 @@ import (
 	"github.com/ovn-org/libovsdb/cache"
 	"github.com/ovn-org/libovsdb/client"
 	"github.com/ovn-org/libovsdb/model"
+	"github.com/ovn-org/libovsdb/ovsdb"
 )
 
 const eventDebounceInterval = 500 * time.Millisecond
@@ -89,31 +90,55 @@ type NBLogicalRouter struct {
 }
 
 type NBLogicalRouterPort struct {
-	UUID string `ovsdb:"_uuid"`
-	Name string `ovsdb:"name"`
+	UUID     string   `ovsdb:"_uuid"`
+	Name     string   `ovsdb:"name"`
+	Networks []string `ovsdb:"networks"`
+}
+
+type NBLogicalRouterStaticRoute struct {
+	UUID       string            `ovsdb:"_uuid"`
+	IPPrefix   string            `ovsdb:"ip_prefix"`
+	Nexthop    string            `ovsdb:"nexthop"`
+	OutputPort *string           `ovsdb:"output_port"`
+	Policy     *string           `ovsdb:"policy"`
+	Options    map[string]string `ovsdb:"options"`
+	ExternalIDs map[string]string `ovsdb:"external_ids"`
+}
+
+type NBStaticMACBinding struct {
+	UUID        string `ovsdb:"_uuid"`
+	LogicalPort string `ovsdb:"logical_port"`
+	IP          string `ovsdb:"ip"`
+	MAC         string `ovsdb:"mac"`
 }
 
 // =============================================================================
 // OVN Client wrapper
 // =============================================================================
 
-// ovsdbReadClient is a restricted interface for OVSDB clients that only
-// permits read operations. The agent must never modify the OVN databases.
-type ovsdbReadClient interface {
+// ovsdbClient is the interface for OVSDB clients.
+// The SB client is read-only; the NB client also performs writes
+// (static routes, MAC bindings).
+type ovsdbClient interface {
 	Connect(context.Context) error
 	Close()
 	Cache() *cache.TableCache
 	NewMonitor(...client.MonitorOption) *client.Monitor
 	Monitor(context.Context, *client.Monitor) (client.MonitorCookie, error)
 	List(ctx context.Context, result interface{}) error
+	Create(models ...model.Model) ([]ovsdb.Operation, error)
+	Where(models ...model.Model) client.ConditionalAPI
+	Transact(ctx context.Context, ops ...ovsdb.Operation) ([]ovsdb.OperationResult, error)
 }
 
 // LocalRouterInfo describes a logical router whose gateway is active on this chassis.
 type LocalRouterInfo struct {
-	RouterName string // NB Logical_Router name
-	RouterUUID string // NB Logical_Router UUID
-	LRPName    string // NB Logical_Router_Port name (e.g. "lrp-abc123")
-	CRPort     string // SB chassisredirect logical_port (e.g. "cr-lrp-abc123")
+	RouterName  string // NB Logical_Router name
+	RouterUUID  string // NB Logical_Router UUID
+	LRPName     string // NB Logical_Router_Port name (e.g. "lrp-abc123")
+	LRPUUID     string // NB Logical_Router_Port UUID
+	LRPNetworks []string // NB Logical_Router_Port networks (e.g. ["198.51.100.11/24"])
+	CRPort      string // SB chassisredirect logical_port (e.g. "cr-lrp-abc123")
 }
 
 type OVNState struct {
@@ -133,8 +158,8 @@ type OVNState struct {
 }
 
 type OVNClient struct {
-	sbClient ovsdbReadClient
-	nbClient ovsdbReadClient
+	sbClient ovsdbClient
+	nbClient ovsdbClient
 	state    *OVNState
 	cfg      Config
 	ctx      context.Context
@@ -241,6 +266,8 @@ func (o *OVNClient) Connect(ctx context.Context) error {
 		client.WithTable(&NBNAT{}),
 		client.WithTable(&NBLogicalRouter{}),
 		client.WithTable(&NBLogicalRouterPort{}),
+		client.WithTable(&NBLogicalRouterStaticRoute{}),
+		client.WithTable(&NBStaticMACBinding{}),
 	)
 	if _, err := o.nbClient.Monitor(ctx, nbMon); err != nil {
 		return fmt.Errorf("monitor NB: %w", err)
@@ -357,10 +384,10 @@ func (o *OVNClient) refreshState(ctx context.Context) {
 		return
 	}
 	lrpNameToUUID := make(map[string]string, len(lrps))
-	lrpUUIDToName := make(map[string]string, len(lrps))
+	lrpByUUID := make(map[string]NBLogicalRouterPort, len(lrps))
 	for _, lrp := range lrps {
 		lrpNameToUUID[lrp.Name] = lrp.UUID
-		lrpUUIDToName[lrp.UUID] = lrp.Name
+		lrpByUUID[lrp.UUID] = lrp
 	}
 
 	// Resolve local LRP names → UUIDs.
@@ -381,21 +408,24 @@ func (o *OVNClient) refreshState(ctx context.Context) {
 	localNATUUIDs := make(map[string]bool)
 	var localRouters []LocalRouterInfo
 	for _, router := range routers {
-		var matchedLRPName string
+		var matchedLRP *NBLogicalRouterPort
 		for _, portUUID := range router.Ports {
 			if localLRPUUIDs[portUUID] {
-				matchedLRPName = lrpUUIDToName[portUUID]
+				lrp := lrpByUUID[portUUID]
+				matchedLRP = &lrp
 				break
 			}
 		}
-		if matchedLRPName == "" {
+		if matchedLRP == nil {
 			continue
 		}
 		localRouters = append(localRouters, LocalRouterInfo{
-			RouterName: router.Name,
-			RouterUUID: router.UUID,
-			LRPName:    matchedLRPName,
-			CRPort:     localLRPNames[matchedLRPName],
+			RouterName:  router.Name,
+			RouterUUID:  router.UUID,
+			LRPName:     matchedLRP.Name,
+			LRPUUID:     matchedLRP.UUID,
+			LRPNetworks: matchedLRP.Networks,
+			CRPort:      localLRPNames[matchedLRP.Name],
 		})
 		for _, natUUID := range router.Nat {
 			localNATUUIDs[natUUID] = true
@@ -609,9 +639,11 @@ func sbDatabaseModel() (model.ClientDBModel, error) {
 
 func nbDatabaseModel() (model.ClientDBModel, error) {
 	return model.NewClientDBModel("OVN_Northbound", map[string]model.Model{
-		"NAT":                 &NBNAT{},
-		"Logical_Router":      &NBLogicalRouter{},
-		"Logical_Router_Port": &NBLogicalRouterPort{},
+		"NAT":                          &NBNAT{},
+		"Logical_Router":               &NBLogicalRouter{},
+		"Logical_Router_Port":          &NBLogicalRouterPort{},
+		"Logical_Router_Static_Route":  &NBLogicalRouterStaticRoute{},
+		"Static_MAC_Binding":           &NBStaticMACBinding{},
 	})
 }
 

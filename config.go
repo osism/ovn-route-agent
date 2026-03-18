@@ -64,6 +64,7 @@ type Config struct {
 	NetworkFilters    []*net.IPNet
 	GatewayPort       string
 	RouteTableID      int
+	BridgeIP          string // IP to add to br-ex for ARP resolution (default: 169.254.169.254)
 	OVSWrapper        string // e.g. "docker exec openvswitch_vswitchd" — prepended to ovs-vsctl/ovs-ofctl calls
 	ReconcileInterval time.Duration
 	LogLevel          string
@@ -81,6 +82,7 @@ type configFile struct {
 	NetworkCIDR       StringOrSlice `yaml:"network_cidr"`
 	GatewayPort       string        `yaml:"gateway_port"`
 	RouteTableID      *int          `yaml:"route_table_id"`
+	BridgeIP          string        `yaml:"bridge_ip"`
 	OVSWrapper        string        `yaml:"ovs_wrapper"`
 	ReconcileInterval string        `yaml:"reconcile_interval"`
 	LogLevel          string        `yaml:"log_level"`
@@ -104,6 +106,7 @@ func loadConfig(args []string) (Config, error) {
 		fCIDR       = fs.String("network-cidr", "", "Filter FIPs by CIDRs (comma-separated, e.g. 10.0.0.0/24,172.16.0.0/12), empty = all")
 		fGWPort     = fs.String("gateway-port", "", "Chassisredirect port filter; empty = track all routers automatically")
 		fTableID    = fs.Int("route-table-id", 0, "Routing table ID for FIP routes (1-252); 0 = main table")
+		fBridgeIP   = fs.String("bridge-ip", "", "IP to add to bridge device for ARP resolution (default: 169.254.169.254)")
 		fOVSWrapper = fs.String("ovs-wrapper", "", "Command prefix for ovs-vsctl/ovs-ofctl (e.g. 'docker exec openvswitch_vswitchd')")
 		fInterval   = fs.String("reconcile-interval", "", "Full reconciliation interval (e.g. 60s, 5m)")
 		fLogLevel          = fs.String("log-level", "", "Log level (debug, info, warn, error)")
@@ -124,6 +127,7 @@ func loadConfig(args []string) (Config, error) {
 		BridgeDev:         "br-ex",
 		VRFName:           "vrf-provider",
 		VethNexthop:       "169.254.0.1",
+		BridgeIP:          "169.254.169.254",
 		ReconcileInterval: 60 * time.Second,
 		LogLevel:          "info",
 		CleanupOnShutdown: true,
@@ -160,6 +164,8 @@ func loadConfig(args []string) (Config, error) {
 			cfg.GatewayPort = *fGWPort
 		case "route-table-id":
 			cfg.RouteTableID = *fTableID
+		case "bridge-ip":
+			cfg.BridgeIP = *fBridgeIP
 		case "ovs-wrapper":
 			cfg.OVSWrapper = *fOVSWrapper
 		case "reconcile-interval":
@@ -251,6 +257,9 @@ func applyFileConfig(cfg *Config, fc *configFile) {
 	if fc.GatewayPort != "" {
 		cfg.GatewayPort = fc.GatewayPort
 	}
+	if fc.BridgeIP != "" {
+		cfg.BridgeIP = fc.BridgeIP
+	}
 	if fc.OVSWrapper != "" {
 		cfg.OVSWrapper = fc.OVSWrapper
 	}
@@ -294,6 +303,9 @@ func applyEnvConfig(cfg *Config) {
 	}
 	if v := os.Getenv("OVN_ROUTE_GATEWAY_PORT"); v != "" {
 		cfg.GatewayPort = v
+	}
+	if v := os.Getenv("OVN_ROUTE_BRIDGE_IP"); v != "" {
+		cfg.BridgeIP = v
 	}
 	if v := os.Getenv("OVN_ROUTE_OVS_WRAPPER"); v != "" {
 		cfg.OVSWrapper = v

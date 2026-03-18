@@ -49,6 +49,11 @@ func (a *Agent) Run(ctx context.Context) error {
 		return fmt.Errorf("bridge device check failed: %w", err)
 	}
 
+	// Add a link-local IP to br-ex so the kernel can ARP on the interface.
+	if err := a.routing.EnsureBridgeIP(a.cfg.BridgeIP); err != nil {
+		return fmt.Errorf("ensure bridge IP: %w", err)
+	}
+
 	// Enable proxy ARP so the kernel responds to ARP requests for FIP addresses.
 	if err := a.routing.EnableProxyARP(); err != nil {
 		return fmt.Errorf("enable proxy ARP: %w", err)
@@ -132,6 +137,20 @@ func (a *Agent) reconcile() {
 		if err := a.routing.EnsureOVSFlows(); err != nil {
 			slog.Error("failed to ensure OVS flows", "error", err)
 		}
+
+		// Ensure OVN default routes and static MAC bindings for local routers.
+		bridgeMAC := a.routing.cachedBridgeMAC
+		if bridgeMAC == "" {
+			if mac, err := a.routing.GetBridgeMAC(); err == nil {
+				bridgeMAC = mac.String()
+			}
+		}
+		if bridgeMAC != "" {
+			if err := a.ovn.EnsureGatewayRouting(a.ovn.ctx, state.LocalRouters, bridgeMAC); err != nil {
+				slog.Error("failed to ensure gateway routing", "error", err)
+			}
+		}
+
 		a.ensureRoutes(desiredIPs)
 	} else {
 		a.removeAllRoutes("no locally active routers")

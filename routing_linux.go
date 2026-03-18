@@ -33,6 +33,45 @@ func (rm *RouteManager) CheckBridgeDevice() error {
 	return nil
 }
 
+// EnsureBridgeIP adds a /32 IP address to the bridge device if not already present.
+// This gives the kernel a source IP for ARP resolution on the bridge.
+func (rm *RouteManager) EnsureBridgeIP(ip string) error {
+	if rm.dryRun {
+		slog.Info("[dry-run] would add bridge IP", "ip", ip, "dev", rm.bridgeDev)
+		return nil
+	}
+	parsedIP := net.ParseIP(ip)
+	if parsedIP == nil {
+		return fmt.Errorf("invalid IP: %s", ip)
+	}
+
+	link, err := netlink.LinkByName(rm.bridgeDev)
+	if err != nil {
+		return fmt.Errorf("find bridge %s: %w", rm.bridgeDev, err)
+	}
+
+	addr := &netlink.Addr{
+		IPNet: &net.IPNet{IP: parsedIP, Mask: net.CIDRMask(32, 32)},
+	}
+
+	addrs, err := netlink.AddrList(link, netlink.FAMILY_V4)
+	if err != nil {
+		return fmt.Errorf("list addrs on %s: %w", rm.bridgeDev, err)
+	}
+	for _, a := range addrs {
+		if a.IP.Equal(parsedIP) {
+			slog.Debug("bridge IP already present", "ip", ip, "dev", rm.bridgeDev)
+			return nil
+		}
+	}
+
+	if err := netlink.AddrAdd(link, addr); err != nil {
+		return fmt.Errorf("add IP %s/32 to %s: %w", ip, rm.bridgeDev, err)
+	}
+	slog.Info("bridge IP added", "ip", ip, "dev", rm.bridgeDev)
+	return nil
+}
+
 // EnableProxyARP enables proxy ARP on the bridge device so the kernel responds
 // to ARP requests for any IP it has a route for on that interface.
 func (rm *RouteManager) EnableProxyARP() error {

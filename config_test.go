@@ -243,6 +243,9 @@ func TestLoadConfigDefaults(t *testing.T) {
 	if cfg.VethNexthop != "169.254.0.1" {
 		t.Errorf("VethNexthop = %q, want %q", cfg.VethNexthop, "169.254.0.1")
 	}
+	if cfg.BridgeIP != "169.254.169.254" {
+		t.Errorf("BridgeIP = %q, want %q", cfg.BridgeIP, "169.254.169.254")
+	}
 	if cfg.ReconcileInterval != 60*time.Second {
 		t.Errorf("ReconcileInterval = %v, want %v", cfg.ReconcileInterval, 60*time.Second)
 	}

@@ -73,8 +73,8 @@ func TestGetStateSnapshot(t *testing.T) {
 	c := NewOVNClient(Config{}, nil)
 	c.state.LocalChassisName = "node1"
 	c.state.LocalRouters = []LocalRouterInfo{
-		{RouterName: "router1", RouterUUID: "uuid1", LRPName: "lrp-abc", CRPort: "cr-lrp-abc"},
-		{RouterName: "router2", RouterUUID: "uuid2", LRPName: "lrp-def", CRPort: "cr-lrp-def"},
+		{RouterName: "router1", RouterUUID: "uuid1", LRPName: "lrp-abc", LRPUUID: "lrp-uuid1", LRPNetworks: []string{"10.0.0.1/24"}, CRPort: "cr-lrp-abc"},
+		{RouterName: "router2", RouterUUID: "uuid2", LRPName: "lrp-def", LRPUUID: "lrp-uuid2", LRPNetworks: []string{"172.16.0.1/16"}, CRPort: "cr-lrp-def"},
 	}
 	c.state.HasLocalRouters = true
 	c.state.FIPs = []string{"10.0.0.1", "10.0.0.2"}

@@ -30,6 +30,11 @@ ovn_nb_remote: "tcp:10.10.0.1:6641,tcp:10.10.0.2:6641,tcp:10.10.0.3:6641"
 #   - "192.0.2.0/24"
 #   - "198.51.100.0/24"
 
+# Link-local IP to add to the bridge device for kernel ARP resolution.
+# The kernel needs a source IP on br-ex to perform ARP. This IP is not
+# routable and can be the same on all nodes (br-ex has no physical NIC).
+# bridge_ip: "169.254.169.254"
+
 # Dedicated routing table ID for FIP routes (default: 0 = main table)
 # When set (1-252), routes are placed in a separate table and ip rules
 # are added to steer traffic. This avoids polluting the main routing table.

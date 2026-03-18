@@ -4,7 +4,7 @@ Event-driven Floating IP route synchronization agent for OVN-based OpenStack env
 
 ## How it works
 
-The agent operates **read-only** on the OVN level — it only monitors the OVN Southbound and Northbound databases and never modifies any OVN state. All write operations are limited to local kernel routes (netlink), IP rules, FRR static routes (vtysh), and OVS flows on the provider bridge.
+The agent monitors the OVN Southbound and Northbound databases and performs targeted writes to both OVN NB (default routes, static MAC bindings) and the local system (kernel routes, IP rules, FRR static routes, OVS flows on the provider bridge).
 
 1. **Connects** to OVN Southbound and Northbound databases via OVSDB IDL
 2. **Watches** for changes in real-time:
@@ -13,10 +13,12 @@ The agent operates **read-only** on the OVN level — it only monitors the OVN S
    - `NAT` table (NB) — detects Floating IP and SNAT assignments
    - `Logical_Router` / `Logical_Router_Port` tables (NB) — maps NAT entries to their owning routers
 3. **Sets up** the provider bridge at startup:
+   - Adds a **link-local IP** to the bridge device so the kernel can perform ARP resolution
    - Enables **proxy ARP** on the bridge device so the kernel responds to ARP requests for FIP addresses
-   - Installs **OVS MAC-tweak flows** that rewrite destination MACs on packets arriving from OVN's integration bridge, enabling proper kernel routing
-4. **Reacts** instantly to changes:
-   - For each router whose gateway is active on this chassis: ensures `/32` kernel routes (with IP rules when using a dedicated routing table) on the provider bridge and FRR static routes in the VRF for each FIP/SNAT IP
+4. **Reacts** instantly to changes — for each router whose gateway is active on this chassis:
+   - Ensures a **default route** (`0.0.0.0/0`) and **static MAC binding** in OVN NB so reply traffic exits the router correctly (no OpenStack gateway IP needed)
+   - Installs **OVS MAC-tweak flows** on the provider bridge
+   - Ensures `/32` **kernel routes** (with IP rules when using a dedicated routing table) and **FRR static routes** in the VRF for each FIP/SNAT IP
    - If no routers are locally active: removes all managed routes
 5. **Reconciles** periodically as a safety net (default: every 60s)
 6. **Cleans up** on shutdown (SIGINT/SIGTERM) — removes all managed routes and OVS flows before exiting (configurable via `cleanup_on_shutdown`)
@@ -94,6 +96,8 @@ CLI flags take precedence over values in the config file.
 | `--network-cidr` | `OVN_ROUTE_NETWORK_CIDR` | `network_cidr` | *(empty = all)* | Filter FIPs by CIDRs (comma-separated for CLI/env, list for YAML) |
 | `--gateway-port` | `OVN_ROUTE_GATEWAY_PORT` | `gateway_port` | *(empty = all)* | Chassisredirect port filter; empty = track all routers automatically |
 | `--route-table-id` | `OVN_ROUTE_ROUTE_TABLE_ID` | `route_table_id` | `0` | Routing table ID for FIP routes (1-252); 0 = main table |
+| `--bridge-ip` | `OVN_ROUTE_BRIDGE_IP` | `bridge_ip` | `169.254.169.254` | Link-local IP added to the bridge device for ARP resolution |
+| `--ovs-wrapper` | `OVN_ROUTE_OVS_WRAPPER` | `ovs_wrapper` | *(empty)* | Command prefix for containerized OVS (e.g. `docker exec openvswitch_vswitchd`) |
 | `--reconcile-interval` | `OVN_ROUTE_RECONCILE_INTERVAL` | `reconcile_interval` | `60s` | Full reconciliation interval |
 | `--log-level` | `OVN_ROUTE_LOG_LEVEL` | `log_level` | `info` | Log level (debug, info, warn, error) |
 | `--dry-run` | `OVN_ROUTE_DRY_RUN` | `dry_run` | `false` | Connect and reconcile but only log what would be done |
@@ -157,6 +161,18 @@ On failover (e.g. router-A moves from net-01 to net-02), the agent on net-01 rem
 
 To restrict the agent to a single router (legacy behavior), set `gateway_port` to a specific chassisredirect port name.
 
+## Gatewayless provider networks
+
+The agent supports OpenStack provider networks configured with `disable_gateway_ip: true`. In this setup there is no physical upstream gateway — all traffic is routed via BGP `/32` announcements.
+
+For each locally-active router, the agent automatically:
+
+1. Computes a **virtual gateway IP** (last usable IP in the subnet, e.g. `.254` for a `/24`)
+2. Creates a **default route** (`0.0.0.0/0 via <virtual-gw>`) on the OVN logical router
+3. Creates a **static MAC binding** mapping the virtual gateway IP to the local `br-ex` MAC
+
+This enables OVN to route reply traffic out the external port without requiring a real gateway. On failover, the MAC binding is automatically updated to point to the new node's `br-ex` MAC.
+
 ## Architecture
 
 ```
@@ -167,8 +183,10 @@ To restrict the agent to a single router (legacy behavior), set `gateway_port` t
   (Port_Binding,    │         │                │
    Chassis)         │    Event Handler         │
                     │         │                │
-  OVN NB DB ◄───────┤  OVSDB IDL Monitor       │
-  (NAT, LR, LRP)    │         │                │
+  OVN NB DB ◄──────►┤  OVSDB IDL Monitor +     │
+  (NAT, LR, LRP,    │  Gateway Route Writer    │
+   Static Routes,   │         │                │
+   MAC Bindings)    │         │                │
                     │    ┌────▼─────┐          │
                     │    │ Reconcile│          │
                     │    └────┬─────┘          │
