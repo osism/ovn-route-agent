@@ -4,7 +4,7 @@ Event-driven Floating IP route synchronization agent for OVN-based OpenStack env
 
 ## How it works
 
-The agent operates **read-only** on the OVN level — it only monitors the OVN Southbound and Northbound databases and never modifies any OVN state. All write operations are limited to local kernel routes (netlink) and FRR static routes (vtysh).
+The agent operates **read-only** on the OVN level — it only monitors the OVN Southbound and Northbound databases and never modifies any OVN state. All write operations are limited to local kernel routes (netlink), IP rules, FRR static routes (vtysh), and OVS flows on the provider bridge.
 
 1. **Connects** to OVN Southbound and Northbound databases via OVSDB IDL
 2. **Watches** for changes in real-time:
@@ -12,11 +12,14 @@ The agent operates **read-only** on the OVN level — it only monitors the OVN S
    - `Chassis` table (SB) — detects chassis membership changes
    - `NAT` table (NB) — detects Floating IP and SNAT assignments
    - `Logical_Router` / `Logical_Router_Port` tables (NB) — maps NAT entries to their owning routers
-3. **Reacts** instantly to changes:
-   - For each router whose gateway is active on this chassis: ensures `/32` kernel routes on the provider bridge and FRR static routes in the VRF for each FIP/SNAT IP
+3. **Sets up** the provider bridge at startup:
+   - Enables **proxy ARP** on the bridge device so the kernel responds to ARP requests for FIP addresses
+   - Installs **OVS MAC-tweak flows** that rewrite destination MACs on packets arriving from OVN's integration bridge, enabling proper kernel routing
+4. **Reacts** instantly to changes:
+   - For each router whose gateway is active on this chassis: ensures `/32` kernel routes (with IP rules when using a dedicated routing table) on the provider bridge and FRR static routes in the VRF for each FIP/SNAT IP
    - If no routers are locally active: removes all managed routes
-4. **Reconciles** periodically as a safety net (default: every 60s)
-5. **Cleans up** on shutdown (SIGINT/SIGTERM) — removes all managed routes before exiting (configurable via `cleanup_on_shutdown`)
+5. **Reconciles** periodically as a safety net (default: every 60s)
+6. **Cleans up** on shutdown (SIGINT/SIGTERM) — removes all managed routes and OVS flows before exiting (configurable via `cleanup_on_shutdown`)
 
 ## Building
 
@@ -90,6 +93,7 @@ CLI flags take precedence over values in the config file.
 | `--veth-nexthop` | `OVN_ROUTE_VETH_NEXTHOP` | `veth_nexthop` | `169.254.0.1` | Nexthop for FRR static routes |
 | `--network-cidr` | `OVN_ROUTE_NETWORK_CIDR` | `network_cidr` | *(empty = all)* | Filter FIPs by CIDRs (comma-separated for CLI/env, list for YAML) |
 | `--gateway-port` | `OVN_ROUTE_GATEWAY_PORT` | `gateway_port` | *(empty = all)* | Chassisredirect port filter; empty = track all routers automatically |
+| `--route-table-id` | `OVN_ROUTE_ROUTE_TABLE_ID` | `route_table_id` | `0` | Routing table ID for FIP routes (1-252); 0 = main table |
 | `--reconcile-interval` | `OVN_ROUTE_RECONCILE_INTERVAL` | `reconcile_interval` | `60s` | Full reconciliation interval |
 | `--log-level` | `OVN_ROUTE_LOG_LEVEL` | `log_level` | `info` | Log level (debug, info, warn, error) |
 | `--dry-run` | `OVN_ROUTE_DRY_RUN` | `dry_run` | `false` | Connect and reconcile but only log what would be done |
@@ -171,14 +175,14 @@ To restrict the agent to a single router (legacy behavior), set `gateway_port` t
                     │         │                │
                     │    ┌────▼─────┐          │
                     │    │ Routing  │          │
-                    │    └──┬───┬───┘          │
-                    └───────┼───┼──────────────┘
-                            │   │
-              ┌─────────────┘   └──────────────┐
-              ▼                                ▼
-    Kernel (netlink)                    FRR (vtysh)
-    ip route add/del                   ip route in VRF
-    on br-ex                           → BGP announcement
+                    │    └─┬──┬──┬──┘          │
+                    └──────┼──┼──┼─────────────┘
+                           │  │  │
+            ┌──────────────┘  │  └─────────────┐
+            ▼                 ▼                ▼
+  Kernel (netlink)     OVS (ovs-ofctl)   FRR (vtysh)
+  /32 routes + rules   MAC-tweak flows   ip route in VRF
+  proxy ARP on br-ex   on br-ex          → BGP announcement
 ```
 
 ## Origin

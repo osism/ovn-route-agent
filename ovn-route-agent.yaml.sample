@@ -30,6 +30,15 @@ ovn_nb_remote: "tcp:10.10.0.1:6641,tcp:10.10.0.2:6641,tcp:10.10.0.3:6641"
 #   - "192.0.2.0/24"
 #   - "198.51.100.0/24"
 
+# Dedicated routing table ID for FIP routes (default: 0 = main table)
+# When set (1-252), routes are placed in a separate table and ip rules
+# are added to steer traffic. This avoids polluting the main routing table.
+# route_table_id: 100
+
+# Command prefix for ovs-vsctl/ovs-ofctl when OVS runs in a container.
+# Set this if ovs-vsctl is not in PATH (e.g. containerized OVS in OSISM/Kolla).
+# ovs_wrapper: "docker exec openvswitch_vswitchd"
+
 # Chassisredirect port filter (default: empty = track all routers)
 # When empty, the agent automatically discovers all chassisredirect port bindings
 # and manages routes for all routers whose gateway is active on this chassis.

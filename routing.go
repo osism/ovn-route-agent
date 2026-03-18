@@ -11,19 +11,31 @@ import (
 
 // RouteManager handles kernel routes on the provider bridge and FRR static routes.
 type RouteManager struct {
-	bridgeDev   string
-	vrfName     string
-	vethNexthop string
-	dryRun      bool
+	bridgeDev    string
+	vrfName      string
+	vethNexthop  string
+	routeTableID int
+	ovsWrapper   []string // prefix args for ovs-vsctl/ovs-ofctl (e.g. ["docker", "exec", "openvswitch_vswitchd"])
+	dryRun       bool
+
+	// Cached OVS discovery results (populated on first use).
+	cachedPatchPort string
+	cachedOfport    string
+	cachedBridgeMAC string
 }
 
 func NewRouteManager(cfg Config) *RouteManager {
-	return &RouteManager{
-		bridgeDev:   cfg.BridgeDev,
-		vrfName:     cfg.VRFName,
-		vethNexthop: cfg.VethNexthop,
-		dryRun:      cfg.DryRun,
+	rm := &RouteManager{
+		bridgeDev:    cfg.BridgeDev,
+		vrfName:      cfg.VRFName,
+		vethNexthop:  cfg.VethNexthop,
+		routeTableID: cfg.RouteTableID,
+		dryRun:       cfg.DryRun,
 	}
+	if cfg.OVSWrapper != "" {
+		rm.ovsWrapper = strings.Fields(cfg.OVSWrapper)
+	}
+	return rm
 }
 
 // validateIP checks that the given string is a valid IPv4 address.

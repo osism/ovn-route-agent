@@ -498,6 +498,31 @@ func TestValidateConfig(t *testing.T) {
 			Config{VethNexthop: "169.254.0.1", VRFName: "vrf-provider", NetworkCIDRs: []string{"10.0.0.0/24", "bad"}},
 			true,
 		},
+		{
+			"valid route table ID",
+			Config{VethNexthop: "169.254.0.1", VRFName: "vrf-provider", RouteTableID: 100},
+			false,
+		},
+		{
+			"route table ID zero (main table)",
+			Config{VethNexthop: "169.254.0.1", VRFName: "vrf-provider", RouteTableID: 0},
+			false,
+		},
+		{
+			"route table ID max",
+			Config{VethNexthop: "169.254.0.1", VRFName: "vrf-provider", RouteTableID: 252},
+			false,
+		},
+		{
+			"route table ID too high",
+			Config{VethNexthop: "169.254.0.1", VRFName: "vrf-provider", RouteTableID: 253},
+			true,
+		},
+		{
+			"route table ID negative",
+			Config{VethNexthop: "169.254.0.1", VRFName: "vrf-provider", RouteTableID: -1},
+			true,
+		},
 	}
 
 	for _, tt := range tests {
@@ -507,6 +532,33 @@ func TestValidateConfig(t *testing.T) {
 				t.Errorf("validateConfig() error = %v, wantErr %v", err, tt.wantErr)
 			}
 		})
+	}
+}
+
+func TestLoadConfigRouteTableIDCLI(t *testing.T) {
+	cfg, err := loadConfig([]string{"--route-table-id", "100"})
+	if err != nil {
+		t.Fatalf("loadConfig() error: %v", err)
+	}
+	if cfg.RouteTableID != 100 {
+		t.Errorf("RouteTableID = %d, want 100", cfg.RouteTableID)
+	}
+}
+
+func TestLoadConfigRouteTableIDInvalid(t *testing.T) {
+	_, err := loadConfig([]string{"--route-table-id", "253"})
+	if err == nil {
+		t.Error("expected error for route-table-id 253")
+	}
+}
+
+func TestApplyEnvConfigRouteTableID(t *testing.T) {
+	cfg := Config{}
+	t.Setenv("OVN_ROUTE_ROUTE_TABLE_ID", "42")
+	applyEnvConfig(&cfg)
+
+	if cfg.RouteTableID != 42 {
+		t.Errorf("RouteTableID = %d, want 42", cfg.RouteTableID)
 	}
 }
 

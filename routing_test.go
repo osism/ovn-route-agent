@@ -44,8 +44,40 @@ func TestNewRouteManager(t *testing.T) {
 	if rm.vethNexthop != "169.254.0.1" {
 		t.Errorf("vethNexthop = %q, want %q", rm.vethNexthop, "169.254.0.1")
 	}
+	if rm.routeTableID != 0 {
+		t.Errorf("routeTableID = %d, want 0", rm.routeTableID)
+	}
 	if rm.dryRun {
 		t.Error("dryRun should be false by default")
+	}
+}
+
+func TestNewRouteManagerWithTableID(t *testing.T) {
+	cfg := Config{
+		BridgeDev:    "br-ex",
+		VRFName:      "vrf-provider",
+		VethNexthop:  "169.254.0.1",
+		RouteTableID: 100,
+	}
+
+	rm := NewRouteManager(cfg)
+
+	if rm.routeTableID != 100 {
+		t.Errorf("routeTableID = %d, want 100", rm.routeTableID)
+	}
+}
+
+func TestDryRunOVSFlows(t *testing.T) {
+	rm := &RouteManager{
+		bridgeDev: "br-ex",
+		dryRun:    true,
+	}
+
+	if err := rm.EnsureOVSFlows(); err != nil {
+		t.Errorf("EnsureOVSFlows() in dry-run should not error, got: %v", err)
+	}
+	if err := rm.RemoveOVSFlows(); err != nil {
+		t.Errorf("RemoveOVSFlows() in dry-run should not error, got: %v", err)
 	}
 }
 

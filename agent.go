@@ -49,6 +49,11 @@ func (a *Agent) Run(ctx context.Context) error {
 		return fmt.Errorf("bridge device check failed: %w", err)
 	}
 
+	// Enable proxy ARP so the kernel responds to ARP requests for FIP addresses.
+	if err := a.routing.EnableProxyARP(); err != nil {
+		return fmt.Errorf("enable proxy ARP: %w", err)
+	}
+
 	if a.cfg.GatewayPort == "" {
 		slog.Info("tracking all chassisredirect ports (multi-router mode)")
 	} else {
@@ -123,6 +128,10 @@ func (a *Agent) reconcile() {
 	)
 
 	if state.HasLocalRouters {
+		// Ensure OVS MAC-tweak flows are in place (only when active).
+		if err := a.routing.EnsureOVSFlows(); err != nil {
+			slog.Error("failed to ensure OVS flows", "error", err)
+		}
 		a.ensureRoutes(desiredIPs)
 	} else {
 		a.removeAllRoutes("no locally active routers")
@@ -238,9 +247,16 @@ func (a *Agent) removeAllRoutes(reason string) {
 	}
 }
 
-// cleanup removes all managed routes on shutdown.
+// cleanup removes all managed routes and OVS flows on shutdown.
 func (a *Agent) cleanup() {
 	a.removeAllRoutes("shutdown cleanup")
+
+	if err := a.routing.RemoveOVSFlows(); err != nil {
+		slog.Error("failed to remove OVS flows", "error", err)
+	}
+	if err := a.routing.CleanupRoutingTable(); err != nil {
+		slog.Error("failed to flush routing table", "error", err)
+	}
 }
 
 // isManaged returns true if the IP is within any of the managed network CIDRs.

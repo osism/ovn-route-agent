@@ -63,6 +63,8 @@ type Config struct {
 	NetworkCIDRs      []string
 	NetworkFilters    []*net.IPNet
 	GatewayPort       string
+	RouteTableID      int
+	OVSWrapper        string // e.g. "docker exec openvswitch_vswitchd" — prepended to ovs-vsctl/ovs-ofctl calls
 	ReconcileInterval time.Duration
 	LogLevel          string
 	DryRun            bool
@@ -78,6 +80,8 @@ type configFile struct {
 	VethNexthop       string        `yaml:"veth_nexthop"`
 	NetworkCIDR       StringOrSlice `yaml:"network_cidr"`
 	GatewayPort       string        `yaml:"gateway_port"`
+	RouteTableID      *int          `yaml:"route_table_id"`
+	OVSWrapper        string        `yaml:"ovs_wrapper"`
 	ReconcileInterval string        `yaml:"reconcile_interval"`
 	LogLevel          string        `yaml:"log_level"`
 	DryRun            *bool         `yaml:"dry_run"`
@@ -99,6 +103,8 @@ func loadConfig(args []string) (Config, error) {
 		fNexthop    = fs.String("veth-nexthop", "", "Nexthop IP for FRR static routes in the VRF")
 		fCIDR       = fs.String("network-cidr", "", "Filter FIPs by CIDRs (comma-separated, e.g. 10.0.0.0/24,172.16.0.0/12), empty = all")
 		fGWPort     = fs.String("gateway-port", "", "Chassisredirect port filter; empty = track all routers automatically")
+		fTableID    = fs.Int("route-table-id", 0, "Routing table ID for FIP routes (1-252); 0 = main table")
+		fOVSWrapper = fs.String("ovs-wrapper", "", "Command prefix for ovs-vsctl/ovs-ofctl (e.g. 'docker exec openvswitch_vswitchd')")
 		fInterval   = fs.String("reconcile-interval", "", "Full reconciliation interval (e.g. 60s, 5m)")
 		fLogLevel          = fs.String("log-level", "", "Log level (debug, info, warn, error)")
 		fDryRun            = fs.Bool("dry-run", false, "Dry-run mode: connect and reconcile but only log what would be done")
@@ -152,6 +158,10 @@ func loadConfig(args []string) (Config, error) {
 			cfg.NetworkCIDRs = splitAndTrim(*fCIDR, ",")
 		case "gateway-port":
 			cfg.GatewayPort = *fGWPort
+		case "route-table-id":
+			cfg.RouteTableID = *fTableID
+		case "ovs-wrapper":
+			cfg.OVSWrapper = *fOVSWrapper
 		case "reconcile-interval":
 			if d, err := time.ParseDuration(*fInterval); err == nil {
 				cfg.ReconcileInterval = d
@@ -179,6 +189,9 @@ func validateConfig(cfg *Config) error {
 	}
 	if cfg.VRFName != "" && !isValidIdentifier(cfg.VRFName) {
 		return fmt.Errorf("invalid vrf-name: %q (only alphanumeric, hyphen, underscore, dot allowed)", cfg.VRFName)
+	}
+	if cfg.RouteTableID < 0 || cfg.RouteTableID > 252 {
+		return fmt.Errorf("invalid route-table-id: %d (must be 0-252)", cfg.RouteTableID)
 	}
 	if len(cfg.NetworkCIDRs) > 0 {
 		cfg.NetworkFilters = make([]*net.IPNet, 0, len(cfg.NetworkCIDRs))
@@ -238,6 +251,12 @@ func applyFileConfig(cfg *Config, fc *configFile) {
 	if fc.GatewayPort != "" {
 		cfg.GatewayPort = fc.GatewayPort
 	}
+	if fc.OVSWrapper != "" {
+		cfg.OVSWrapper = fc.OVSWrapper
+	}
+	if fc.RouteTableID != nil {
+		cfg.RouteTableID = *fc.RouteTableID
+	}
 	if fc.ReconcileInterval != "" {
 		if d, err := time.ParseDuration(fc.ReconcileInterval); err == nil {
 			cfg.ReconcileInterval = d
@@ -275,6 +294,15 @@ func applyEnvConfig(cfg *Config) {
 	}
 	if v := os.Getenv("OVN_ROUTE_GATEWAY_PORT"); v != "" {
 		cfg.GatewayPort = v
+	}
+	if v := os.Getenv("OVN_ROUTE_OVS_WRAPPER"); v != "" {
+		cfg.OVSWrapper = v
+	}
+	if v := os.Getenv("OVN_ROUTE_ROUTE_TABLE_ID"); v != "" {
+		var id int
+		if _, err := fmt.Sscanf(v, "%d", &id); err == nil {
+			cfg.RouteTableID = id
+		}
 	}
 	if v := os.Getenv("OVN_ROUTE_RECONCILE_INTERVAL"); v != "" {
 		if d, err := time.ParseDuration(v); err == nil {

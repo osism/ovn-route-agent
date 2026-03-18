@@ -46,6 +46,8 @@ func main() {
 		"veth_nexthop", cfg.VethNexthop,
 		"network_cidrs", cfg.NetworkCIDRs,
 		"gateway_port", cfg.GatewayPort,
+		"route_table_id", cfg.RouteTableID,
+		"ovs_wrapper", cfg.OVSWrapper,
 		"reconcile_interval", cfg.ReconcileInterval,
 	)
 

@@ -80,11 +80,12 @@ type NBNAT struct {
 }
 
 type NBLogicalRouter struct {
-	UUID        string            `ovsdb:"_uuid"`
-	Name        string            `ovsdb:"name"`
-	Ports       []string          `ovsdb:"ports"`
-	Nat         []string          `ovsdb:"nat"`
-	ExternalIDs map[string]string `ovsdb:"external_ids"`
+	UUID         string            `ovsdb:"_uuid"`
+	Name         string            `ovsdb:"name"`
+	Ports        []string          `ovsdb:"ports"`
+	Nat          []string          `ovsdb:"nat"`
+	StaticRoutes []string          `ovsdb:"static_routes"`
+	ExternalIDs  map[string]string `ovsdb:"external_ids"`
 }
 
 type NBLogicalRouterPort struct {
@@ -139,6 +140,11 @@ type OVNClient struct {
 	ctx      context.Context
 
 	onChange func() // callback when state changes
+
+	// ready is set to true after Connect() completes initial setup.
+	// Event handlers check this to avoid calling refreshState before
+	// both databases are connected and monitored.
+	ready bool
 
 	// Debounce timers for event-triggered refreshes
 	debounceMu     sync.Mutex
@@ -239,6 +245,9 @@ func (o *OVNClient) Connect(ctx context.Context) error {
 	if _, err := o.nbClient.Monitor(ctx, nbMon); err != nil {
 		return fmt.Errorf("monitor NB: %w", err)
 	}
+
+	// Mark as ready so event handlers can now trigger refreshes.
+	o.ready = true
 
 	// Initial state refresh
 	o.refreshState(ctx)
@@ -446,6 +455,9 @@ func (o *OVNClient) refreshState(ctx context.Context) {
 // Unlike a resetting debounce, this does not extend the delay when new events
 // arrive — it fires at most eventDebounceInterval after the first event.
 func (o *OVNClient) debounceStateRefresh() {
+	if !o.ready {
+		return // not fully connected yet
+	}
 	o.debounceMu.Lock()
 	defer o.debounceMu.Unlock()
 	if o.stateTimer != nil {
@@ -466,6 +478,9 @@ func (o *OVNClient) debounceStateRefresh() {
 // immediateStateRefresh bypasses debouncing for chassisredirect changes
 // to minimise failover reaction time.
 func (o *OVNClient) immediateStateRefresh() {
+	if !o.ready {
+		return // not fully connected yet
+	}
 	o.debounceMu.Lock()
 	if o.stateTimer != nil {
 		o.stateTimer.Stop()
