@@ -1,6 +1,7 @@
 package main
 
 import (
+	"net"
 	"reflect"
 	"testing"
 )
@@ -124,6 +125,57 @@ func TestGetStateSnapshotNoLocalRouters(t *testing.T) {
 	}
 	if len(snap.LocalRouters) != 0 {
 		t.Errorf("LocalRouters length = %d, want 0", len(snap.LocalRouters))
+	}
+}
+
+func TestUniqueNetworks(t *testing.T) {
+	_, net1, _ := net.ParseCIDR("10.0.0.0/24")
+	_, net2, _ := net.ParseCIDR("172.16.0.0/16")
+	_, net1dup, _ := net.ParseCIDR("10.0.0.0/24")
+
+	tests := []struct {
+		name  string
+		input []*net.IPNet
+		want  []string
+	}{
+		{"nil", nil, []string{}},
+		{"empty", []*net.IPNet{}, []string{}},
+		{"single", []*net.IPNet{net1}, []string{"10.0.0.0/24"}},
+		{"dedup", []*net.IPNet{net1, net2, net1dup}, []string{"10.0.0.0/24", "172.16.0.0/16"}},
+		{"sorted", []*net.IPNet{net2, net1}, []string{"10.0.0.0/24", "172.16.0.0/16"}},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			got := uniqueNetworks(tt.input)
+			gotStrs := make([]string, 0, len(got))
+			for _, n := range got {
+				gotStrs = append(gotStrs, n.String())
+			}
+			if !reflect.DeepEqual(gotStrs, tt.want) {
+				t.Errorf("uniqueNetworks() = %v, want %v", gotStrs, tt.want)
+			}
+		})
+	}
+}
+
+func TestGetStateIncludesDiscoveredNetworks(t *testing.T) {
+	_, net1, _ := net.ParseCIDR("198.51.100.0/24")
+	c := NewOVNClient(Config{}, nil)
+	c.state.DiscoveredNetworks = []*net.IPNet{net1}
+
+	snap := c.GetState()
+	if len(snap.DiscoveredNetworks) != 1 {
+		t.Fatalf("DiscoveredNetworks length = %d, want 1", len(snap.DiscoveredNetworks))
+	}
+	if snap.DiscoveredNetworks[0].String() != "198.51.100.0/24" {
+		t.Errorf("DiscoveredNetworks[0] = %q, want %q", snap.DiscoveredNetworks[0], "198.51.100.0/24")
+	}
+
+	// Verify snapshot is a copy.
+	snap.DiscoveredNetworks[0] = nil
+	if c.state.DiscoveredNetworks[0] == nil {
+		t.Error("GetState should return a copy of DiscoveredNetworks")
 	}
 }
 

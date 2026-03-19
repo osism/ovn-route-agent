@@ -196,6 +196,51 @@ func TestDisabledVethLeak(t *testing.T) {
 	}
 }
 
+func TestNewRouteManagerFRRPrefixList(t *testing.T) {
+	cfg := Config{
+		BridgeDev:     "br-ex",
+		VRFName:       "vrf-provider",
+		VethNexthop:   "169.254.0.1",
+		FRRPrefixList: "ANNOUNCED-NETWORKS",
+	}
+	rm := NewRouteManager(cfg)
+	if rm.frrPrefixList != "ANNOUNCED-NETWORKS" {
+		t.Errorf("frrPrefixList = %q, want %q", rm.frrPrefixList, "ANNOUNCED-NETWORKS")
+	}
+}
+
+func TestReconcileFRRPrefixListDisabled(t *testing.T) {
+	rm := &RouteManager{frrPrefixList: ""}
+	_, cidr, _ := net.ParseCIDR("10.0.0.0/24")
+	if err := rm.ReconcileFRRPrefixList([]*net.IPNet{cidr}); err != nil {
+		t.Errorf("ReconcileFRRPrefixList() with empty name should be no-op, got: %v", err)
+	}
+}
+
+func TestReconcileFRRPrefixListDryRun(t *testing.T) {
+	rm := &RouteManager{frrPrefixList: "ANNOUNCED-NETWORKS", dryRun: true}
+	_, cidr, _ := net.ParseCIDR("10.0.0.0/24")
+	if err := rm.ReconcileFRRPrefixList([]*net.IPNet{cidr}); err != nil {
+		t.Errorf("ReconcileFRRPrefixList() in dry-run should not error, got: %v", err)
+	}
+}
+
+func TestReconcileVethLeakNetworksDisabled(t *testing.T) {
+	rm := &RouteManager{vethLeakEnabled: false}
+	_, cidr, _ := net.ParseCIDR("10.0.0.0/24")
+	if err := rm.ReconcileVethLeakNetworks([]*net.IPNet{cidr}); err != nil {
+		t.Errorf("ReconcileVethLeakNetworks() when disabled should be no-op, got: %v", err)
+	}
+}
+
+func TestReconcileVethLeakNetworksDryRun(t *testing.T) {
+	rm := &RouteManager{vethLeakEnabled: true, dryRun: true}
+	_, cidr, _ := net.ParseCIDR("10.0.0.0/24")
+	if err := rm.ReconcileVethLeakNetworks([]*net.IPNet{cidr}); err != nil {
+		t.Errorf("ReconcileVethLeakNetworks() in dry-run should not error, got: %v", err)
+	}
+}
+
 func TestValidateIP(t *testing.T) {
 	tests := []struct {
 		ip      string

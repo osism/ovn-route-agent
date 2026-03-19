@@ -67,6 +67,17 @@ func (rm *RouteManager) CleanupRoutingTable() error {
 	return fmt.Errorf("routing table management is only supported on Linux")
 }
 
+func (rm *RouteManager) ReconcileVethLeakNetworks(desired []*net.IPNet) error {
+	if !rm.vethLeakEnabled {
+		return nil
+	}
+	if rm.dryRun {
+		slog.Info("[dry-run] would reconcile veth leak networks", "desired", len(desired))
+		return nil
+	}
+	return fmt.Errorf("veth VRF leak is only supported on Linux")
+}
+
 func (rm *RouteManager) SetupVethLeak() error {
 	if !rm.vethLeakEnabled {
 		return nil

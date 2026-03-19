@@ -6,6 +6,7 @@ import (
 	"log/slog"
 	"net"
 	"os"
+	"sort"
 	"strings"
 	"sync"
 	"time"
@@ -155,6 +156,9 @@ type OVNState struct {
 	// NAT entries from NB, filtered to only locally-active routers.
 	FIPs    []string // dnat_and_snat external IPs
 	SNATIPs []string // snat external IPs
+
+	// Networks auto-discovered from Logical_Router_Port.Networks of locally-active routers.
+	DiscoveredNetworks []*net.IPNet
 }
 
 type OVNClient struct {
@@ -318,12 +322,15 @@ func (o *OVNClient) GetState() OVNState {
 	defer o.state.mu.RUnlock()
 	localRouters := make([]LocalRouterInfo, len(o.state.LocalRouters))
 	copy(localRouters, o.state.LocalRouters)
+	discoveredNets := make([]*net.IPNet, len(o.state.DiscoveredNetworks))
+	copy(discoveredNets, o.state.DiscoveredNetworks)
 	return OVNState{
-		LocalChassisName: o.state.LocalChassisName,
-		LocalRouters:     localRouters,
-		HasLocalRouters:  o.state.HasLocalRouters,
-		FIPs:             append([]string{}, o.state.FIPs...),
-		SNATIPs:          append([]string{}, o.state.SNATIPs...),
+		LocalChassisName:   o.state.LocalChassisName,
+		LocalRouters:       localRouters,
+		HasLocalRouters:    o.state.HasLocalRouters,
+		FIPs:               append([]string{}, o.state.FIPs...),
+		SNATIPs:            append([]string{}, o.state.SNATIPs...),
+		DiscoveredNetworks: discoveredNets,
 	}
 }
 
@@ -432,7 +439,24 @@ func (o *OVNClient) refreshState(ctx context.Context) {
 		}
 	}
 
-	// Step 4: Filter NAT entries to only those belonging to locally-active routers.
+	// Step 4: Extract network CIDRs from locally-active LRPs.
+	var discoveredNets []*net.IPNet
+	for _, lr := range localRouters {
+		for _, ns := range lr.LRPNetworks {
+			_, cidr, err := net.ParseCIDR(ns)
+			if err != nil {
+				slog.Warn("failed to parse LRP network", "network", ns, "router", lr.RouterName, "error", err)
+				continue
+			}
+			discoveredNets = append(discoveredNets, cidr)
+		}
+	}
+	discoveredNets = uniqueNetworks(discoveredNets)
+
+	// Determine effective network filters: manual config takes precedence over auto-discovery.
+	effectiveFilters := effectiveNetworkFilters(o.cfg.NetworkFilters, discoveredNets)
+
+	// Step 5: Filter NAT entries to only those belonging to locally-active routers.
 	var nats []NBNAT
 	if err := o.nbClient.List(ctx, &nats); err != nil {
 		slog.Error("failed to list NAT entries", "error", err)
@@ -445,9 +469,9 @@ func (o *OVNClient) refreshState(ctx context.Context) {
 			continue
 		}
 		ip := nat.ExternalIP
-		if len(o.cfg.NetworkFilters) > 0 {
+		if len(effectiveFilters) > 0 {
 			parsedIP := net.ParseIP(ip)
-			if parsedIP == nil || !containedInAny(parsedIP, o.cfg.NetworkFilters) {
+			if parsedIP == nil || !containedInAny(parsedIP, effectiveFilters) {
 				continue
 			}
 		}
@@ -459,18 +483,20 @@ func (o *OVNClient) refreshState(ctx context.Context) {
 		}
 	}
 
-	// Step 5: Update state atomically.
+	// Step 6: Update state atomically.
 	o.state.mu.Lock()
 	o.state.LocalRouters = localRouters
 	o.state.HasLocalRouters = len(localRouters) > 0
 	o.state.FIPs = fips
 	o.state.SNATIPs = snatIPs
+	o.state.DiscoveredNetworks = discoveredNets
 	o.state.mu.Unlock()
 
 	slog.Info("state updated",
 		"local_routers", len(localRouters),
 		"fips", len(fips),
 		"snat_ips", len(snatIPs),
+		"discovered_networks", len(discoveredNets),
 	)
 	for _, lr := range localRouters {
 		slog.Debug("locally active router",
@@ -657,6 +683,23 @@ func ovsdbEndpoints(remote string) []string {
 		}
 	}
 	return endpoints
+}
+
+// uniqueNetworks deduplicates and sorts a list of *net.IPNet by string representation.
+func uniqueNetworks(nets []*net.IPNet) []*net.IPNet {
+	seen := make(map[string]bool, len(nets))
+	var result []*net.IPNet
+	for _, n := range nets {
+		key := n.String()
+		if !seen[key] {
+			seen[key] = true
+			result = append(result, n)
+		}
+	}
+	sort.Slice(result, func(i, j int) bool {
+		return result[i].String() < result[j].String()
+	})
+	return result
 }
 
 func getHostname() (string, error) {

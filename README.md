@@ -11,7 +11,7 @@ The agent monitors the OVN Southbound and Northbound databases and performs targ
    - `Port_Binding` table (SB) — detects gateway chassis failover
    - `Chassis` table (SB) — detects chassis membership changes
    - `NAT` table (NB) — detects Floating IP and SNAT assignments
-   - `Logical_Router` / `Logical_Router_Port` tables (NB) — maps NAT entries to their owning routers
+   - `Logical_Router` / `Logical_Router_Port` tables (NB) — maps NAT entries to their owning routers and auto-discovers provider network CIDRs from `Logical_Router_Port.Networks`
 3. **Sets up** the provider bridge at startup:
    - Adds a **link-local IP** to the bridge device so the kernel can perform ARP resolution
    - Enables **proxy ARP** on the bridge device so the kernel responds to ARP requests for FIP addresses
@@ -19,6 +19,7 @@ The agent monitors the OVN Southbound and Northbound databases and performs targ
    - Ensures a **default route** (`0.0.0.0/0`) and **static MAC binding** in OVN NB so reply traffic exits the router correctly (no OpenStack gateway IP needed)
    - Installs **OVS MAC-tweak flows** on the provider bridge
    - Ensures `/32` **kernel routes** (with IP rules when using a dedicated routing table) and **FRR static routes** in the VRF for each FIP/SNAT IP
+   - If configured, reconciles the **FRR prefix-list** with `permit <network> ge 32 le 32` entries for each discovered provider network
    - If no routers are locally active: removes all managed routes
 5. **Reconciles** periodically as a safety net (default: every 60s)
 6. **Cleans up** on shutdown (SIGINT/SIGTERM) — removes all managed routes and OVS flows before exiting (configurable via `cleanup_on_shutdown`)
@@ -70,9 +71,11 @@ Config file `/etc/ovn-route-agent/config.yaml` with the base settings:
 ```yaml
 ovn_sb_remote: "tcp:10.10.0.1:6642,tcp:10.10.0.2:6642,tcp:10.10.0.3:6642"
 ovn_nb_remote: "tcp:10.10.0.1:6641,tcp:10.10.0.2:6641,tcp:10.10.0.3:6641"
-network_cidr:
-  - "192.0.2.0/24"
-  - "198.51.100.0/24"
+
+# Optional: provider networks are auto-discovered from OVN when omitted
+# network_cidr:
+#   - "192.0.2.0/24"
+#   - "198.51.100.0/24"
 ```
 
 Run with the config file, overriding log level and enabling dry-run via CLI flags:
@@ -93,7 +96,7 @@ CLI flags take precedence over values in the config file.
 | `--bridge-dev` | `OVN_ROUTE_BRIDGE_DEV` | `bridge_dev` | `br-ex` | Provider bridge device |
 | `--vrf-name` | `OVN_ROUTE_VRF_NAME` | `vrf_name` | `vrf-provider` | VRF name for FRR routes |
 | `--veth-nexthop` | `OVN_ROUTE_VETH_NEXTHOP` | `veth_nexthop` | `169.254.0.1` | Nexthop for FRR static routes |
-| `--network-cidr` | `OVN_ROUTE_NETWORK_CIDR` | `network_cidr` | *(empty = all)* | Filter FIPs by CIDRs (comma-separated for CLI/env, list for YAML) |
+| `--network-cidr` | `OVN_ROUTE_NETWORK_CIDR` | `network_cidr` | *(empty = auto-discover)* | Filter FIPs by CIDRs; when empty, networks are auto-discovered from OVN `Logical_Router_Port.Networks` |
 | `--gateway-port` | `OVN_ROUTE_GATEWAY_PORT` | `gateway_port` | *(empty = all)* | Chassisredirect port filter; empty = track all routers automatically |
 | `--route-table-id` | `OVN_ROUTE_ROUTE_TABLE_ID` | `route_table_id` | `0` | Routing table ID for FIP routes (1-252); 0 = main table |
 | `--bridge-ip` | `OVN_ROUTE_BRIDGE_IP` | `bridge_ip` | `169.254.169.254` | Link-local IP added to the bridge device for ARP resolution |
@@ -102,7 +105,8 @@ CLI flags take precedence over values in the config file.
 | `--log-level` | `OVN_ROUTE_LOG_LEVEL` | `log_level` | `info` | Log level (debug, info, warn, error) |
 | `--dry-run` | `OVN_ROUTE_DRY_RUN` | `dry_run` | `false` | Connect and reconcile but only log what would be done |
 | `--cleanup-on-shutdown` | `OVN_ROUTE_CLEANUP_ON_SHUTDOWN` | `cleanup_on_shutdown` | `true` | Remove all managed routes on shutdown; set to `false` to keep routes in place |
-| `--veth-leak-enabled` | `OVN_ROUTE_VETH_LEAK_ENABLED` | `veth_leak_enabled` | `true` | Enable automatic veth VRF route leaking (requires `network_cidr`) |
+| `--frr-prefix-list` | `OVN_ROUTE_FRR_PREFIX_LIST` | `frr_prefix_list` | `ANNOUNCED-NETWORKS` | FRR prefix-list name to manage dynamically; adds `permit <network> ge 32 le 32` entries for each discovered provider network (set to empty string to disable) |
+| `--veth-leak-enabled` | `OVN_ROUTE_VETH_LEAK_ENABLED` | `veth_leak_enabled` | `true` | Enable automatic veth VRF route leaking |
 | `--veth-provider-ip` | `OVN_ROUTE_VETH_PROVIDER_IP` | `veth_provider_ip` | *(nexthop+1)* | IP of the veth-provider side (auto-computed from `veth_nexthop` + 1) |
 | `--veth-leak-table-id` | `OVN_ROUTE_VETH_LEAK_TABLE_ID` | `veth_leak_table_id` | `200` | Routing table for the leak default route (1-252, must differ from `route_table_id`) |
 | `--veth-leak-rule-priority` | `OVN_ROUTE_VETH_LEAK_RULE_PRIORITY` | `veth_leak_rule_priority` | `2000` | Policy rule priority for veth leak rules |
@@ -146,7 +150,7 @@ sudo journalctl -u ovn-route-agent -f
 - **OVN**: TCP access to OVN Southbound and Northbound databases on the control nodes (the agent runs on network/gateway nodes where no local DB sockets exist)
 - **FRR**: `vtysh` must be available and the VRF + BGP configuration must already exist
 - **Linux**: Provider bridge (e.g. `br-ex`) must exist
-- **VRF route leaking**: The agent automatically creates and manages a veth pair connecting the default VRF to `vrf-provider` (enabled by default via `--veth-leak-enabled`). The external script [`contrib/veth-vrf-leak.sh`](./contrib/veth-vrf-leak.sh) is no longer needed.
+- **VRF route leaking**: The agent automatically creates and manages a veth pair connecting the default VRF to `vrf-provider` (enabled by default via `--veth-leak-enabled`). Per-network routes are reconciled dynamically based on auto-discovered or configured provider networks. The external script [`contrib/veth-vrf-leak.sh`](./contrib/veth-vrf-leak.sh) is no longer needed.
 - **Permissions**: Root or `CAP_NET_ADMIN` for netlink route manipulation
 
 ## Multi-router support
@@ -301,10 +305,10 @@ This diagram shows the complete packet path on a gateway node. The upper half (d
 
 The agent creates `/32` FRR routes inside `vrf-provider`, but reply traffic from OVN arrives in the default VRF on `br-ex`. A veth pair bridges the two VRFs so that:
 
-- **Default VRF → `vrf-provider`**: An `ip rule` matches the source address of reply packets against the configured provider networks and redirects them into routing table 200. Table 200 has a default route via `169.254.0.2` (the `veth-provider` end), which moves the packet into `vrf-provider` for BGP delivery.
+- **Default VRF → `vrf-provider`**: An `ip rule` matches the source address of reply packets against the discovered (or configured) provider networks and redirects them into routing table 200. Table 200 has a default route via `169.254.0.2` (the `veth-provider` end), which moves the packet into `vrf-provider` for BGP delivery.
 - **`vrf-provider` → Default VRF**: Network routes in `vrf-provider` (e.g. `192.0.2.0/24 via 169.254.0.1`) send return traffic back through the veth pair into the default VRF for normal kernel delivery.
 
-The agent creates the veth pair, assigns link-local addresses, adds static ARP entries for reliable cross-VRF resolution, and configures the policy rules and routes for each network from `network_cidr` automatically at startup (`--veth-leak-enabled`, on by default). On shutdown, all resources are cleaned up. This replaces the external script [`contrib/veth-vrf-leak.sh`](./contrib/veth-vrf-leak.sh), which is kept for reference only.
+The agent creates the veth pair and assigns link-local addresses at startup (`--veth-leak-enabled`, on by default). Per-network policy rules and routes are reconciled dynamically — networks are either auto-discovered from OVN `Logical_Router_Port.Networks` or taken from the static `network_cidr` configuration. On shutdown, all resources are cleaned up. This replaces the external script [`contrib/veth-vrf-leak.sh`](./contrib/veth-vrf-leak.sh), which is kept for reference only.
 
 ## Origin
 

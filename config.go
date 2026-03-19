@@ -31,6 +31,16 @@ func (s *StringOrSlice) UnmarshalYAML(value *yaml.Node) error {
 }
 
 // containedInAny returns true if ip is contained in any of the given networks.
+// effectiveNetworkFilters returns manual config if non-empty, otherwise discovered networks.
+// This is the single source of truth for the "manual takes precedence" rule, used by
+// both NAT filtering (ovn.go) and veth-leak/prefix-list reconciliation (agent.go).
+func effectiveNetworkFilters(manual, discovered []*net.IPNet) []*net.IPNet {
+	if len(manual) > 0 {
+		return manual
+	}
+	return discovered
+}
+
 func containedInAny(ip net.IP, nets []*net.IPNet) bool {
 	for _, n := range nets {
 		if n.Contains(ip) {
@@ -70,6 +80,7 @@ type Config struct {
 	LogLevel          string
 	DryRun            bool
 	CleanupOnShutdown bool
+	FRRPrefixList     string // FRR prefix-list name to manage dynamically (e.g. ANNOUNCED-NETWORKS)
 
 	// Veth VRF leak settings
 	VethLeakEnabled      bool
@@ -94,6 +105,8 @@ type configFile struct {
 	LogLevel          string        `yaml:"log_level"`
 	DryRun            *bool         `yaml:"dry_run"`
 	CleanupOnShutdown *bool         `yaml:"cleanup_on_shutdown"`
+
+	FRRPrefixList string `yaml:"frr_prefix_list"`
 
 	VethLeakEnabled      *bool  `yaml:"veth_leak_enabled"`
 	VethProviderIP       string `yaml:"veth_provider_ip"`
@@ -124,6 +137,7 @@ func loadConfig(args []string) (Config, error) {
 		fDryRun            = fs.Bool("dry-run", false, "Dry-run mode: connect and reconcile but only log what would be done")
 		fCleanupOnShutdown = fs.Bool("cleanup-on-shutdown", true, "Remove all managed routes on shutdown (SIGINT/SIGTERM)")
 
+		fFRRPrefixList        = fs.String("frr-prefix-list", "", "FRR prefix-list name to manage dynamically (default: ANNOUNCED-NETWORKS)")
 		fVethLeakEnabled      = fs.Bool("veth-leak-enabled", true, "Enable veth VRF route leaking")
 		fVethProviderIP       = fs.String("veth-provider-ip", "", "IP of the veth-provider side (default: veth-nexthop + 1)")
 		fVethLeakTableID      = fs.Int("veth-leak-table-id", 200, "Routing table ID for veth leak default route (1-252)")
@@ -147,6 +161,7 @@ func loadConfig(args []string) (Config, error) {
 		ReconcileInterval:    60 * time.Second,
 		LogLevel:             "info",
 		CleanupOnShutdown:    true,
+		FRRPrefixList:        "ANNOUNCED-NETWORKS",
 		VethLeakEnabled:      true,
 		VethLeakTableID:      200,
 		VethLeakRulePriority: 2000,
@@ -197,6 +212,8 @@ func loadConfig(args []string) (Config, error) {
 			cfg.DryRun = *fDryRun
 		case "cleanup-on-shutdown":
 			cfg.CleanupOnShutdown = *fCleanupOnShutdown
+		case "frr-prefix-list":
+			cfg.FRRPrefixList = *fFRRPrefixList
 		case "veth-leak-enabled":
 			cfg.VethLeakEnabled = *fVethLeakEnabled
 		case "veth-provider-ip":
@@ -237,11 +254,13 @@ func validateConfig(cfg *Config) error {
 		}
 	}
 
+	// FRR prefix-list validation
+	if cfg.FRRPrefixList != "" && !isValidIdentifier(cfg.FRRPrefixList) {
+		return fmt.Errorf("invalid frr-prefix-list: %q (only alphanumeric, hyphen, underscore, dot allowed)", cfg.FRRPrefixList)
+	}
+
 	// Veth leak validation
 	if cfg.VethLeakEnabled {
-		if len(cfg.NetworkCIDRs) == 0 {
-			return fmt.Errorf("veth-leak-enabled requires network-cidr to be set")
-		}
 		if cfg.VethLeakTableID < 1 || cfg.VethLeakTableID > 252 {
 			return fmt.Errorf("invalid veth-leak-table-id: %d (must be 1-252)", cfg.VethLeakTableID)
 		}
@@ -348,6 +367,9 @@ func applyFileConfig(cfg *Config, fc *configFile) {
 	if fc.CleanupOnShutdown != nil {
 		cfg.CleanupOnShutdown = *fc.CleanupOnShutdown
 	}
+	if fc.FRRPrefixList != "" {
+		cfg.FRRPrefixList = fc.FRRPrefixList
+	}
 	if fc.VethLeakEnabled != nil {
 		cfg.VethLeakEnabled = *fc.VethLeakEnabled
 	}
@@ -409,6 +431,9 @@ func applyEnvConfig(cfg *Config) {
 	}
 	if v := os.Getenv("OVN_ROUTE_CLEANUP_ON_SHUTDOWN"); v == "0" || v == "false" {
 		cfg.CleanupOnShutdown = false
+	}
+	if v := os.Getenv("OVN_ROUTE_FRR_PREFIX_LIST"); v != "" {
+		cfg.FRRPrefixList = v
 	}
 	if v := os.Getenv("OVN_ROUTE_VETH_LEAK_ENABLED"); v == "0" || v == "false" {
 		cfg.VethLeakEnabled = false

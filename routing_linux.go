@@ -12,6 +12,11 @@ import (
 	"github.com/vishvananda/netlink"
 )
 
+// rtProtoOVNRouteAgent is a custom route protocol number used to tag kernel
+// routes created by ReconcileVethLeakNetworks. This distinguishes them from
+// routes installed by FRR/zebra (which use RTPROT_ZEBRA or RTPROT_STATIC).
+const rtProtoOVNRouteAgent = 44
+
 // CheckBridgeDevice verifies that the bridge device exists and that the agent
 // has sufficient privileges (root or CAP_NET_ADMIN) for route management.
 // If the device exists but is not up, it will be brought up automatically.
@@ -432,32 +437,13 @@ func (rm *RouteManager) SetupVethLeak() error {
 		return fmt.Errorf("add default route in table %d: %w", rm.vethLeakTableID, err)
 	}
 
-	// 7. Per-network: route in VRF + policy rule
-	vrfTableID, err := rm.getVRFTableID()
-	if err != nil {
-		return fmt.Errorf("get VRF table ID: %w", err)
-	}
-
-	for _, network := range rm.networkFilters {
-		// Route in VRF: <network> via <nexthop> dev veth-provider table <vrf_table>
-		if err := netlink.RouteReplace(&netlink.Route{
-			LinkIndex: vethProvider.Attrs().Index,
-			Dst:       network,
-			Gw:        nexthopIP,
-			Table:     vrfTableID,
-		}); err != nil {
-			return fmt.Errorf("add route for %s in VRF: %w", network, err)
-		}
-
-		// Policy rule: from <network> lookup <leak_table> prio <priority>
-		rule := netlink.NewRule()
-		rule.Src = network
-		rule.Table = rm.vethLeakTableID
-		rule.Priority = rm.vethLeakRulePriority
-		if err := netlink.RuleAdd(rule); err != nil {
-			if !isFileExists(err) {
-				return fmt.Errorf("add policy rule for %s: %w", network, err)
-			}
+	// Per-network routes and policy rules are managed dynamically by
+	// ReconcileVethLeakNetworks() during each reconciliation cycle.
+	// If static network_cidr is configured, set up initial per-network
+	// routes now for backwards compatibility.
+	if len(rm.networkFilters) > 0 {
+		if err := rm.ReconcileVethLeakNetworks(rm.networkFilters); err != nil {
+			return fmt.Errorf("initial veth leak network setup: %w", err)
 		}
 	}
 
@@ -465,7 +451,6 @@ func (rm *RouteManager) SetupVethLeak() error {
 		"nexthop", rm.vethNexthop,
 		"provider_ip", rm.vethProviderIP,
 		"table", rm.vethLeakTableID,
-		"networks", len(rm.networkFilters),
 	)
 	return nil
 }
@@ -482,24 +467,23 @@ func (rm *RouteManager) TeardownVethLeak() error {
 		return nil
 	}
 
-	nexthopIP := net.ParseIP(rm.vethNexthop)
 	providerIP := net.ParseIP(rm.vethProviderIP)
 
 	// Steps 1-3 explicitly remove rules/routes before step 4 deletes the veth pair.
 	// The kernel would garbage-collect connected routes on link deletion, but explicit
 	// cleanup ensures policy rules are removed and gives clear log output on errors.
 
-	// 1. Remove policy rules
-	for _, network := range rm.networkFilters {
-		rule := netlink.NewRule()
-		rule.Src = network
-		rule.Table = rm.vethLeakTableID
-		rule.Priority = rm.vethLeakRulePriority
-		if err := netlink.RuleDel(rule); err != nil {
-			if isNoSuchRule(err) {
-				slog.Debug("veth leak policy rule already absent", "network", network)
-			} else {
-				slog.Warn("failed to remove veth leak policy rule", "network", network, "error", err)
+	// 1. Remove ALL policy rules pointing to our leak table with our priority
+	// (covers both statically configured and dynamically discovered networks).
+	rules, err := netlink.RuleList(netlink.FAMILY_V4)
+	if err == nil {
+		for _, r := range rules {
+			if r.Table == rm.vethLeakTableID && r.Priority == rm.vethLeakRulePriority {
+				if err := netlink.RuleDel(&r); err != nil {
+					slog.Warn("failed to remove veth leak policy rule", "src", r.Src, "error", err)
+				} else {
+					slog.Debug("removed veth leak policy rule", "src", r.Src)
+				}
 			}
 		}
 	}
@@ -520,22 +504,27 @@ func (rm *RouteManager) TeardownVethLeak() error {
 		}
 	}
 
-	// 3. Remove per-network routes from VRF
+	// 3. Remove ALL per-network routes from VRF via veth-provider
+	// (query the system instead of relying on tracked state).
 	vethProvider, vrfErr := netlink.LinkByName(vethProviderName)
 	if vrfErr == nil {
 		vrfTableID, err := rm.getVRFTableID()
 		if err == nil {
-			for _, network := range rm.networkFilters {
-				if err := netlink.RouteDel(&netlink.Route{
-					LinkIndex: vethProvider.Attrs().Index,
-					Dst:       network,
-					Gw:        nexthopIP,
-					Table:     vrfTableID,
-				}); err != nil {
-					if isNoSuchRoute(err) {
-						slog.Debug("veth leak VRF route already absent", "network", network)
+			filter := &netlink.Route{
+				LinkIndex: vethProvider.Attrs().Index,
+				Table:     vrfTableID,
+			}
+			routes, err := netlink.RouteListFiltered(netlink.FAMILY_V4, filter, netlink.RT_FILTER_OIF|netlink.RT_FILTER_TABLE)
+			if err == nil {
+				for _, r := range routes {
+					if err := netlink.RouteDel(&r); err != nil {
+						if isNoSuchRoute(err) {
+							slog.Debug("veth leak VRF route already absent", "dst", r.Dst)
+						} else {
+							slog.Warn("failed to remove veth leak VRF route", "dst", r.Dst, "error", err)
+						}
 					} else {
-						slog.Warn("failed to remove veth leak VRF route", "network", network, "error", err)
+						slog.Debug("removed veth leak VRF route", "dst", r.Dst)
 					}
 				}
 			}
@@ -550,6 +539,135 @@ func (rm *RouteManager) TeardownVethLeak() error {
 	}
 
 	slog.Info("veth VRF leak teardown complete")
+	return nil
+}
+
+// ReconcileVethLeakNetworks ensures per-network VRF routes and policy rules
+// match the desired set of networks. Pass nil to remove all per-network state.
+func (rm *RouteManager) ReconcileVethLeakNetworks(desired []*net.IPNet) error {
+	if !rm.vethLeakEnabled {
+		return nil
+	}
+	if rm.dryRun {
+		slog.Info("[dry-run] would reconcile veth leak networks", "desired", len(desired))
+		return nil
+	}
+
+	nexthopIP := net.ParseIP(rm.vethNexthop)
+
+	vethProvider, err := netlink.LinkByName(vethProviderName)
+	if err != nil {
+		return fmt.Errorf("find %s: %w", vethProviderName, err)
+	}
+
+	vrfTableID, err := rm.getVRFTableID()
+	if err != nil {
+		return fmt.Errorf("get VRF table ID: %w", err)
+	}
+
+	// Discover current per-network VRF routes via veth-provider.
+	// We filter by our custom protocol (rtProtoOVNRouteAgent) to only find
+	// routes we created, ignoring routes installed by FRR (which use
+	// RTPROT_ZEBRA or RTPROT_STATIC) that share the same interface and gateway.
+	filter := &netlink.Route{
+		LinkIndex: vethProvider.Attrs().Index,
+		Table:     vrfTableID,
+		Protocol:  rtProtoOVNRouteAgent,
+	}
+	currentRoutes, err := netlink.RouteListFiltered(netlink.FAMILY_V4, filter, netlink.RT_FILTER_OIF|netlink.RT_FILTER_TABLE|netlink.RT_FILTER_PROTOCOL)
+	if err != nil {
+		return fmt.Errorf("list VRF routes: %w", err)
+	}
+
+	currentNets := make(map[string]bool, len(currentRoutes))
+	for _, r := range currentRoutes {
+		// Defense-in-depth: also verify protocol in Go code in case the
+		// netlink RT_FILTER_PROTOCOL flag does not filter correctly on
+		// all kernel versions. Without this check, FRR-installed /32
+		// routes (RTPROT_ZEBRA) sharing the same interface and gateway
+		// could leak into currentNets and be treated as stale.
+		if r.Dst != nil && r.Gw != nil && r.Gw.Equal(nexthopIP) && r.Protocol == rtProtoOVNRouteAgent {
+			currentNets[r.Dst.String()] = true
+		}
+	}
+
+	desiredSet := make(map[string]*net.IPNet, len(desired))
+	for _, n := range desired {
+		desiredSet[n.String()] = n
+	}
+
+	// Add missing per-network routes and rules.
+	for key, network := range desiredSet {
+		if currentNets[key] {
+			continue
+		}
+		if err := netlink.RouteReplace(&netlink.Route{
+			LinkIndex: vethProvider.Attrs().Index,
+			Dst:       network,
+			Gw:        nexthopIP,
+			Table:     vrfTableID,
+			Protocol:  rtProtoOVNRouteAgent,
+		}); err != nil {
+			return fmt.Errorf("add VRF route for %s: %w", network, err)
+		}
+
+		rule := netlink.NewRule()
+		rule.Src = network
+		rule.Table = rm.vethLeakTableID
+		rule.Priority = rm.vethLeakRulePriority
+		if err := netlink.RuleAdd(rule); err != nil {
+			if !isFileExists(err) {
+				return fmt.Errorf("add policy rule for %s: %w", network, err)
+			}
+		}
+		slog.Info("veth leak network added", "network", network)
+	}
+
+	// Remove stale per-network routes and rules.
+	for key := range currentNets {
+		if _, wanted := desiredSet[key]; wanted {
+			continue
+		}
+		_, staleNet, err := net.ParseCIDR(key)
+		if err != nil {
+			continue
+		}
+		if err := netlink.RouteDel(&netlink.Route{
+			LinkIndex: vethProvider.Attrs().Index,
+			Dst:       staleNet,
+			Gw:        nexthopIP,
+			Table:     vrfTableID,
+			Protocol:  rtProtoOVNRouteAgent,
+		}); err != nil {
+			if !isNoSuchRoute(err) {
+				slog.Warn("failed to remove stale VRF route", "network", key, "error", err)
+			}
+		}
+		slog.Info("veth leak network removed", "network", key)
+	}
+
+	// Reconcile policy rules independently — catches orphaned rules where
+	// the route was removed externally but the rule remained.
+	rules, err := netlink.RuleList(netlink.FAMILY_V4)
+	if err != nil {
+		slog.Warn("failed to list policy rules for reconciliation", "error", err)
+	} else {
+		for _, r := range rules {
+			if r.Table != rm.vethLeakTableID || r.Priority != rm.vethLeakRulePriority || r.Src == nil {
+				continue
+			}
+			if _, wanted := desiredSet[r.Src.String()]; !wanted {
+				if err := netlink.RuleDel(&r); err != nil {
+					if !isNoSuchRule(err) {
+						slog.Warn("failed to remove orphaned policy rule", "src", r.Src, "error", err)
+					}
+				} else {
+					slog.Info("orphaned veth leak policy rule removed", "src", r.Src)
+				}
+			}
+		}
+	}
+
 	return nil
 }
 

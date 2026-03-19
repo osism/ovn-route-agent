@@ -35,6 +35,11 @@ func main() {
 		os.Exit(1)
 	}
 
+	networkMode := "auto-discover from OVN"
+	if len(cfg.NetworkCIDRs) > 0 {
+		networkMode = "manual"
+	}
+
 	slog.Info("ovn-route-agent starting",
 		"version", version,
 		"dry_run", cfg.DryRun,
@@ -45,11 +50,13 @@ func main() {
 		"vrf_name", cfg.VRFName,
 		"veth_nexthop", cfg.VethNexthop,
 		"network_cidrs", cfg.NetworkCIDRs,
+		"network_mode", networkMode,
 		"gateway_port", cfg.GatewayPort,
 		"route_table_id", cfg.RouteTableID,
 		"ovs_wrapper", cfg.OVSWrapper,
 		"reconcile_interval", cfg.ReconcileInterval,
 		"veth_leak_enabled", cfg.VethLeakEnabled,
+		"frr_prefix_list", cfg.FRRPrefixList,
 	)
 
 	if cfg.DryRun {

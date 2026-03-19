@@ -52,20 +52,67 @@ func TestIsManaged(t *testing.T) {
 
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {
-			cfg := Config{}
+			var filters []*net.IPNet
 			for _, cidrStr := range tt.cidrs {
 				_, cidr, err := net.ParseCIDR(cidrStr)
 				if err != nil {
 					t.Fatalf("ParseCIDR(%q) error: %v", cidrStr, err)
 				}
-				cfg.NetworkFilters = append(cfg.NetworkFilters, cidr)
+				filters = append(filters, cidr)
 			}
-			a := &Agent{cfg: cfg}
+			a := &Agent{effectiveFilters: filters}
 			got := a.isManaged(tt.ip)
 			if got != tt.want {
 				t.Errorf("isManaged(%q) with cidrs %v = %v, want %v", tt.ip, tt.cidrs, got, tt.want)
 			}
 		})
+	}
+}
+
+func TestComputeEffectiveNetworks(t *testing.T) {
+	_, manual, _ := net.ParseCIDR("10.0.0.0/24")
+	_, discovered, _ := net.ParseCIDR("198.51.100.0/24")
+
+	t.Run("manual config takes precedence", func(t *testing.T) {
+		a := &Agent{cfg: Config{NetworkFilters: []*net.IPNet{manual}}}
+		eff := a.computeEffectiveNetworks([]*net.IPNet{discovered})
+		if len(eff) != 1 || eff[0].String() != "10.0.0.0/24" {
+			t.Errorf("expected manual config, got %v", eff)
+		}
+	})
+
+	t.Run("auto-discovery when no manual config", func(t *testing.T) {
+		a := &Agent{cfg: Config{}}
+		eff := a.computeEffectiveNetworks([]*net.IPNet{discovered})
+		if len(eff) != 1 || eff[0].String() != "198.51.100.0/24" {
+			t.Errorf("expected discovered network, got %v", eff)
+		}
+	})
+
+	t.Run("nil when nothing configured or discovered", func(t *testing.T) {
+		a := &Agent{cfg: Config{}}
+		eff := a.computeEffectiveNetworks(nil)
+		if len(eff) != 0 {
+			t.Errorf("expected empty, got %v", eff)
+		}
+	})
+}
+
+func TestIsManagedWithEffectiveFilters(t *testing.T) {
+	_, cidr, _ := net.ParseCIDR("198.51.100.0/24")
+	a := &Agent{effectiveFilters: []*net.IPNet{cidr}}
+
+	if !a.isManaged("198.51.100.10") {
+		t.Error("198.51.100.10 should be managed within 198.51.100.0/24")
+	}
+	if a.isManaged("10.0.0.1") {
+		t.Error("10.0.0.1 should not be managed outside 198.51.100.0/24")
+	}
+
+	// With nil effectiveFilters, all IPs are managed.
+	a.effectiveFilters = nil
+	if !a.isManaged("10.0.0.1") {
+		t.Error("all IPs should be managed when effectiveFilters is nil")
 	}
 }
 

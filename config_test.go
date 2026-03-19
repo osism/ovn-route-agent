@@ -231,8 +231,7 @@ func TestApplyEnvConfigInvalidDuration(t *testing.T) {
 }
 
 func TestLoadConfigDefaults(t *testing.T) {
-	// Pass --veth-leak-enabled=false to avoid requiring --network-cidr for basic default checks.
-	cfg, err := loadConfig([]string{"--veth-leak-enabled=false"})
+	cfg, err := loadConfig(nil)
 	if err != nil {
 		t.Fatalf("loadConfig() error: %v", err)
 	}
@@ -256,6 +255,9 @@ func TestLoadConfigDefaults(t *testing.T) {
 	}
 	if !cfg.CleanupOnShutdown {
 		t.Error("CleanupOnShutdown should be true by default")
+	}
+	if cfg.FRRPrefixList != "ANNOUNCED-NETWORKS" {
+		t.Errorf("FRRPrefixList = %q, want %q", cfg.FRRPrefixList, "ANNOUNCED-NETWORKS")
 	}
 	// VethLeakEnabled was overridden to false for this test; check other defaults.
 	if cfg.VethLeakTableID != 200 {
@@ -313,7 +315,7 @@ func TestLoadConfigCLIFlags(t *testing.T) {
 }
 
 func TestLoadConfigDryRunFlag(t *testing.T) {
-	cfg, err := loadConfig([]string{"--dry-run", "--veth-leak-enabled=false"})
+	cfg, err := loadConfig([]string{"--dry-run"})
 	if err != nil {
 		t.Fatalf("loadConfig() error: %v", err)
 	}
@@ -323,7 +325,7 @@ func TestLoadConfigDryRunFlag(t *testing.T) {
 }
 
 func TestLoadConfigDryRunDefault(t *testing.T) {
-	cfg, err := loadConfig([]string{"--veth-leak-enabled=false"})
+	cfg, err := loadConfig(nil)
 	if err != nil {
 		t.Fatalf("loadConfig() error: %v", err)
 	}
@@ -352,7 +354,7 @@ func TestApplyFileConfigDryRun(t *testing.T) {
 }
 
 func TestLoadConfigCleanupOnShutdownDefault(t *testing.T) {
-	cfg, err := loadConfig([]string{"--veth-leak-enabled=false"})
+	cfg, err := loadConfig(nil)
 	if err != nil {
 		t.Fatalf("loadConfig() error: %v", err)
 	}
@@ -362,7 +364,7 @@ func TestLoadConfigCleanupOnShutdownDefault(t *testing.T) {
 }
 
 func TestLoadConfigCleanupOnShutdownDisabledViaCLI(t *testing.T) {
-	cfg, err := loadConfig([]string{"--cleanup-on-shutdown=false", "--veth-leak-enabled=false"})
+	cfg, err := loadConfig([]string{"--cleanup-on-shutdown=false"})
 	if err != nil {
 		t.Fatalf("loadConfig() error: %v", err)
 	}
@@ -564,7 +566,7 @@ func TestValidateConfig(t *testing.T) {
 }
 
 func TestLoadConfigRouteTableIDCLI(t *testing.T) {
-	cfg, err := loadConfig([]string{"--route-table-id", "100", "--veth-leak-enabled=false"})
+	cfg, err := loadConfig([]string{"--route-table-id", "100"})
 	if err != nil {
 		t.Fatalf("loadConfig() error: %v", err)
 	}
@@ -574,7 +576,7 @@ func TestLoadConfigRouteTableIDCLI(t *testing.T) {
 }
 
 func TestLoadConfigRouteTableIDInvalid(t *testing.T) {
-	_, err := loadConfig([]string{"--route-table-id", "253", "--veth-leak-enabled=false"})
+	_, err := loadConfig([]string{"--route-table-id", "253"})
 	if err == nil {
 		t.Error("expected error for route-table-id 253")
 	}
@@ -588,6 +590,32 @@ func TestApplyEnvConfigRouteTableID(t *testing.T) {
 	if cfg.RouteTableID != 42 {
 		t.Errorf("RouteTableID = %d, want 42", cfg.RouteTableID)
 	}
+}
+
+func TestEffectiveNetworkFilters(t *testing.T) {
+	_, manual, _ := net.ParseCIDR("10.0.0.0/24")
+	_, discovered, _ := net.ParseCIDR("198.51.100.0/24")
+
+	t.Run("manual takes precedence", func(t *testing.T) {
+		got := effectiveNetworkFilters([]*net.IPNet{manual}, []*net.IPNet{discovered})
+		if len(got) != 1 || got[0].String() != "10.0.0.0/24" {
+			t.Errorf("expected manual, got %v", got)
+		}
+	})
+
+	t.Run("discovered when no manual", func(t *testing.T) {
+		got := effectiveNetworkFilters(nil, []*net.IPNet{discovered})
+		if len(got) != 1 || got[0].String() != "198.51.100.0/24" {
+			t.Errorf("expected discovered, got %v", got)
+		}
+	})
+
+	t.Run("nil when both empty", func(t *testing.T) {
+		got := effectiveNetworkFilters(nil, nil)
+		if len(got) != 0 {
+			t.Errorf("expected empty, got %v", got)
+		}
+	})
 }
 
 func TestIsValidIdentifier(t *testing.T) {
@@ -615,10 +643,14 @@ func TestIsValidIdentifier(t *testing.T) {
 	}
 }
 
-func TestLoadConfigVethLeakRequiresNetworkCIDR(t *testing.T) {
-	_, err := loadConfig([]string{"--veth-leak-enabled"})
-	if err == nil {
-		t.Error("expected error when veth-leak-enabled without network-cidr")
+func TestLoadConfigVethLeakWithoutNetworkCIDR(t *testing.T) {
+	// Veth leak no longer requires network-cidr — networks are auto-discovered from OVN.
+	cfg, err := loadConfig([]string{"--veth-leak-enabled"})
+	if err != nil {
+		t.Fatalf("loadConfig() error: %v", err)
+	}
+	if !cfg.VethLeakEnabled {
+		t.Error("VethLeakEnabled should be true")
 	}
 }
 
@@ -758,6 +790,41 @@ veth_leak_rule_priority: 3000
 	}
 	if cfg.VethLeakRulePriority != 3000 {
 		t.Errorf("VethLeakRulePriority = %d, want 3000", cfg.VethLeakRulePriority)
+	}
+}
+
+func TestLoadConfigFRRPrefixListCLI(t *testing.T) {
+	cfg, err := loadConfig([]string{"--frr-prefix-list", "ANNOUNCED-NETWORKS"})
+	if err != nil {
+		t.Fatalf("loadConfig() error: %v", err)
+	}
+	if cfg.FRRPrefixList != "ANNOUNCED-NETWORKS" {
+		t.Errorf("FRRPrefixList = %q, want %q", cfg.FRRPrefixList, "ANNOUNCED-NETWORKS")
+	}
+}
+
+func TestLoadConfigFRRPrefixListInvalid(t *testing.T) {
+	_, err := loadConfig([]string{"--frr-prefix-list", "bad name; drop"})
+	if err == nil {
+		t.Error("expected error for invalid frr-prefix-list name")
+	}
+}
+
+func TestApplyEnvConfigFRRPrefixList(t *testing.T) {
+	cfg := Config{}
+	t.Setenv("OVN_ROUTE_FRR_PREFIX_LIST", "MY-LIST")
+	applyEnvConfig(&cfg)
+	if cfg.FRRPrefixList != "MY-LIST" {
+		t.Errorf("FRRPrefixList = %q, want %q", cfg.FRRPrefixList, "MY-LIST")
+	}
+}
+
+func TestApplyFileConfigFRRPrefixList(t *testing.T) {
+	cfg := Config{}
+	fc := configFile{FRRPrefixList: "FILE-LIST"}
+	applyFileConfig(&cfg, &fc)
+	if cfg.FRRPrefixList != "FILE-LIST" {
+		t.Errorf("FRRPrefixList = %q, want %q", cfg.FRRPrefixList, "FILE-LIST")
 	}
 }
 

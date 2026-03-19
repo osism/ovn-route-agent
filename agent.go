@@ -18,6 +18,11 @@ type Agent struct {
 
 	// Channel to trigger reconciliation
 	reconcileCh chan struct{}
+
+	// effectiveFilters holds the network filters in effect for the current
+	// reconciliation cycle — either from manual config or auto-discovered
+	// from OVN Logical_Router_Port.Networks.
+	effectiveFilters []*net.IPNet
 }
 
 func NewAgent(cfg Config) (*Agent, error) {
@@ -127,6 +132,9 @@ func (a *Agent) Run(ctx context.Context) error {
 func (a *Agent) reconcile() {
 	state := a.ovn.GetState()
 
+	// Compute effective network filters for this cycle.
+	a.effectiveFilters = a.computeEffectiveNetworks(state.DiscoveredNetworks)
+
 	// Combine FIPs and SNAT IPs, deduplicate
 	desiredIPs := uniqueIPs(append(state.FIPs, state.SNATIPs...))
 
@@ -135,6 +143,7 @@ func (a *Agent) reconcile() {
 		"local_routers", len(state.LocalRouters),
 		"local_host", state.LocalChassisName,
 		"desired_ips", len(desiredIPs),
+		"effective_networks", len(a.effectiveFilters),
 	)
 
 	if state.HasLocalRouters {
@@ -156,10 +165,33 @@ func (a *Agent) reconcile() {
 			}
 		}
 
+		// Reconcile per-network veth leak routes and policy rules.
+		if err := a.routing.ReconcileVethLeakNetworks(a.effectiveFilters); err != nil {
+			slog.Error("failed to reconcile veth leak networks", "error", err)
+		}
+
+		// Reconcile FRR prefix-list entries for discovered networks.
+		if err := a.routing.ReconcileFRRPrefixList(a.effectiveFilters); err != nil {
+			slog.Error("failed to reconcile FRR prefix-list", "error", err)
+		}
+
 		a.ensureRoutes(desiredIPs)
 	} else {
+		// No locally active routers — remove per-network veth leak and prefix-list entries.
+		if err := a.routing.ReconcileVethLeakNetworks(nil); err != nil {
+			slog.Error("failed to clean veth leak networks", "error", err)
+		}
+		if err := a.routing.ReconcileFRRPrefixList(nil); err != nil {
+			slog.Error("failed to clean FRR prefix-list", "error", err)
+		}
 		a.removeAllRoutes("no locally active routers")
 	}
+}
+
+// computeEffectiveNetworks returns the network filters to use: manual config if set,
+// otherwise auto-discovered networks from OVN Logical_Router_Port.
+func (a *Agent) computeEffectiveNetworks(discovered []*net.IPNet) []*net.IPNet {
+	return effectiveNetworkFilters(a.cfg.NetworkFilters, discovered)
 }
 
 // ensureRoutes adds routes for all desired IPs and removes stale ones.
@@ -275,6 +307,11 @@ func (a *Agent) removeAllRoutes(reason string) {
 func (a *Agent) cleanup() {
 	a.removeAllRoutes("shutdown cleanup")
 
+	// Clean up FRR prefix-list entries.
+	if err := a.routing.ReconcileFRRPrefixList(nil); err != nil {
+		slog.Error("failed to cleanup FRR prefix-list", "error", err)
+	}
+
 	if err := a.routing.RemoveOVSFlows(); err != nil {
 		slog.Error("failed to remove OVS flows", "error", err)
 	}
@@ -291,14 +328,14 @@ func (a *Agent) cleanup() {
 	}
 }
 
-// isManaged returns true if the IP is within any of the managed network CIDRs.
-// If no CIDRs are configured, all /32 routes on the bridge are considered managed.
+// isManaged returns true if the IP is within any of the effective network CIDRs.
+// If no CIDRs are configured or discovered, all /32 routes on the bridge are considered managed.
 func (a *Agent) isManaged(ip string) bool {
-	if len(a.cfg.NetworkFilters) == 0 {
+	if len(a.effectiveFilters) == 0 {
 		return true
 	}
 	parsedIP := net.ParseIP(ip)
-	return parsedIP != nil && containedInAny(parsedIP, a.cfg.NetworkFilters)
+	return parsedIP != nil && containedInAny(parsedIP, a.effectiveFilters)
 }
 
 // uniqueIPs deduplicates and sorts a list of IP strings.

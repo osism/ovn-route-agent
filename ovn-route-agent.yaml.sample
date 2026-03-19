@@ -22,8 +22,10 @@ ovn_nb_remote: "tcp:10.10.0.1:6641,tcp:10.10.0.2:6641,tcp:10.10.0.3:6641"
 # Nexthop IP for FRR static routes in the VRF (default: 169.254.0.1)
 # veth_nexthop: "169.254.0.1"
 
-# Filter FIPs by CIDRs (default: empty = all)
+# Filter FIPs by CIDRs (default: empty = auto-discover from OVN)
 # Only manage NAT IPs within these networks.
+# When empty, networks are auto-discovered from Logical_Router_Port.Networks
+# of locally-active routers.
 # Accepts a single string or a list of CIDRs.
 # network_cidr: "192.0.2.0/24"
 # network_cidr:
@@ -64,9 +66,16 @@ ovn_nb_remote: "tcp:10.10.0.1:6641,tcp:10.10.0.2:6641,tcp:10.10.0.3:6641"
 # Set to false to keep routes in place when the agent stops.
 # cleanup_on_shutdown: true
 
+# FRR prefix-list to manage dynamically (default: ANNOUNCED-NETWORKS)
+# When set, the agent adds/removes "permit <network> ge 32 le 32" entries
+# for each discovered provider network. This replaces hardcoded prefix-list
+# entries in the FRR configuration. Set to empty string to disable.
+# frr_prefix_list: "ANNOUNCED-NETWORKS"
+
 # Veth VRF route leaking (replaces contrib/veth-vrf-leak.sh)
 # Creates a veth pair for selective route leaking between default VRF and
-# the provider VRF. Requires network_cidr to be set.
+# the provider VRF. Per-network routes are managed dynamically based on
+# discovered or configured networks.
 # veth_leak_enabled: true
 
 # IP of the veth-provider side (default: computed from veth_nexthop + 1)
