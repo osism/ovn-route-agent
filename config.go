@@ -303,7 +303,7 @@ func nextIPInSubnet(ip net.IP) net.IP {
 // for use in shell commands (alphanumeric, hyphen, underscore, dot).
 func isValidIdentifier(s string) bool {
 	for _, c := range s {
-		if !((c >= 'a' && c <= 'z') || (c >= 'A' && c <= 'Z') || (c >= '0' && c <= '9') || c == '-' || c == '_' || c == '.') {
+		if (c < 'a' || c > 'z') && (c < 'A' || c > 'Z') && (c < '0' || c > '9') && c != '-' && c != '_' && c != '.' {
 			return false
 		}
 	}
