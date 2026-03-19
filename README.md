@@ -8,7 +8,7 @@ The agent monitors the OVN Southbound and Northbound databases and performs targ
 
 1. **Connects** to OVN Southbound and Northbound databases via OVSDB IDL
 2. **Watches** for changes in real-time:
-   - `Port_Binding` table (SB) — detects gateway chassis failover
+   - `Port_Binding` table (SB) — detects gateway chassis failover (chassisredirect changes bypass debouncing for fast reaction) and extracts SNAT IPs from `NatAddresses` on gateway patch ports for immediate route announcement before NB NAT entries exist
    - `Chassis` table (SB) — detects chassis membership changes
    - `NAT` table (NB) — detects Floating IP and SNAT assignments
    - `Logical_Router` / `Logical_Router_Port` tables (NB) — maps NAT entries to their owning routers and auto-discovers provider network CIDRs from `Logical_Router_Port.Networks`
