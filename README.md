@@ -175,33 +175,132 @@ This enables OVN to route reply traffic out the external port without requiring 
 
 ## Architecture
 
+### Control plane
+
+The agent monitors OVN databases and writes routing state into four subsystems. On every change (or periodically as safety net) it reconciles the desired state:
+
 ```
-                    ┌──────────────────────────┐
-                    │     ovn-route-agent      │
-                    │                          │
-  OVN SB DB ◄───────┤  OVSDB IDL Monitor       │
-  (Port_Binding,    │         │                │
-   Chassis)         │    Event Handler         │
-                    │         │                │
-  OVN NB DB ◄──────►┤  OVSDB IDL Monitor +     │
-  (NAT, LR, LRP,    │  Gateway Route Writer    │
-   Static Routes,   │         │                │
-   MAC Bindings)    │         │                │
-                    │    ┌────▼─────┐          │
-                    │    │ Reconcile│          │
-                    │    └────┬─────┘          │
-                    │         │                │
-                    │    ┌────▼─────┐          │
-                    │    │ Routing  │          │
-                    │    └─┬──┬──┬──┘          │
-                    └──────┼──┼──┼─────────────┘
-                           │  │  │
-            ┌──────────────┘  │  └─────────────┐
-            ▼                 ▼                ▼
-  Kernel (netlink)     OVS (ovs-ofctl)   FRR (vtysh)
-  /32 routes + rules   MAC-tweak flows   ip route in VRF
-  proxy ARP on br-ex   on br-ex          → BGP announcement
+                         ┌──────────────────────────────┐
+                         │       ovn-route-agent        │
+                         │                              │
+   OVN SB DB ◄───────────┤  OVSDB IDL Monitor           │
+   (Port_Binding,        │         │                    │
+    Chassis)             │    Event Handler             │
+                         │         │                    │
+   OVN NB DB ◄──────────►┤  OVSDB IDL Monitor +         │
+   (NAT, LR, LRP,        │  Gateway Route Writer        │
+    Static Routes,       │         │                    │
+    MAC Bindings)        │    ┌────▼──────┐             │
+                         │    │ Reconcile │             │
+                         │    └────┬──────┘             │
+                         │         │                    │
+                         │    ┌────▼──────┐             │
+                         │    │  Routing  │             │
+                         │    └─┬──┬──┬───┘             │
+                         └──────┼──┼──┼─────────────────┘
+                                │  │  │
+                 ┌──────────────┘  │  └───────────────┐
+                 ▼                 ▼                  ▼
+       Kernel (netlink)     OVS (ovs-ofctl)    FRR (vtysh)
+       /32 routes + rules   MAC-tweak flows    ip route in VRF
+       proxy ARP on br-ex   on br-ex           → BGP announcement
 ```
+
+For each locally-active router the agent:
+
+1. Writes a **default route** (`0.0.0.0/0`) and **static MAC binding** into OVN NB so reply traffic exits the logical router correctly (gatewayless provider networks only)
+2. Installs **OVS MAC-tweak flows** on `br-ex` so packets from OVN reach the kernel with the correct destination MAC
+3. Creates `/32` **kernel routes** (with `ip rule` entries when using a dedicated routing table) on `br-ex` so the kernel can receive packets for each FIP
+4. Creates `/32` **FRR static routes** in `vrf-provider` so BGP announces each FIP to the external fabric
+
+### Data plane
+
+This diagram shows the complete packet path on a gateway node. The upper half (default VRF) handles OVN traffic and kernel routing. The lower half (`vrf-provider`) handles BGP announcement and external delivery. The veth pair set up by [`contrib/veth-vrf-leak.sh`](./contrib/veth-vrf-leak.sh) bridges the two VRFs.
+
+```
+ ┌─────────────────────────────────────────────────────────────────────┐
+ │                          Gateway Node                               │
+ │                                                                     │
+ │  ┌────────────────────────────── Default VRF ─────────────────────┐ │
+ │  │                                                                │ │
+ │  │  ┌──────────────────────────────────────────────┐              │ │
+ │  │  │              br-ex (provider bridge)         │              │ │
+ │  │  │  - proxy ARP enabled                         │              │ │
+ │  │  │  - bridge IP 169.254.169.254/32              │              │ │
+ │  │  │  - /32 kernel route per FIP (scope link)     │              │ │
+ │  │  │  - OVS MAC-tweak flows (cookie 0x999)        │              │ │
+ │  │  └──────────┬──────────────────────┬────────────┘              │ │
+ │  │        physical NIC           patch port                       │ │
+ │  │        (uplink)               to br-int                        │ │
+ │  │             │                      │                           │ │
+ │  │             │                 ┌────▼──────────────────────┐    │ │
+ │  │             │                 │  br-int (OVN integration) │    │ │
+ │  │             │                 │                           │    │ │
+ │  │             │                 │  OVN Logical Router:      │    │ │
+ │  │             │                 │   DNAT: FIP → VM IP       │    │ │
+ │  │             │                 │   SNAT: VM IP → FIP       │    │ │
+ │  │             │                 │   default route → .254    │    │ │
+ │  │             │                 │   MAC binding → br-ex MAC │    │ │
+ │  │             │                 └──────────────┬────────────┘    │ │
+ │  │             │                                │                 │ │
+ │  │             │                           VM (10.0.0.5)          │ │
+ │  │             │                                                  │ │
+ │  │  ┌─────────────────┐                                           │ │
+ │  │  │  veth-default   │                                           │ │
+ │  │  │  169.254.0.1/30 │                                           │ │
+ │  │  └────────┬────────┘                                           │ │
+ │  │           │          ip rule: from <net> → lookup table 200    │ │
+ │  │       veth pair      table 200: default via 169.254.0.2        │ │
+ │  │           │                                                    │ │
+ │  └───────────┼────────────────────────────────────────────────────┘ │
+ │              │                                                      │
+ │  ┌───────────┼─────────────────── vrf-provider ───────────────────┐ │
+ │  │           │                                                    │ │
+ │  │  ┌────────▼────────┐       ┌────────────────────────┐          │ │
+ │  │  │  veth-provider  │       │      FRR / BGP         │          │ │
+ │  │  │  169.254.0.2/30 │       │  announces /32 routes  │          │ │
+ │  │  └─────────────────┘       └───────────┬────────────┘          │ │
+ │  │                                        │                       │ │
+ │  │  <net>/24 via 169.254.0.1  (→ default VRF, return path)        │ │
+ │  │  <FIP>/32 via 169.254.0.1  (agent-managed, per FIP)            │ │
+ │  └────────────────────────────────────────┼───────────────────────┘ │
+ └───────────────────────────────────────────┼─────────────────────────┘
+                                             │ BGP peering
+                                             ▼
+                                     ┌───────────────┐
+                                     │   External    │
+                                     │  BGP Router / │
+                                     │    Fabric     │
+                                     └───────────────┘
+```
+
+#### Forward path (external client → VM)
+
+1. External router learns `198.51.100.10/32` via BGP from FRR in `vrf-provider`
+2. Packet (`dst=198.51.100.10`) arrives at `br-ex` via the physical NIC
+3. Kernel finds the `/32` route on `br-ex` (scope link); proxy ARP resolves the FIP to the bridge MAC
+4. OVS MAC-tweak flow rewrites the destination MAC to `br-ex` MAC and passes the packet to `br-int`
+5. OVN Logical Router applies DNAT: `198.51.100.10` → `10.0.0.5`
+6. Packet is delivered to the VM on its internal network
+
+#### Return path (VM → external client)
+
+1. VM sends reply (`src=10.0.0.5`, `dst=external client`)
+2. OVN Logical Router applies SNAT: source becomes `198.51.100.10`
+3. OVN forwards via default route (`.254`) + static MAC binding → packet exits through `br-ex`
+4. Packet leaves `br-ex` with `src=198.51.100.10` (falls in a provider network range)
+5. Policy rule `from <net> → lookup table 200` matches the source address
+6. Table 200 routes via `169.254.0.2` → veth pair → packet enters `vrf-provider`
+7. FRR/BGP in `vrf-provider` delivers the packet to the external fabric
+
+#### VRF route leaking (`contrib/veth-vrf-leak.sh`)
+
+The agent creates `/32` FRR routes inside `vrf-provider`, but reply traffic from OVN arrives in the default VRF on `br-ex`. A veth pair bridges the two VRFs so that:
+
+- **Default VRF → `vrf-provider`**: An `ip rule` matches the source address of reply packets against the configured provider networks and redirects them into routing table 200. Table 200 has a default route via `169.254.0.2` (the `veth-provider` end), which moves the packet into `vrf-provider` for BGP delivery.
+- **`vrf-provider` → Default VRF**: Network routes in `vrf-provider` (e.g. `192.0.2.0/24 via 169.254.0.1`) send return traffic back through the veth pair into the default VRF for normal kernel delivery.
+
+The script creates the veth pair, assigns link-local addresses, adds static ARP entries for reliable cross-VRF resolution, and configures the policy rules and routes for each network listed in [`contrib/networks.txt.sample`](./contrib/networks.txt.sample).
 
 ## Origin
 
