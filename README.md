@@ -16,8 +16,8 @@ The agent monitors the OVN Southbound and Northbound databases and performs targ
    - Adds a **link-local IP** to the bridge device so the kernel can perform ARP resolution
    - Enables **proxy ARP** on the bridge device so the kernel responds to ARP requests for FIP addresses
 4. **Reacts** instantly to changes — for each router whose gateway is active on this chassis:
-   - Ensures a **default route** (`0.0.0.0/0`) and **static MAC binding** in OVN NB so reply traffic exits the router correctly (no OpenStack gateway IP needed)
-   - Installs **OVS MAC-tweak flows** on the provider bridge
+   - Ensures a **default route** (`0.0.0.0/0 via <virtual-gw>`) and **static MAC binding** in OVN NB so reply traffic exits the logical router correctly (see [Gatewayless provider networks](#gatewayless-provider-networks))
+   - Installs **OVS MAC-tweak flows** on the provider bridge so the kernel accepts packets from OVN (rewrites destination MAC to `br-ex` MAC)
    - Ensures `/32` **kernel routes** (with IP rules when using a dedicated routing table) and **FRR static routes** in the VRF for each FIP/SNAT IP
    - If configured, reconciles the **FRR prefix-list** with `permit <network> ge 32 le 32` entries for each discovered provider network
    - If no routers are locally active: removes all managed routes
@@ -171,15 +171,90 @@ To restrict the agent to a single router (legacy behavior), set `gateway_port` t
 
 ## Gatewayless provider networks
 
-The agent supports OpenStack provider networks configured with `disable_gateway_ip: true`. In this setup there is no physical upstream gateway — all traffic is routed via BGP `/32` announcements.
+### Background: the problem
 
-For each locally-active router, the agent automatically:
+In a traditional OpenStack deployment, the provider network has a real upstream gateway (e.g. a physical router at `.1`). OVN uses this gateway IP as the nexthop for its default route, so SNAT reply traffic naturally exits the logical router and reaches the physical network.
 
-1. Computes a **virtual gateway IP** (last usable IP in the subnet, e.g. `.254` for a `/24`)
-2. Creates a **default route** (`0.0.0.0/0 via <virtual-gw>`) on the OVN logical router
-3. Creates a **static MAC binding** mapping the virtual gateway IP to the local `br-ex` MAC
+When the provider network is configured with **`disable_gateway_ip: true`** (gatewayless mode), there is no physical upstream gateway at all — all external traffic is routed purely via BGP `/32` announcements. This creates a problem: OVN's logical router has no nexthop for its default route, so reply traffic (after SNAT) has no way to leave the logical router.
 
-This enables OVN to route reply traffic out the external port without requiring a real gateway. On failover, the MAC binding is automatically updated to point to the new node's `br-ex` MAC.
+### Solution: the virtual gateway ("magic gateway")
+
+The agent solves this by inventing a **virtual gateway IP** that does not correspond to any real device. It picks the **last usable host address** in the provider subnet (broadcast address minus one):
+
+| Subnet | Virtual gateway IP |
+|--------|--------------------|
+| `198.51.100.0/24` | `198.51.100.254` |
+| `192.168.42.0/23` | `192.168.43.254` |
+| `10.0.0.0/16` | `10.0.255.254` |
+| `172.16.0.0/30` | `172.16.0.2` |
+
+The computation uses the first IPv4 CIDR found on the logical router's external port (`Logical_Router_Port.Networks`).
+
+For each locally-active router, the agent writes two entries into the OVN Northbound database:
+
+1. **Default route** — `0.0.0.0/0 via <virtual-gw>` on the logical router, so OVN knows where to send reply traffic after SNAT.
+2. **Static MAC binding** — maps the virtual gateway IP to the local `br-ex` MAC address, so OVN can resolve the nexthop without sending ARP requests that nobody would answer.
+
+Together, these two entries trick OVN into forwarding SNAT reply packets out of the logical router's external port onto `br-ex`, where the kernel and FRR take over for BGP delivery. The virtual gateway IP itself is never used as an actual destination — it only serves as the logical nexthop that makes OVN's routing pipeline work.
+
+Both entries are tagged with `ExternalIDs["ovn-route-agent"] = "managed"` so the agent can track and clean them up. If a default route already exists that was **not** created by the agent (i.e. a real gateway configured by OpenStack), the agent leaves it untouched.
+
+### Creating a gatewayless provider network
+
+The key difference to a normal provider network is that the subnet has **no gateway IP** and the **last usable address** (`.254` in this example) is kept free — the agent will use it as the virtual gateway.
+
+**Ansible (openstack.cloud collection):**
+
+```yaml
+- name: Create public network
+  openstack.cloud.network:
+    cloud: admin
+    state: present
+    name: public
+    external: true
+    provider_network_type: flat
+    provider_physical_network: physnet1
+    mtu: 1500
+
+- name: Create public subnet (gatewayless)
+  openstack.cloud.subnet:
+    cloud: admin
+    state: present
+    name: subnet-public-001
+    network_name: public
+    cidr: 198.51.100.0/24
+    enable_dhcp: false
+    allocation_pool_start: 198.51.100.1
+    allocation_pool_end: 198.51.100.253
+    # no gateway_ip → OpenStack sets disable_gateway_ip: true
+```
+
+**OpenStack CLI equivalent:**
+
+```bash
+openstack network create --external --provider-network-type flat \
+  --provider-physical-network physnet1 --mtu 1500 public
+
+openstack subnet create --network public --subnet-range 198.51.100.0/24 \
+  --no-dhcp --allocation-pool start=198.51.100.1,end=198.51.100.253 \
+  --gateway none subnet-public-001
+```
+
+Note that the allocation pool ends at `.253` — address `.254` is reserved for the agent's virtual gateway. The `--gateway none` flag (or omitting `gateway_ip` in Ansible) tells OpenStack not to assign a real gateway, which is exactly what triggers the gatewayless scenario that the agent handles.
+
+### Failover behavior
+
+On HA failover (chassisredirect port moves to a different chassis), the agent on the new active node **updates the static MAC binding** to point to its own `br-ex` MAC. This ensures reply traffic is forwarded to the correct physical node without requiring any change to the logical route itself.
+
+### MAC-tweak flows on br-ex
+
+Packets leaving OVN via `br-int` arrive on the patch port of `br-ex` with a destination MAC set by OVN's logical pipeline — not the bridge's own MAC. The Linux kernel would drop these packets because the destination MAC does not match any local interface. To fix this, the agent installs OVS flows (cookie `0x999`, priority 900) on `br-ex` that **rewrite the destination MAC** to the bridge's own MAC for all packets arriving on the patch port:
+
+```
+cookie=0x999,priority=900,ip,in_port=<patch-port>,actions=mod_dl_dst:<br-ex-mac>,NORMAL
+```
+
+This allows the kernel to accept and route the packets normally (via the `/32` kernel routes and policy rules into `vrf-provider` for BGP delivery).
 
 ## Architecture
 
@@ -216,8 +291,8 @@ The agent monitors OVN databases and writes routing state into four subsystems. 
 
 For each locally-active router the agent:
 
-1. Writes a **default route** (`0.0.0.0/0`) and **static MAC binding** into OVN NB so reply traffic exits the logical router correctly (gatewayless provider networks only)
-2. Installs **OVS MAC-tweak flows** on `br-ex` so packets from OVN reach the kernel with the correct destination MAC
+1. Writes a **default route** (`0.0.0.0/0 via <virtual-gw>`) and **static MAC binding** into OVN NB — the [virtual gateway](#gatewayless-provider-networks) makes reply traffic exit the logical router without a real upstream gateway
+2. Installs **OVS MAC-tweak flows** on `br-ex` — rewrites the destination MAC on packets arriving from OVN's patch port so the kernel accepts them
 3. Creates `/32` **kernel routes** (with `ip rule` entries when using a dedicated routing table) on `br-ex` so the kernel can receive packets for each FIP
 4. Creates `/32` **FRR static routes** in `vrf-provider` so BGP announces each FIP to the external fabric
 5. Triggers a **BGP outbound soft-refresh** only when routes are removed (withdrawals) — additions rely on FRR's normal route redistribution to avoid disrupting existing BGP announcements
@@ -249,8 +324,10 @@ This diagram shows the complete packet path on a gateway node. The upper half (d
  │  │             │                 │  OVN Logical Router:      │    │ │
  │  │             │                 │   DNAT: FIP → VM IP       │    │ │
  │  │             │                 │   SNAT: VM IP → FIP       │    │ │
- │  │             │                 │   default route → .254    │    │ │
+ │  │             │                 │   default route → .254 ¹  │    │ │
  │  │             │                 │   MAC binding → br-ex MAC │    │ │
+ │  │             │                 │   ¹ virtual gateway (last │    │ │
+ │  │             │                 │     usable IP in subnet)  │    │ │
  │  │             │                 └──────────────┬────────────┘    │ │
  │  │             │                                │                 │ │
  │  │             │                           VM (10.0.0.5)          │ │
@@ -297,7 +374,7 @@ This diagram shows the complete packet path on a gateway node. The upper half (d
 
 1. VM sends reply (`src=10.0.0.5`, `dst=external client`)
 2. OVN Logical Router applies SNAT: source becomes `198.51.100.10`
-3. OVN forwards via default route (`.254`) + static MAC binding → packet exits through `br-ex`
+3. OVN forwards via default route (`0.0.0.0/0 via .254` — the virtual gateway) + static MAC binding (`.254` → `br-ex` MAC) → packet exits through `br-ex`
 4. Packet leaves `br-ex` with `src=198.51.100.10` (falls in a provider network range)
 5. Policy rule `from <net> → lookup table 200` matches the source address
 6. Table 200 routes via `169.254.0.2` → veth pair → packet enters `vrf-provider`
