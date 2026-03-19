@@ -112,30 +112,70 @@ CLI flags take precedence over values in the config file.
 | `--veth-leak-rule-priority` | `OVN_ROUTE_VETH_LEAK_RULE_PRIORITY` | `veth_leak_rule_priority` | `2000` | Policy rule priority for veth leak rules |
 | `--version` | — | — | — | Print version and exit |
 
-## Deployment
+## Installation
 
-### Install binary
+Pre-built binaries and Debian packages for `amd64` and `arm64` are available on the [GitHub Releases](https://github.com/osism/ovn-route-agent/releases) page.
+
+### Debian package
 
 ```bash
-make build-static
-sudo install -m 0755 ovn-route-agent /usr/local/bin/ovn-route-agent
+# Download the .deb package (replace VERSION and ARCH as needed)
+curl -LO https://github.com/osism/ovn-route-agent/releases/download/vVERSION/ovn-route-agent_VERSION_ARCH.deb
+
+# Example: v0.1.0, amd64
+curl -LO https://github.com/osism/ovn-route-agent/releases/download/v0.1.0/ovn-route-agent_0.1.0_amd64.deb
+
+# Install
+sudo dpkg -i ovn-route-agent_0.1.0_amd64.deb
 ```
 
-### Install systemd service
+The package installs:
+
+- `/usr/bin/ovn-route-agent` — the binary
+- `/lib/systemd/system/ovn-route-agent.service` — systemd service
+- `/etc/default/ovn-route-agent` — environment defaults (preserved on upgrade)
+- `/etc/ovn-route-agent/config.yaml.sample` — sample configuration
+
+After installation, create your configuration and start the service:
+
+```bash
+sudo cp /etc/ovn-route-agent/config.yaml.sample /etc/ovn-route-agent/config.yaml
+sudo vi /etc/ovn-route-agent/config.yaml
+sudo systemctl enable --now ovn-route-agent
+```
+
+### Binary
+
+```bash
+# Download the static binary (replace ARCH as needed: amd64 or arm64)
+curl -LO https://github.com/osism/ovn-route-agent/releases/download/vVERSION/ovn-route-agent-linux-ARCH
+
+# Example: v0.1.0, amd64
+curl -LO https://github.com/osism/ovn-route-agent/releases/download/v0.1.0/ovn-route-agent-linux-amd64
+
+# Install
+sudo install -m 0755 ovn-route-agent-linux-amd64 /usr/local/bin/ovn-route-agent
+```
+
+Set up the systemd service and configuration manually:
 
 ```bash
 sudo cp ovn-route-agent.service /etc/systemd/system/
 sudo cp ovn-route-agent.default /etc/default/ovn-route-agent
 
-# Create configuration directory and config file from sample
 sudo mkdir -p /etc/ovn-route-agent
 sudo cp ovn-route-agent.yaml.sample /etc/ovn-route-agent/config.yaml
-
-# Edit configuration
 sudo vi /etc/ovn-route-agent/config.yaml
 
 sudo systemctl daemon-reload
 sudo systemctl enable --now ovn-route-agent
+```
+
+### From source
+
+```bash
+make build-static
+sudo install -m 0755 ovn-route-agent /usr/local/bin/ovn-route-agent
 ```
 
 ### Check status
