@@ -10,6 +10,29 @@ import (
 	"github.com/ovn-org/libovsdb/ovsdb"
 )
 
+// transactOps executes OVSDB operations and checks both the transport-level
+// error and the per-operation results for OVSDB errors (constraint violations, etc.).
+// libovsdb v0.7.0's Transact does NOT check OperationResult errors itself.
+func (o *OVNClient) transactOps(ctx context.Context, ops []ovsdb.Operation) error {
+	results, err := o.nbClient.Transact(ctx, ops...)
+	if err != nil {
+		return err
+	}
+	opErrors, err := ovsdb.CheckOperationResults(results, ops)
+	if err != nil {
+		for i, opErr := range opErrors {
+			slog.Error("OVSDB operation error",
+				"index", i,
+				"op", ops[i].Op,
+				"table", ops[i].Table,
+				"error", opErr.Error(),
+			)
+		}
+		return err
+	}
+	return nil
+}
+
 // virtualGatewayIP computes the virtual gateway IP for a router's external network.
 // It takes the last usable IP in the subnet (e.g., .254 for a /24).
 func virtualGatewayIP(lrpNetworks []string) (net.IP, error) {
@@ -117,8 +140,7 @@ func (o *OVNClient) ensureDefaultRoute(ctx context.Context, lr LocalRouterInfo, 
 			if err != nil {
 				return fmt.Errorf("build update op: %w", err)
 			}
-			_, err = o.nbClient.Transact(ctx, ops...)
-			return err
+			return o.transactOps(ctx, ops)
 		}
 	}
 
@@ -157,8 +179,7 @@ func (o *OVNClient) ensureDefaultRoute(ctx context.Context, lr LocalRouterInfo, 
 	}
 
 	allOps := append(createOps, mutateOp)
-	_, err = o.nbClient.Transact(ctx, allOps...)
-	if err != nil {
+	if err := o.transactOps(ctx, allOps); err != nil {
 		return fmt.Errorf("transact create route: %w", err)
 	}
 
@@ -187,8 +208,7 @@ func (o *OVNClient) ensureStaticMACBinding(ctx context.Context, lrpName, ip, mac
 			if err != nil {
 				return fmt.Errorf("build update op: %w", err)
 			}
-			_, err = o.nbClient.Transact(ctx, ops...)
-			return err
+			return o.transactOps(ctx, ops)
 		}
 	}
 
@@ -204,8 +224,7 @@ func (o *OVNClient) ensureStaticMACBinding(ctx context.Context, lrpName, ip, mac
 	if err != nil {
 		return fmt.Errorf("build create op: %w", err)
 	}
-	_, err = o.nbClient.Transact(ctx, ops...)
-	if err != nil {
+	if err := o.transactOps(ctx, ops); err != nil {
 		return fmt.Errorf("transact create MAC binding: %w", err)
 	}
 
