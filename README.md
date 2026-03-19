@@ -150,7 +150,7 @@ sudo journalctl -u ovn-route-agent -f
 - **OVN**: TCP access to OVN Southbound and Northbound databases on the control nodes (the agent runs on network/gateway nodes where no local DB sockets exist)
 - **FRR**: `vtysh` must be available and the VRF + BGP configuration must already exist
 - **Linux**: Provider bridge (e.g. `br-ex`) must exist
-- **VRF route leaking**: The agent automatically creates and manages a veth pair connecting the default VRF to `vrf-provider` (enabled by default via `--veth-leak-enabled`). Per-network routes are reconciled dynamically based on auto-discovered or configured provider networks. The external script [`contrib/veth-vrf-leak.sh`](./contrib/veth-vrf-leak.sh) is no longer needed.
+- **VRF route leaking**: The agent automatically creates and manages a veth pair connecting the default VRF to `vrf-provider` (enabled by default via `--veth-leak-enabled`). Per-network routes are reconciled dynamically based on auto-discovered or configured provider networks.
 - **Permissions**: Root or `CAP_NET_ADMIN` for netlink route manipulation
 
 ## Multi-router support
@@ -310,11 +310,11 @@ The agent creates `/32` FRR routes inside `vrf-provider`, but reply traffic from
 - **Default VRF → `vrf-provider`**: An `ip rule` matches the source address of reply packets against the discovered (or configured) provider networks and redirects them into routing table 200. Table 200 has a default route via `169.254.0.2` (the `veth-provider` end), which moves the packet into `vrf-provider` for BGP delivery.
 - **`vrf-provider` → Default VRF**: Network routes in `vrf-provider` (e.g. `192.0.2.0/24 via 169.254.0.1`) send return traffic back through the veth pair into the default VRF for normal kernel delivery.
 
-The agent creates the veth pair and assigns link-local addresses at startup (`--veth-leak-enabled`, on by default). Per-network policy rules and routes are reconciled dynamically — networks are either auto-discovered from OVN `Logical_Router_Port.Networks` or taken from the static `network_cidr` configuration. On shutdown, all resources are cleaned up. This replaces the external script [`contrib/veth-vrf-leak.sh`](./contrib/veth-vrf-leak.sh), which is kept for reference only.
+The agent creates the veth pair and assigns link-local addresses at startup (`--veth-leak-enabled`, on by default). Per-network policy rules and routes are reconciled dynamically — networks are either auto-discovered from OVN `Logical_Router_Port.Networks` or taken from the static `network_cidr` configuration. On shutdown, all resources are cleaned up.
 
 ## Origin
 
-This agent is based on the shell script [`ovn-route-agent.sh`](./contrib/ovn-route-agent.sh) which served as the original prototype. The built-in veth VRF leak functionality (`--veth-leak-enabled`) replaces the standalone script [`contrib/veth-vrf-leak.sh`](./contrib/veth-vrf-leak.sh).
+This agent is based on the shell script [`ovn-route-agent.sh`](./contrib/ovn-route-agent.sh) which served as the original prototype. The built-in veth VRF leak functionality (`--veth-leak-enabled`) replaces the standalone script [`veth-vrf-leak.sh`](./contrib/veth-vrf-leak.sh).
 
 ## License
 
