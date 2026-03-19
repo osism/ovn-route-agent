@@ -24,6 +24,14 @@ func (rm *RouteManager) EnsureBridgeIP(ip string) error {
 	return fmt.Errorf("bridge IP management is only supported on Linux")
 }
 
+func (rm *RouteManager) RemoveBridgeIP(ip string) error {
+	if rm.dryRun {
+		slog.Info("[dry-run] would remove bridge IP", "ip", ip, "dev", rm.bridgeDev)
+		return nil
+	}
+	return fmt.Errorf("bridge IP management is only supported on Linux")
+}
+
 func (rm *RouteManager) EnableProxyARP() error {
 	if rm.dryRun {
 		slog.Info("[dry-run] would enable proxy ARP", "dev", rm.bridgeDev)

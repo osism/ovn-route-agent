@@ -81,6 +81,33 @@ func (rm *RouteManager) EnsureBridgeIP(ip string) error {
 	return nil
 }
 
+// RemoveBridgeIP removes the /32 IP address from the bridge device.
+func (rm *RouteManager) RemoveBridgeIP(ip string) error {
+	if rm.dryRun {
+		slog.Info("[dry-run] would remove bridge IP", "ip", ip, "dev", rm.bridgeDev)
+		return nil
+	}
+	parsedIP := net.ParseIP(ip)
+	if parsedIP == nil {
+		return fmt.Errorf("invalid IP: %s", ip)
+	}
+
+	link, err := netlink.LinkByName(rm.bridgeDev)
+	if err != nil {
+		return fmt.Errorf("find bridge %s: %w", rm.bridgeDev, err)
+	}
+
+	addr := &netlink.Addr{
+		IPNet: &net.IPNet{IP: parsedIP, Mask: net.CIDRMask(32, 32)},
+	}
+
+	if err := netlink.AddrDel(link, addr); err != nil {
+		return fmt.Errorf("remove IP %s/32 from %s: %w", ip, rm.bridgeDev, err)
+	}
+	slog.Info("bridge IP removed", "ip", ip, "dev", rm.bridgeDev)
+	return nil
+}
+
 // EnableProxyARP enables proxy ARP on the bridge device so the kernel responds
 // to ARP requests for any IP it has a route for on that interface.
 func (rm *RouteManager) EnableProxyARP() error {

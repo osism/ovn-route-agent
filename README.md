@@ -22,7 +22,7 @@ The agent monitors the OVN Southbound and Northbound databases and performs targ
    - If configured, reconciles the **FRR prefix-list** with `permit <network> ge 32 le 32` entries for each discovered provider network
    - If no routers are locally active: removes all managed routes
 5. **Reconciles** periodically as a safety net (default: every 60s)
-6. **Cleans up** on shutdown (SIGINT/SIGTERM) — removes all managed routes and OVS flows before exiting (configurable via `cleanup_on_shutdown`)
+6. **Cleans up** on shutdown (SIGINT/SIGTERM) — removes all managed routes, OVS flows, and the bridge IP before exiting (configurable via `cleanup_on_shutdown`)
 
 ## Building
 

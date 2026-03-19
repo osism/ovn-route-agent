@@ -321,6 +321,9 @@ func (a *Agent) cleanup() {
 	if err := a.routing.TeardownVethLeak(); err != nil {
 		slog.Error("failed to tear down veth VRF leak", "error", err)
 	}
+	if err := a.routing.RemoveBridgeIP(a.cfg.BridgeIP); err != nil {
+		slog.Error("failed to remove bridge IP", "error", err)
+	}
 	cleanupCtx, cleanupCancel := context.WithTimeout(context.Background(), 10*time.Second)
 	defer cleanupCancel()
 	if err := a.ovn.RemoveManagedNBEntries(cleanupCtx); err != nil {

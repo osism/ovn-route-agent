@@ -68,6 +68,20 @@ func TestNewRouteManagerWithTableID(t *testing.T) {
 	}
 }
 
+func TestDryRunBridgeIP(t *testing.T) {
+	rm := &RouteManager{
+		bridgeDev: "br-ex",
+		dryRun:    true,
+	}
+
+	if err := rm.EnsureBridgeIP("169.254.169.254"); err != nil {
+		t.Errorf("EnsureBridgeIP() in dry-run should not error, got: %v", err)
+	}
+	if err := rm.RemoveBridgeIP("169.254.169.254"); err != nil {
+		t.Errorf("RemoveBridgeIP() in dry-run should not error, got: %v", err)
+	}
+}
+
 func TestDryRunOVSFlows(t *testing.T) {
 	rm := &RouteManager{
 		bridgeDev: "br-ex",
