@@ -63,3 +63,18 @@ ovn_nb_remote: "tcp:10.10.0.1:6641,tcp:10.10.0.2:6641,tcp:10.10.0.3:6641"
 # Remove all managed routes on shutdown (default: true)
 # Set to false to keep routes in place when the agent stops.
 # cleanup_on_shutdown: true
+
+# Veth VRF route leaking (replaces contrib/veth-vrf-leak.sh)
+# Creates a veth pair for selective route leaking between default VRF and
+# the provider VRF. Requires network_cidr to be set.
+# veth_leak_enabled: true
+
+# IP of the veth-provider side (default: computed from veth_nexthop + 1)
+# veth_provider_ip: "169.254.0.2"
+
+# Routing table ID for the leak default route (default: 200, must be 1-252)
+# Must differ from route_table_id.
+# veth_leak_table_id: 200
+
+# Policy rule priority for veth leak rules (default: 2000)
+# veth_leak_rule_priority: 2000

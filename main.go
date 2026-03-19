@@ -49,6 +49,7 @@ func main() {
 		"route_table_id", cfg.RouteTableID,
 		"ovs_wrapper", cfg.OVSWrapper,
 		"reconcile_interval", cfg.ReconcileInterval,
+		"veth_leak_enabled", cfg.VethLeakEnabled,
 	)
 
 	if cfg.DryRun {

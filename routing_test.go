@@ -2,6 +2,7 @@ package main
 
 import (
 	"errors"
+	"net"
 	"testing"
 )
 
@@ -125,6 +126,73 @@ func TestDryRunEnsureRemoveRoute(t *testing.T) {
 	}
 	if err := rm.RemoveRoute("10.0.0.1"); err != nil {
 		t.Errorf("RemoveRoute() in dry-run should not error, got: %v", err)
+	}
+}
+
+func TestNewRouteManagerVethLeak(t *testing.T) {
+	_, cidr, _ := net.ParseCIDR("10.0.0.0/24")
+	cfg := Config{
+		BridgeDev:            "br-ex",
+		VRFName:              "vrf-provider",
+		VethNexthop:          "169.254.0.1",
+		VethLeakEnabled:      true,
+		VethProviderIP:       "169.254.0.2",
+		VethLeakTableID:      200,
+		VethLeakRulePriority: 2000,
+		NetworkFilters:       []*net.IPNet{cidr},
+	}
+
+	rm := NewRouteManager(cfg)
+
+	if !rm.vethLeakEnabled {
+		t.Error("vethLeakEnabled should be true")
+	}
+	if rm.vethProviderIP != "169.254.0.2" {
+		t.Errorf("vethProviderIP = %q, want %q", rm.vethProviderIP, "169.254.0.2")
+	}
+	if rm.vethLeakTableID != 200 {
+		t.Errorf("vethLeakTableID = %d, want 200", rm.vethLeakTableID)
+	}
+	if rm.vethLeakRulePriority != 2000 {
+		t.Errorf("vethLeakRulePriority = %d, want 2000", rm.vethLeakRulePriority)
+	}
+	if len(rm.networkFilters) != 1 {
+		t.Errorf("networkFilters length = %d, want 1", len(rm.networkFilters))
+	}
+}
+
+func TestDryRunVethLeak(t *testing.T) {
+	rm := &RouteManager{
+		bridgeDev:       "br-ex",
+		vrfName:         "vrf-provider",
+		vethNexthop:     "169.254.0.1",
+		vethLeakEnabled: true,
+		vethProviderIP:  "169.254.0.2",
+		vethLeakTableID: 200,
+		dryRun:          true,
+	}
+
+	if err := rm.SetupVethLeak(); err != nil {
+		t.Errorf("SetupVethLeak() in dry-run should not error, got: %v", err)
+	}
+	if err := rm.TeardownVethLeak(); err != nil {
+		t.Errorf("TeardownVethLeak() in dry-run should not error, got: %v", err)
+	}
+}
+
+func TestDisabledVethLeak(t *testing.T) {
+	rm := &RouteManager{
+		bridgeDev:       "br-ex",
+		vrfName:         "vrf-provider",
+		vethNexthop:     "169.254.0.1",
+		vethLeakEnabled: false,
+	}
+
+	if err := rm.SetupVethLeak(); err != nil {
+		t.Errorf("SetupVethLeak() when disabled should not error, got: %v", err)
+	}
+	if err := rm.TeardownVethLeak(); err != nil {
+		t.Errorf("TeardownVethLeak() when disabled should not error, got: %v", err)
 	}
 }
 

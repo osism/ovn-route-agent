@@ -59,6 +59,11 @@ func (a *Agent) Run(ctx context.Context) error {
 		return fmt.Errorf("enable proxy ARP: %w", err)
 	}
 
+	// Set up veth VRF leak for route leaking between default VRF and provider VRF.
+	if err := a.routing.SetupVethLeak(); err != nil {
+		return fmt.Errorf("veth VRF leak setup: %w", err)
+	}
+
 	if a.cfg.GatewayPort == "" {
 		slog.Info("tracking all chassisredirect ports (multi-router mode)")
 	} else {
@@ -275,6 +280,9 @@ func (a *Agent) cleanup() {
 	}
 	if err := a.routing.CleanupRoutingTable(); err != nil {
 		slog.Error("failed to flush routing table", "error", err)
+	}
+	if err := a.routing.TeardownVethLeak(); err != nil {
+		slog.Error("failed to tear down veth VRF leak", "error", err)
 	}
 	cleanupCtx, cleanupCancel := context.WithTimeout(context.Background(), 10*time.Second)
 	defer cleanupCancel()

@@ -2,6 +2,7 @@ package main
 
 import (
 	"errors"
+	"net"
 	"os"
 	"path/filepath"
 	"testing"
@@ -230,7 +231,8 @@ func TestApplyEnvConfigInvalidDuration(t *testing.T) {
 }
 
 func TestLoadConfigDefaults(t *testing.T) {
-	cfg, err := loadConfig([]string{})
+	// Pass --veth-leak-enabled=false to avoid requiring --network-cidr for basic default checks.
+	cfg, err := loadConfig([]string{"--veth-leak-enabled=false"})
 	if err != nil {
 		t.Fatalf("loadConfig() error: %v", err)
 	}
@@ -254,6 +256,27 @@ func TestLoadConfigDefaults(t *testing.T) {
 	}
 	if !cfg.CleanupOnShutdown {
 		t.Error("CleanupOnShutdown should be true by default")
+	}
+	// VethLeakEnabled was overridden to false for this test; check other defaults.
+	if cfg.VethLeakTableID != 200 {
+		t.Errorf("VethLeakTableID = %d, want 200", cfg.VethLeakTableID)
+	}
+	if cfg.VethLeakRulePriority != 2000 {
+		t.Errorf("VethLeakRulePriority = %d, want 2000", cfg.VethLeakRulePriority)
+	}
+}
+
+func TestLoadConfigVethLeakEnabledByDefault(t *testing.T) {
+	// VethLeakEnabled defaults to true and requires network-cidr.
+	cfg, err := loadConfig([]string{"--network-cidr", "10.0.0.0/24"})
+	if err != nil {
+		t.Fatalf("loadConfig() error: %v", err)
+	}
+	if !cfg.VethLeakEnabled {
+		t.Error("VethLeakEnabled should be true by default")
+	}
+	if cfg.VethProviderIP != "169.254.0.2" {
+		t.Errorf("VethProviderIP = %q, want %q (auto-computed from default nexthop)", cfg.VethProviderIP, "169.254.0.2")
 	}
 }
 
@@ -290,7 +313,7 @@ func TestLoadConfigCLIFlags(t *testing.T) {
 }
 
 func TestLoadConfigDryRunFlag(t *testing.T) {
-	cfg, err := loadConfig([]string{"--dry-run"})
+	cfg, err := loadConfig([]string{"--dry-run", "--veth-leak-enabled=false"})
 	if err != nil {
 		t.Fatalf("loadConfig() error: %v", err)
 	}
@@ -300,7 +323,7 @@ func TestLoadConfigDryRunFlag(t *testing.T) {
 }
 
 func TestLoadConfigDryRunDefault(t *testing.T) {
-	cfg, err := loadConfig([]string{})
+	cfg, err := loadConfig([]string{"--veth-leak-enabled=false"})
 	if err != nil {
 		t.Fatalf("loadConfig() error: %v", err)
 	}
@@ -329,7 +352,7 @@ func TestApplyFileConfigDryRun(t *testing.T) {
 }
 
 func TestLoadConfigCleanupOnShutdownDefault(t *testing.T) {
-	cfg, err := loadConfig([]string{})
+	cfg, err := loadConfig([]string{"--veth-leak-enabled=false"})
 	if err != nil {
 		t.Fatalf("loadConfig() error: %v", err)
 	}
@@ -339,7 +362,7 @@ func TestLoadConfigCleanupOnShutdownDefault(t *testing.T) {
 }
 
 func TestLoadConfigCleanupOnShutdownDisabledViaCLI(t *testing.T) {
-	cfg, err := loadConfig([]string{"--cleanup-on-shutdown=false"})
+	cfg, err := loadConfig([]string{"--cleanup-on-shutdown=false", "--veth-leak-enabled=false"})
 	if err != nil {
 		t.Fatalf("loadConfig() error: %v", err)
 	}
@@ -390,6 +413,7 @@ func TestLoadConfigWithFile(t *testing.T) {
 ovn_sb_remote: "tcp:10.0.0.1:6642"
 ovn_nb_remote: "tcp:10.0.0.1:6641"
 bridge_dev: "br-provider"
+veth_leak_enabled: false
 `
 	path := filepath.Join(t.TempDir(), "config.yaml")
 	if err := os.WriteFile(path, []byte(content), 0644); err != nil {
@@ -413,6 +437,7 @@ func TestLoadConfigCLIOverridesFile(t *testing.T) {
 ovn_sb_remote: "tcp:10.0.0.1:6642"
 ovn_nb_remote: "tcp:10.0.0.1:6641"
 bridge_dev: "br-provider"
+veth_leak_enabled: false
 `
 	path := filepath.Join(t.TempDir(), "config.yaml")
 	if err := os.WriteFile(path, []byte(content), 0644); err != nil {
@@ -539,7 +564,7 @@ func TestValidateConfig(t *testing.T) {
 }
 
 func TestLoadConfigRouteTableIDCLI(t *testing.T) {
-	cfg, err := loadConfig([]string{"--route-table-id", "100"})
+	cfg, err := loadConfig([]string{"--route-table-id", "100", "--veth-leak-enabled=false"})
 	if err != nil {
 		t.Fatalf("loadConfig() error: %v", err)
 	}
@@ -549,7 +574,7 @@ func TestLoadConfigRouteTableIDCLI(t *testing.T) {
 }
 
 func TestLoadConfigRouteTableIDInvalid(t *testing.T) {
-	_, err := loadConfig([]string{"--route-table-id", "253"})
+	_, err := loadConfig([]string{"--route-table-id", "253", "--veth-leak-enabled=false"})
 	if err == nil {
 		t.Error("expected error for route-table-id 253")
 	}
@@ -585,6 +610,174 @@ func TestIsValidIdentifier(t *testing.T) {
 			got := isValidIdentifier(tt.input)
 			if got != tt.want {
 				t.Errorf("isValidIdentifier(%q) = %v, want %v", tt.input, got, tt.want)
+			}
+		})
+	}
+}
+
+func TestLoadConfigVethLeakRequiresNetworkCIDR(t *testing.T) {
+	_, err := loadConfig([]string{"--veth-leak-enabled"})
+	if err == nil {
+		t.Error("expected error when veth-leak-enabled without network-cidr")
+	}
+}
+
+func TestLoadConfigVethLeakDisabledWithoutNetworkCIDR(t *testing.T) {
+	cfg, err := loadConfig([]string{"--veth-leak-enabled=false"})
+	if err != nil {
+		t.Fatalf("loadConfig() error: %v", err)
+	}
+	if cfg.VethLeakEnabled {
+		t.Error("VethLeakEnabled should be false")
+	}
+}
+
+func TestLoadConfigVethLeakAutoProviderIP(t *testing.T) {
+	cfg, err := loadConfig([]string{
+		"--veth-nexthop", "169.254.0.1",
+		"--network-cidr", "10.0.0.0/24",
+	})
+	if err != nil {
+		t.Fatalf("loadConfig() error: %v", err)
+	}
+	if cfg.VethProviderIP != "169.254.0.2" {
+		t.Errorf("VethProviderIP = %q, want %q", cfg.VethProviderIP, "169.254.0.2")
+	}
+}
+
+func TestLoadConfigVethLeakExplicitProviderIP(t *testing.T) {
+	cfg, err := loadConfig([]string{
+		"--veth-provider-ip", "169.254.0.10",
+		"--network-cidr", "10.0.0.0/24",
+	})
+	if err != nil {
+		t.Fatalf("loadConfig() error: %v", err)
+	}
+	if cfg.VethProviderIP != "169.254.0.10" {
+		t.Errorf("VethProviderIP = %q, want %q", cfg.VethProviderIP, "169.254.0.10")
+	}
+}
+
+func TestLoadConfigVethLeakTableIDConflict(t *testing.T) {
+	_, err := loadConfig([]string{
+		"--route-table-id", "200",
+		"--veth-leak-table-id", "200",
+		"--network-cidr", "10.0.0.0/24",
+	})
+	if err == nil {
+		t.Error("expected error when veth-leak-table-id equals route-table-id")
+	}
+}
+
+func TestLoadConfigVethLeakTableIDInvalid(t *testing.T) {
+	_, err := loadConfig([]string{
+		"--veth-leak-table-id", "0",
+		"--network-cidr", "10.0.0.0/24",
+	})
+	if err == nil {
+		t.Error("expected error for veth-leak-table-id 0")
+	}
+}
+
+func TestApplyEnvConfigVethLeak(t *testing.T) {
+	cfg := Config{VethLeakEnabled: true}
+	t.Setenv("OVN_ROUTE_VETH_LEAK_ENABLED", "false")
+	t.Setenv("OVN_ROUTE_VETH_PROVIDER_IP", "169.254.0.5")
+	t.Setenv("OVN_ROUTE_VETH_LEAK_TABLE_ID", "201")
+	t.Setenv("OVN_ROUTE_VETH_LEAK_RULE_PRIORITY", "3000")
+	applyEnvConfig(&cfg)
+
+	if cfg.VethLeakEnabled {
+		t.Error("VethLeakEnabled should be false")
+	}
+	if cfg.VethProviderIP != "169.254.0.5" {
+		t.Errorf("VethProviderIP = %q, want %q", cfg.VethProviderIP, "169.254.0.5")
+	}
+	if cfg.VethLeakTableID != 201 {
+		t.Errorf("VethLeakTableID = %d, want 201", cfg.VethLeakTableID)
+	}
+	if cfg.VethLeakRulePriority != 3000 {
+		t.Errorf("VethLeakRulePriority = %d, want 3000", cfg.VethLeakRulePriority)
+	}
+}
+
+func TestApplyFileConfigVethLeak(t *testing.T) {
+	cfg := Config{VethLeakEnabled: true, VethLeakTableID: 200, VethLeakRulePriority: 2000}
+	enabled := false
+	tableID := 201
+	prio := 3000
+	fc := configFile{
+		VethLeakEnabled:      &enabled,
+		VethProviderIP:       "169.254.0.5",
+		VethLeakTableID:      &tableID,
+		VethLeakRulePriority: &prio,
+	}
+	applyFileConfig(&cfg, &fc)
+
+	if cfg.VethLeakEnabled {
+		t.Error("VethLeakEnabled should be false")
+	}
+	if cfg.VethProviderIP != "169.254.0.5" {
+		t.Errorf("VethProviderIP = %q, want %q", cfg.VethProviderIP, "169.254.0.5")
+	}
+	if cfg.VethLeakTableID != 201 {
+		t.Errorf("VethLeakTableID = %d, want 201", cfg.VethLeakTableID)
+	}
+	if cfg.VethLeakRulePriority != 3000 {
+		t.Errorf("VethLeakRulePriority = %d, want 3000", cfg.VethLeakRulePriority)
+	}
+}
+
+func TestLoadConfigVethLeakYAML(t *testing.T) {
+	content := `
+ovn_sb_remote: "tcp:10.0.0.1:6642"
+ovn_nb_remote: "tcp:10.0.0.1:6641"
+network_cidr: "10.0.0.0/24"
+veth_leak_enabled: true
+veth_provider_ip: "169.254.0.5"
+veth_leak_table_id: 201
+veth_leak_rule_priority: 3000
+`
+	path := filepath.Join(t.TempDir(), "config.yaml")
+	if err := os.WriteFile(path, []byte(content), 0644); err != nil {
+		t.Fatalf("write test config: %v", err)
+	}
+
+	cfg, err := loadConfig([]string{"--config", path})
+	if err != nil {
+		t.Fatalf("loadConfig() error: %v", err)
+	}
+	if !cfg.VethLeakEnabled {
+		t.Error("VethLeakEnabled should be true")
+	}
+	if cfg.VethProviderIP != "169.254.0.5" {
+		t.Errorf("VethProviderIP = %q, want %q", cfg.VethProviderIP, "169.254.0.5")
+	}
+	if cfg.VethLeakTableID != 201 {
+		t.Errorf("VethLeakTableID = %d, want 201", cfg.VethLeakTableID)
+	}
+	if cfg.VethLeakRulePriority != 3000 {
+		t.Errorf("VethLeakRulePriority = %d, want 3000", cfg.VethLeakRulePriority)
+	}
+}
+
+func TestNextIPInSubnet(t *testing.T) {
+	tests := []struct {
+		input string
+		want  string
+	}{
+		{"169.254.0.1", "169.254.0.2"},
+		{"169.254.0.254", "169.254.0.255"},
+		{"169.254.0.255", "169.254.1.0"},
+		{"10.0.0.0", "10.0.0.1"},
+		{"255.255.255.255", "0.0.0.0"}, // wraps around
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.input, func(t *testing.T) {
+			got := nextIPInSubnet(net.ParseIP(tt.input))
+			if got.String() != tt.want {
+				t.Errorf("nextIPInSubnet(%s) = %s, want %s", tt.input, got, tt.want)
 			}
 		})
 	}

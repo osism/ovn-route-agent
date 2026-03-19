@@ -2,6 +2,12 @@
 #
 # veth-vrf-leak.sh - VRF Route Leaking via veth Pair
 #
+# DEPRECATED: This functionality is now built into the ovn-route-agent Go
+# daemon (--veth-leak-enabled, enabled by default). The agent sets up and
+# tears down the veth pair automatically on startup/shutdown. This script
+# is kept here for reference only.
+# See: https://github.com/osism/ovn-route-agent#vrf-route-leaking
+#
 # This script sets up a veth pair to enable selective route leaking
 # between the default VRF and the "vrf-provider" VRF. This allows
 # specific networks (listed in a configuration file) to communicate

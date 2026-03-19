@@ -70,6 +70,12 @@ type Config struct {
 	LogLevel          string
 	DryRun            bool
 	CleanupOnShutdown bool
+
+	// Veth VRF leak settings
+	VethLeakEnabled      bool
+	VethProviderIP       string // IP of the veth-provider side (default: computed from VethNexthop + 1)
+	VethLeakTableID      int    // Routing table for leak default route (default: 200)
+	VethLeakRulePriority int    // Policy rule priority (default: 2000)
 }
 
 // configFile is the YAML representation of the config file.
@@ -88,6 +94,11 @@ type configFile struct {
 	LogLevel          string        `yaml:"log_level"`
 	DryRun            *bool         `yaml:"dry_run"`
 	CleanupOnShutdown *bool         `yaml:"cleanup_on_shutdown"`
+
+	VethLeakEnabled      *bool  `yaml:"veth_leak_enabled"`
+	VethProviderIP       string `yaml:"veth_provider_ip"`
+	VethLeakTableID      *int   `yaml:"veth_leak_table_id"`
+	VethLeakRulePriority *int   `yaml:"veth_leak_rule_priority"`
 }
 
 // loadConfig builds the configuration with the following priority
@@ -112,6 +123,11 @@ func loadConfig(args []string) (Config, error) {
 		fLogLevel          = fs.String("log-level", "", "Log level (debug, info, warn, error)")
 		fDryRun            = fs.Bool("dry-run", false, "Dry-run mode: connect and reconcile but only log what would be done")
 		fCleanupOnShutdown = fs.Bool("cleanup-on-shutdown", true, "Remove all managed routes on shutdown (SIGINT/SIGTERM)")
+
+		fVethLeakEnabled      = fs.Bool("veth-leak-enabled", true, "Enable veth VRF route leaking")
+		fVethProviderIP       = fs.String("veth-provider-ip", "", "IP of the veth-provider side (default: veth-nexthop + 1)")
+		fVethLeakTableID      = fs.Int("veth-leak-table-id", 200, "Routing table ID for veth leak default route (1-252)")
+		fVethLeakRulePriority = fs.Int("veth-leak-rule-priority", 2000, "Policy rule priority for veth leak rules")
 	)
 
 	if err := fs.Parse(args); err != nil {
@@ -124,13 +140,16 @@ func loadConfig(args []string) (Config, error) {
 
 	// Layer 0: defaults
 	cfg := Config{
-		BridgeDev:         "br-ex",
-		VRFName:           "vrf-provider",
-		VethNexthop:       "169.254.0.1",
-		BridgeIP:          "169.254.169.254",
-		ReconcileInterval: 60 * time.Second,
-		LogLevel:          "info",
-		CleanupOnShutdown: true,
+		BridgeDev:            "br-ex",
+		VRFName:              "vrf-provider",
+		VethNexthop:          "169.254.0.1",
+		BridgeIP:             "169.254.169.254",
+		ReconcileInterval:    60 * time.Second,
+		LogLevel:             "info",
+		CleanupOnShutdown:    true,
+		VethLeakEnabled:      true,
+		VethLeakTableID:      200,
+		VethLeakRulePriority: 2000,
 	}
 
 	// Layer 1: config file
@@ -178,6 +197,14 @@ func loadConfig(args []string) (Config, error) {
 			cfg.DryRun = *fDryRun
 		case "cleanup-on-shutdown":
 			cfg.CleanupOnShutdown = *fCleanupOnShutdown
+		case "veth-leak-enabled":
+			cfg.VethLeakEnabled = *fVethLeakEnabled
+		case "veth-provider-ip":
+			cfg.VethProviderIP = *fVethProviderIP
+		case "veth-leak-table-id":
+			cfg.VethLeakTableID = *fVethLeakTableID
+		case "veth-leak-rule-priority":
+			cfg.VethLeakRulePriority = *fVethLeakRulePriority
 		}
 	})
 
@@ -209,7 +236,48 @@ func validateConfig(cfg *Config) error {
 			cfg.NetworkFilters = append(cfg.NetworkFilters, cidr)
 		}
 	}
+
+	// Veth leak validation
+	if cfg.VethLeakEnabled {
+		if len(cfg.NetworkCIDRs) == 0 {
+			return fmt.Errorf("veth-leak-enabled requires network-cidr to be set")
+		}
+		if cfg.VethLeakTableID < 1 || cfg.VethLeakTableID > 252 {
+			return fmt.Errorf("invalid veth-leak-table-id: %d (must be 1-252)", cfg.VethLeakTableID)
+		}
+		// RouteTableID 0 means "main table" and cannot conflict with an explicit leak table.
+		if cfg.VethLeakTableID == cfg.RouteTableID && cfg.RouteTableID != 0 {
+			return fmt.Errorf("veth-leak-table-id (%d) must not equal route-table-id (%d)", cfg.VethLeakTableID, cfg.RouteTableID)
+		}
+		// Auto-compute VethProviderIP from VethNexthop + 1 if not set.
+		if cfg.VethProviderIP == "" {
+			nexthopIP := net.ParseIP(cfg.VethNexthop)
+			cfg.VethProviderIP = nextIPInSubnet(nexthopIP).String()
+		}
+		if net.ParseIP(cfg.VethProviderIP) == nil {
+			return fmt.Errorf("invalid veth-provider-ip: %q", cfg.VethProviderIP)
+		}
+	}
+
 	return nil
+}
+
+// nextIPInSubnet returns the next IP address after the given IP.
+// NOTE: wraps around to 0.0.0.0 for 255.255.255.255 — callers must validate.
+func nextIPInSubnet(ip net.IP) net.IP {
+	ip = ip.To4()
+	if ip == nil {
+		return nil
+	}
+	next := make(net.IP, len(ip))
+	copy(next, ip)
+	for i := len(next) - 1; i >= 0; i-- {
+		next[i]++
+		if next[i] != 0 {
+			break
+		}
+	}
+	return next
 }
 
 // isValidIdentifier checks that a string contains only safe characters
@@ -280,6 +348,18 @@ func applyFileConfig(cfg *Config, fc *configFile) {
 	if fc.CleanupOnShutdown != nil {
 		cfg.CleanupOnShutdown = *fc.CleanupOnShutdown
 	}
+	if fc.VethLeakEnabled != nil {
+		cfg.VethLeakEnabled = *fc.VethLeakEnabled
+	}
+	if fc.VethProviderIP != "" {
+		cfg.VethProviderIP = fc.VethProviderIP
+	}
+	if fc.VethLeakTableID != nil {
+		cfg.VethLeakTableID = *fc.VethLeakTableID
+	}
+	if fc.VethLeakRulePriority != nil {
+		cfg.VethLeakRulePriority = *fc.VethLeakRulePriority
+	}
 }
 
 func applyEnvConfig(cfg *Config) {
@@ -329,5 +409,23 @@ func applyEnvConfig(cfg *Config) {
 	}
 	if v := os.Getenv("OVN_ROUTE_CLEANUP_ON_SHUTDOWN"); v == "0" || v == "false" {
 		cfg.CleanupOnShutdown = false
+	}
+	if v := os.Getenv("OVN_ROUTE_VETH_LEAK_ENABLED"); v == "0" || v == "false" {
+		cfg.VethLeakEnabled = false
+	}
+	if v := os.Getenv("OVN_ROUTE_VETH_PROVIDER_IP"); v != "" {
+		cfg.VethProviderIP = v
+	}
+	if v := os.Getenv("OVN_ROUTE_VETH_LEAK_TABLE_ID"); v != "" {
+		var id int
+		if _, err := fmt.Sscanf(v, "%d", &id); err == nil {
+			cfg.VethLeakTableID = id
+		}
+	}
+	if v := os.Getenv("OVN_ROUTE_VETH_LEAK_RULE_PRIORITY"); v != "" {
+		var prio int
+		if _, err := fmt.Sscanf(v, "%d", &prio); err == nil {
+			cfg.VethLeakRulePriority = prio
+		}
 	}
 }

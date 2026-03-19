@@ -18,6 +18,13 @@ type RouteManager struct {
 	ovsWrapper   []string // prefix args for ovs-vsctl/ovs-ofctl (e.g. ["docker", "exec", "openvswitch_vswitchd"])
 	dryRun       bool
 
+	// Veth VRF leak settings
+	vethLeakEnabled      bool
+	vethProviderIP       string
+	vethLeakTableID      int
+	vethLeakRulePriority int
+	networkFilters       []*net.IPNet
+
 	// Cached OVS discovery results (populated on first use).
 	cachedPatchPort string
 	cachedOfport    string
@@ -26,11 +33,16 @@ type RouteManager struct {
 
 func NewRouteManager(cfg Config) *RouteManager {
 	rm := &RouteManager{
-		bridgeDev:    cfg.BridgeDev,
-		vrfName:      cfg.VRFName,
-		vethNexthop:  cfg.VethNexthop,
-		routeTableID: cfg.RouteTableID,
-		dryRun:       cfg.DryRun,
+		bridgeDev:            cfg.BridgeDev,
+		vrfName:              cfg.VRFName,
+		vethNexthop:          cfg.VethNexthop,
+		routeTableID:         cfg.RouteTableID,
+		dryRun:               cfg.DryRun,
+		vethLeakEnabled:      cfg.VethLeakEnabled,
+		vethProviderIP:       cfg.VethProviderIP,
+		vethLeakTableID:      cfg.VethLeakTableID,
+		vethLeakRulePriority: cfg.VethLeakRulePriority,
+		networkFilters:       cfg.NetworkFilters,
 	}
 	if cfg.OVSWrapper != "" {
 		rm.ovsWrapper = strings.Fields(cfg.OVSWrapper)
@@ -170,4 +182,8 @@ func (rm *RouteManager) RemoveRoute(ip string) error {
 
 func isNoSuchRoute(err error) bool {
 	return strings.Contains(err.Error(), "no such process")
+}
+
+func isNoSuchRule(err error) bool {
+	return strings.Contains(err.Error(), "no such file or directory")
 }
