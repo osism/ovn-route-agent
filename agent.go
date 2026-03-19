@@ -23,6 +23,12 @@ type Agent struct {
 	// reconciliation cycle — either from manual config or auto-discovered
 	// from OVN Logical_Router_Port.Networks.
 	effectiveFilters []*net.IPNet
+
+	// consecutiveReAdds tracks how many reconcile cycles in a row the
+	// post-change verification had to re-add missing routes. A sustained
+	// non-zero value indicates persistent route instability (e.g. FRR
+	// misconfiguration) and triggers escalated logging.
+	consecutiveReAdds int
 }
 
 func NewAgent(cfg Config) (*Agent, error) {
@@ -145,6 +151,9 @@ func (a *Agent) reconcile() {
 		"desired_ips", len(desiredIPs),
 		"effective_networks", len(a.effectiveFilters),
 	)
+	if len(desiredIPs) > 0 {
+		slog.Debug("desired IP list", "ips", desiredIPs)
+	}
 
 	if state.HasLocalRouters {
 		// Ensure OVS MAC-tweak flows are in place (only when active).
@@ -288,12 +297,22 @@ func (a *Agent) ensureRoutes(desiredIPs []string) {
 		}
 	}
 
-	// If any FRR routes changed, trigger an outbound BGP refresh so peers
-	// learn about the changes immediately.
-	if len(addFRR) > 0 || len(delFRR) > 0 {
+	// Only trigger a BGP soft-refresh when routes were removed. For
+	// additions FRR's normal route redistribution announces the new
+	// static routes automatically. A blanket "clear ip bgp * soft out"
+	// re-evaluates outbound policy for ALL routes; doing this on every
+	// addition risks disrupting existing BGP announcements.
+	if len(delFRR) > 0 {
 		if err := a.routing.RefreshBGP(); err != nil {
 			slog.Warn("BGP soft-refresh failed, peers may wait for MRAI timer", "error", err)
 		}
+	}
+
+	// Safety net: after any route changes, verify that all desired routes
+	// are still present. A BGP soft-refresh re-evaluates outbound policy
+	// and could (in edge cases) interact with FRR in unexpected ways.
+	if len(addFRR) > 0 || len(delFRR) > 0 {
+		a.verifyRoutes(desiredIPs)
 	}
 }
 
@@ -368,6 +387,82 @@ func (a *Agent) cleanup() {
 	if err := a.ovn.RemoveManagedNBEntries(cleanupCtx); err != nil {
 		slog.Error("failed to remove managed OVN NB entries", "error", err)
 	}
+}
+
+// consecutiveReAddThreshold is the number of consecutive reconcile cycles
+// with route re-adds before logging escalates from Warn to Error.
+const consecutiveReAddThreshold = 3
+
+// verifyRoutes checks that all desired IPs still have both a kernel route and
+// an FRR static route after route mutations. Any route that disappeared
+// (e.g. due to a vtysh race or unexpected FRR behaviour) is re-added
+// immediately so that existing connections are not disrupted.
+//
+// Returns the number of routes that had to be re-added (0 means all routes
+// were present). The agent tracks consecutive non-zero results and escalates
+// logging to help operators detect persistent route instability.
+func (a *Agent) verifyRoutes(desiredIPs []string) int {
+	// Re-read current FRR routes.
+	currentFRR, err := a.routing.ListFRRRoutes()
+	if err != nil {
+		slog.Error("post-change FRR route verification failed", "error", err)
+		return 0
+	}
+	frrSet := make(map[string]bool, len(currentFRR))
+	for _, ip := range currentFRR {
+		frrSet[ip] = true
+	}
+
+	// Re-read current kernel routes.
+	currentKernel, err := a.routing.ListKernelRoutes()
+	if err != nil {
+		slog.Error("post-change kernel route verification failed", "error", err)
+		return 0
+	}
+	kernelSet := make(map[string]bool, len(currentKernel))
+	for _, ip := range currentKernel {
+		kernelSet[ip] = true
+	}
+
+	var reAddFRR []string
+	reAddKernel := 0
+	for _, ip := range desiredIPs {
+		if !a.isManaged(ip) {
+			continue
+		}
+		if !frrSet[ip] {
+			slog.Warn("FRR route missing after route change, re-adding", "ip", ip)
+			reAddFRR = append(reAddFRR, ip)
+		}
+		if !kernelSet[ip] {
+			slog.Warn("kernel route missing after route change, re-adding", "ip", ip)
+			if err := a.routing.AddKernelRoute(ip); err != nil {
+				slog.Error("failed to re-add kernel route", "ip", ip, "error", err)
+			}
+			reAddKernel++
+		}
+	}
+
+	if len(reAddFRR) > 0 {
+		if err := a.routing.AddFRRRoutes(reAddFRR); err != nil {
+			slog.Error("failed to re-add FRR routes", "count", len(reAddFRR), "error", err)
+		}
+	}
+
+	totalReAdds := len(reAddFRR) + reAddKernel
+	if totalReAdds > 0 {
+		a.consecutiveReAdds++
+		if a.consecutiveReAdds >= consecutiveReAddThreshold {
+			slog.Error("persistent route instability detected: routes required re-adding for multiple consecutive cycles",
+				"consecutive_cycles", a.consecutiveReAdds,
+				"re_added_this_cycle", totalReAdds,
+			)
+		}
+	} else {
+		a.consecutiveReAdds = 0
+	}
+
+	return totalReAdds
 }
 
 // isManaged returns true if the IP is within any of the effective network CIDRs.

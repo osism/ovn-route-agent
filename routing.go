@@ -172,6 +172,9 @@ func (rm *RouteManager) HasFRRRoute(ip string) bool {
 
 // ListFRRRoutes returns all static /32 routes in the VRF.
 func (rm *RouteManager) ListFRRRoutes() ([]string, error) {
+	if rm.dryRun {
+		return nil, nil
+	}
 	cmd := exec.Command("vtysh",
 		"-c", fmt.Sprintf("show ip route vrf %s static", rm.vrfName),
 	)

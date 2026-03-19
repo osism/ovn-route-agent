@@ -134,3 +134,94 @@ func TestTriggerReconcile(t *testing.T) {
 	a.triggerReconcile()
 	a.triggerReconcile() // Should not block even with full channel.
 }
+
+func TestVerifyRoutesDryRun(t *testing.T) {
+	rm := &RouteManager{
+		bridgeDev:   "br-ex",
+		vrfName:     "vrf-provider",
+		vethNexthop: "169.254.0.1",
+		dryRun:      true,
+	}
+	_, cidr, _ := net.ParseCIDR("10.0.0.0/24")
+	a := &Agent{
+		routing:          rm,
+		effectiveFilters: []*net.IPNet{cidr},
+	}
+
+	// In dry-run mode, ListFRRRoutes and ListKernelRoutes return empty
+	// lists (nil, nil). This means verifyRoutes sees every desired IP as
+	// missing and attempts re-adds — but those are also dry-run no-ops.
+	// This is by design: we exercise the full code path without side effects.
+	n := a.verifyRoutes([]string{"10.0.0.1", "10.0.0.2", "10.0.0.3"})
+	if n != 6 { // 3 FRR + 3 kernel
+		t.Errorf("expected 6 re-adds in dry-run, got %d", n)
+	}
+}
+
+func TestVerifyRoutesSkipsUnmanagedIPs(t *testing.T) {
+	rm := &RouteManager{
+		bridgeDev:   "br-ex",
+		vrfName:     "vrf-provider",
+		vethNexthop: "169.254.0.1",
+		dryRun:      true,
+	}
+	_, cidr, _ := net.ParseCIDR("10.0.0.0/24")
+	a := &Agent{
+		routing:          rm,
+		effectiveFilters: []*net.IPNet{cidr},
+	}
+
+	// IPs outside the managed CIDR should be skipped — zero re-adds.
+	n := a.verifyRoutes([]string{"192.168.1.1", "172.16.0.1"})
+	if n != 0 {
+		t.Errorf("expected 0 re-adds for unmanaged IPs, got %d", n)
+	}
+}
+
+func TestVerifyRoutesEmptyDesired(t *testing.T) {
+	rm := &RouteManager{
+		bridgeDev:   "br-ex",
+		vrfName:     "vrf-provider",
+		vethNexthop: "169.254.0.1",
+		dryRun:      true,
+	}
+	a := &Agent{routing: rm}
+
+	// Empty desired list should be a no-op.
+	if n := a.verifyRoutes(nil); n != 0 {
+		t.Errorf("expected 0 re-adds for nil desired, got %d", n)
+	}
+	if n := a.verifyRoutes([]string{}); n != 0 {
+		t.Errorf("expected 0 re-adds for empty desired, got %d", n)
+	}
+}
+
+func TestVerifyRoutesConsecutiveReAddCounter(t *testing.T) {
+	rm := &RouteManager{
+		bridgeDev:   "br-ex",
+		vrfName:     "vrf-provider",
+		vethNexthop: "169.254.0.1",
+		dryRun:      true,
+	}
+	_, cidr, _ := net.ParseCIDR("10.0.0.0/24")
+	a := &Agent{
+		routing:          rm,
+		effectiveFilters: []*net.IPNet{cidr},
+	}
+
+	// Simulate multiple consecutive cycles with missing routes (dry-run
+	// always reports all routes as missing since list calls return nil).
+	desired := []string{"10.0.0.1"}
+	for i := 1; i <= 5; i++ {
+		a.verifyRoutes(desired)
+		if a.consecutiveReAdds != i {
+			t.Errorf("after cycle %d: expected consecutiveReAdds=%d, got %d", i, i, a.consecutiveReAdds)
+		}
+	}
+
+	// A cycle with no managed IPs (nothing to re-add) resets the counter.
+	a.verifyRoutes([]string{"192.168.1.1"}) // unmanaged → 0 re-adds
+	if a.consecutiveReAdds != 0 {
+		t.Errorf("expected consecutiveReAdds=0 after clean cycle, got %d", a.consecutiveReAdds)
+	}
+}

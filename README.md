@@ -220,6 +220,8 @@ For each locally-active router the agent:
 2. Installs **OVS MAC-tweak flows** on `br-ex` so packets from OVN reach the kernel with the correct destination MAC
 3. Creates `/32` **kernel routes** (with `ip rule` entries when using a dedicated routing table) on `br-ex` so the kernel can receive packets for each FIP
 4. Creates `/32` **FRR static routes** in `vrf-provider` so BGP announces each FIP to the external fabric
+5. Triggers a **BGP outbound soft-refresh** only when routes are removed (withdrawals) — additions rely on FRR's normal route redistribution to avoid disrupting existing BGP announcements
+6. **Verifies** all desired routes (FRR and kernel) after every route change and re-adds any that went missing as a safety net
 
 ### Data plane
 

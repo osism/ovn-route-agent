@@ -227,6 +227,9 @@ func (rm *RouteManager) DelKernelRoute(ip string) error {
 // ListKernelRoutes returns all /32 routes on the bridge device.
 // When a dedicated routing table is configured, only routes from that table are returned.
 func (rm *RouteManager) ListKernelRoutes() ([]string, error) {
+	if rm.dryRun {
+		return nil, nil
+	}
 	link, err := netlink.LinkByName(rm.bridgeDev)
 	if err != nil {
 		return nil, fmt.Errorf("find bridge %s: %w", rm.bridgeDev, err)
