@@ -232,3 +232,103 @@ func (o *OVNClient) ensureStaticMACBinding(ctx context.Context, lrpName, ip, mac
 	return nil
 }
 
+// RemoveManagedNBEntries removes OVN NB entries created by this agent instance.
+// Only entries belonging to locally-active routers are removed, so that agents
+// running on other network nodes are not affected.
+func (o *OVNClient) RemoveManagedNBEntries(ctx context.Context) error {
+	state := o.GetState()
+
+	// Build set of locally-active router UUIDs and LRP names.
+	localRouterUUIDs := make(map[string]bool, len(state.LocalRouters))
+	localPorts := make(map[string]bool, len(state.LocalRouters))
+	for _, lr := range state.LocalRouters {
+		localRouterUUIDs[lr.RouterUUID] = true
+		localPorts[lr.LRPName] = true
+	}
+
+	if len(localRouterUUIDs) == 0 {
+		slog.Debug("no locally-active routers, skipping OVN NB cleanup")
+		return nil
+	}
+
+	// Remove managed static routes on locally-active routers.
+	var routes []NBLogicalRouterStaticRoute
+	if err := o.nbClient.List(ctx, &routes); err != nil {
+		return fmt.Errorf("list static routes: %w", err)
+	}
+
+	var routers []NBLogicalRouter
+	if err := o.nbClient.List(ctx, &routers); err != nil {
+		return fmt.Errorf("list routers: %w", err)
+	}
+
+	for _, route := range routes {
+		if route.ExternalIDs == nil || route.ExternalIDs["ovn-route-agent"] != "managed" {
+			continue
+		}
+
+		// Find the router that owns this route — only process local routers.
+	nextRoute:
+		for _, router := range routers {
+			if !localRouterUUIDs[router.UUID] {
+				continue
+			}
+			for _, ruuid := range router.StaticRoutes {
+				if ruuid != route.UUID {
+					continue
+				}
+				mutateOp := ovsdb.Operation{
+					Op:    "mutate",
+					Table: "Logical_Router",
+					Where: []ovsdb.Condition{{
+						Column:   "_uuid",
+						Function: ovsdb.ConditionEqual,
+						Value:    ovsdb.UUID{GoUUID: router.UUID},
+					}},
+					Mutations: []ovsdb.Mutation{{
+						Column:  "static_routes",
+						Mutator: ovsdb.MutateOperationDelete,
+						Value:   ovsdb.UUID{GoUUID: route.UUID},
+					}},
+				}
+				deleteOps, err := o.nbClient.Where(&route).Delete()
+				if err != nil {
+					slog.Error("failed to build delete op for managed route", "uuid", route.UUID, "error", err)
+					break nextRoute
+				}
+				allOps := append([]ovsdb.Operation{mutateOp}, deleteOps...)
+				if err := o.transactOps(ctx, allOps); err != nil {
+					slog.Error("failed to remove managed route", "router", router.Name, "prefix", route.IPPrefix, "error", err)
+				} else {
+					slog.Info("managed OVN route removed", "router", router.Name, "prefix", route.IPPrefix, "nexthop", route.Nexthop)
+				}
+				break nextRoute
+			}
+		}
+	}
+
+	// Remove static MAC bindings on locally-active router ports.
+	var bindings []NBStaticMACBinding
+	if err := o.nbClient.List(ctx, &bindings); err != nil {
+		return fmt.Errorf("list static MAC bindings: %w", err)
+	}
+
+	for _, b := range bindings {
+		if !localPorts[b.LogicalPort] {
+			continue
+		}
+		ops, err := o.nbClient.Where(&b).Delete()
+		if err != nil {
+			slog.Error("failed to build delete op for MAC binding", "lrp", b.LogicalPort, "ip", b.IP, "error", err)
+			continue
+		}
+		if err := o.transactOps(ctx, ops); err != nil {
+			slog.Error("failed to remove static MAC binding", "lrp", b.LogicalPort, "ip", b.IP, "error", err)
+		} else {
+			slog.Info("managed static MAC binding removed", "lrp", b.LogicalPort, "ip", b.IP, "mac", b.MAC)
+		}
+	}
+
+	return nil
+}
+

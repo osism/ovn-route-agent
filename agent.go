@@ -266,7 +266,7 @@ func (a *Agent) removeAllRoutes(reason string) {
 	}
 }
 
-// cleanup removes all managed routes and OVS flows on shutdown.
+// cleanup removes all managed routes, OVS flows, and OVN NB entries on shutdown.
 func (a *Agent) cleanup() {
 	a.removeAllRoutes("shutdown cleanup")
 
@@ -275,6 +275,11 @@ func (a *Agent) cleanup() {
 	}
 	if err := a.routing.CleanupRoutingTable(); err != nil {
 		slog.Error("failed to flush routing table", "error", err)
+	}
+	cleanupCtx, cleanupCancel := context.WithTimeout(context.Background(), 10*time.Second)
+	defer cleanupCancel()
+	if err := a.ovn.RemoveManagedNBEntries(cleanupCtx); err != nil {
+		slog.Error("failed to remove managed OVN NB entries", "error", err)
 	}
 }
 
