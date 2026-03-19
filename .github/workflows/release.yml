@@ -44,7 +44,7 @@ jobs:
           go install github.com/goreleaser/nfpm/v2/cmd/nfpm@latest
           GOARCH=${{ matrix.goarch }} VERSION="${VERSION}" nfpm package --packager deb --target .
 
-      - uses: actions/upload-artifact@v6
+      - uses: actions/upload-artifact@v7
         with:
           name: build-${{ matrix.goos }}-${{ matrix.goarch }}
           path: |
@@ -59,7 +59,7 @@ jobs:
         with:
           fetch-depth: 0
 
-      - uses: actions/download-artifact@v6
+      - uses: actions/download-artifact@v8
         with:
           path: artifacts
           merge-multiple: true
