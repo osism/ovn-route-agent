@@ -53,9 +53,16 @@ jobs:
           path: artifacts
           merge-multiple: true
 
+      - name: Generate SBOM
+        uses: anchore/sbom-action@v0
+        with:
+          path: .
+          format: cyclonedx-json
+          output-file: artifacts/sbom.cyclonedx.json
+
       - name: Create checksums
         working-directory: artifacts
-        run: sha256sum ovn-route-agent-* > checksums.txt
+        run: sha256sum ovn-route-agent-* sbom.cyclonedx.json > checksums.txt
 
       - name: Generate changelog
         uses: orhun/git-cliff-action@v4
@@ -69,4 +76,5 @@ jobs:
           body: ${{ steps.changelog.outputs.content }}
           files: |
             artifacts/ovn-route-agent-*
+            artifacts/sbom.cyclonedx.json
             artifacts/checksums.txt
