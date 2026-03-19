@@ -483,6 +483,39 @@ func (o *OVNClient) refreshState(ctx context.Context) {
 		}
 	}
 
+	// Step 5b: Extract SNAT IPs from SB gateway port NatAddresses.
+	// When a router has an external gateway but no connected internal subnets,
+	// Neutron has not yet created the NB NAT entry. However, the SB
+	// Port_Binding for the gateway patch port already contains the NAT IP
+	// in its NatAddresses field. Extract these so routes are announced
+	// as soon as the gateway is set.
+	for _, pb := range portBindings {
+		if pb.Type != "patch" {
+			continue
+		}
+		peer := pb.Options["peer"]
+		if peer == "" {
+			continue
+		}
+		if _, isLocal := localLRPNames[peer]; !isLocal {
+			continue
+		}
+		if pb.ExternalIDs["neutron:device_owner"] != "network:router_gateway" {
+			continue
+		}
+		for _, natAddr := range pb.NatAddresses {
+			for _, ip := range parseNatAddressIPs(natAddr) {
+				if len(effectiveFilters) > 0 {
+					parsedIP := net.ParseIP(ip)
+					if parsedIP == nil || !containedInAny(parsedIP, effectiveFilters) {
+						continue
+					}
+				}
+				snatIPs = append(snatIPs, ip)
+			}
+		}
+	}
+
 	// Step 6: Update state atomically.
 	o.state.mu.Lock()
 	o.state.LocalRouters = localRouters
@@ -700,6 +733,25 @@ func uniqueNetworks(nets []*net.IPNet) []*net.IPNet {
 		return result[i].String() < result[j].String()
 	})
 	return result
+}
+
+// parseNatAddressIPs extracts IP addresses from an OVN NatAddresses entry.
+// Format: "MAC IP1 [IP2 ...] [is_chassis_resident("port")]"
+func parseNatAddressIPs(natAddr string) []string {
+	fields := strings.Fields(natAddr)
+	if len(fields) < 2 {
+		return nil
+	}
+	var ips []string
+	for _, f := range fields[1:] {
+		if strings.HasPrefix(f, "is_chassis_resident") {
+			break
+		}
+		if net.ParseIP(f) != nil {
+			ips = append(ips, f)
+		}
+	}
+	return ips
 }
 
 func getHostname() (string, error) {

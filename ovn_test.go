@@ -179,6 +179,49 @@ func TestGetStateIncludesDiscoveredNetworks(t *testing.T) {
 	}
 }
 
+func TestParseNatAddressIPs(t *testing.T) {
+	tests := []struct {
+		name    string
+		natAddr string
+		want    []string
+	}{
+		{
+			"typical SNAT with chassis_resident",
+			`fa:16:3e:8f:45:69 198.51.100.15 is_chassis_resident("cr-lrp-d8bba1ed-55eb-4476-9c3e-bedc07388cac")`,
+			[]string{"198.51.100.15"},
+		},
+		{
+			"multiple IPs",
+			"fa:16:3e:ab:cd:ef 10.0.0.1 10.0.0.2 is_chassis_resident(\"cr-lrp-abc\")",
+			[]string{"10.0.0.1", "10.0.0.2"},
+		},
+		{
+			"MAC and IP only",
+			"fa:16:3e:ab:cd:ef 192.168.1.1",
+			[]string{"192.168.1.1"},
+		},
+		{
+			"MAC only",
+			"fa:16:3e:ab:cd:ef",
+			nil,
+		},
+		{
+			"empty string",
+			"",
+			nil,
+		},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			got := parseNatAddressIPs(tt.natAddr)
+			if !reflect.DeepEqual(got, tt.want) {
+				t.Errorf("parseNatAddressIPs(%q) = %v, want %v", tt.natAddr, got, tt.want)
+			}
+		})
+	}
+}
+
 func TestSBDatabaseModel(t *testing.T) {
 	m, err := sbDatabaseModel()
 	if err != nil {
