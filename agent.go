@@ -222,7 +222,8 @@ func (a *Agent) ensureRoutes(desiredIPs []string) {
 		}
 	}
 
-	// Add missing routes
+	// Collect missing and stale routes, then apply in batches.
+	var addFRR []string
 	for _, ip := range desiredIPs {
 		needsKernel := !currentKernelSet[ip]
 		needsFRR := !currentFRRSet[ip]
@@ -240,32 +241,58 @@ func (a *Agent) ensureRoutes(desiredIPs []string) {
 			}
 		}
 		if needsFRR {
-			if err := a.routing.AddFRRRoute(ip); err != nil {
-				slog.Error("failed to add FRR route", "ip", ip, "error", err)
-			}
+			addFRR = append(addFRR, ip)
 		}
 	}
 
-	// Remove stale kernel routes (also removes the corresponding FRR route)
+	// Batch-add all missing FRR routes in one vtysh call.
+	if len(addFRR) > 0 {
+		if err := a.routing.AddFRRRoutes(addFRR); err != nil {
+			slog.Error("failed to batch-add FRR routes", "count", len(addFRR), "ips", addFRR, "error", err)
+		}
+	}
+
+	// Collect stale routes for batch removal.
+	var delFRR []string
 	removedSet := make(map[string]bool)
 	for _, ip := range currentKernel {
 		if !desiredSet[ip] && a.isManaged(ip) {
 			slog.Info("removing stale route", "ip", ip)
-			if err := a.routing.RemoveRoute(ip); err != nil {
-				slog.Error("failed to remove stale route", "ip", ip, "error", err)
-			}
+			// Remove FRR first to stop attracting traffic before tearing down the data plane.
+			delFRR = append(delFRR, ip)
 			removedSet[ip] = true
 		}
 	}
 
-	// Remove orphaned FRR routes that have no corresponding kernel route
-	// (skip IPs already handled in the stale route loop above)
+	// Collect orphaned FRR routes that have no corresponding kernel route.
 	for _, ip := range currentFRR {
 		if !desiredSet[ip] && a.isManaged(ip) && !removedSet[ip] {
 			slog.Info("removing orphaned FRR route", "ip", ip)
-			if err := a.routing.DelFRRRoute(ip); err != nil {
-				slog.Error("failed to remove orphaned FRR route", "ip", ip, "error", err)
+			delFRR = append(delFRR, ip)
+		}
+	}
+
+	// Batch-remove all stale/orphaned FRR routes in one vtysh call.
+	if len(delFRR) > 0 {
+		if err := a.routing.DelFRRRoutes(delFRR); err != nil {
+			slog.Error("failed to batch-del FRR routes", "count", len(delFRR), "ips", delFRR, "error", err)
+		}
+	}
+
+	// Remove stale kernel routes (after FRR withdrawal).
+	for _, ip := range currentKernel {
+		if removedSet[ip] {
+			if err := a.routing.DelKernelRoute(ip); err != nil {
+				slog.Error("failed to remove kernel route", "ip", ip, "error", err)
 			}
+		}
+	}
+
+	// If any FRR routes changed, trigger an outbound BGP refresh so peers
+	// learn about the changes immediately.
+	if len(addFRR) > 0 || len(delFRR) > 0 {
+		if err := a.routing.RefreshBGP(); err != nil {
+			slog.Warn("BGP soft-refresh failed, peers may wait for MRAI timer", "error", err)
 		}
 	}
 }
@@ -273,32 +300,44 @@ func (a *Agent) ensureRoutes(desiredIPs []string) {
 // removeAllRoutes removes all managed FIP routes.
 // The reason parameter is used in log messages to indicate why routes are being removed.
 func (a *Agent) removeAllRoutes(reason string) {
+	// Collect all managed FRR routes for batch removal (FRR first to stop attracting traffic).
+	var delFRR []string
+	currentFRR, err := a.routing.ListFRRRoutes()
+	if err != nil {
+		slog.Error("failed to list FRR routes", "error", err)
+	} else {
+		for _, ip := range currentFRR {
+			if a.isManaged(ip) {
+				delFRR = append(delFRR, ip)
+			}
+		}
+	}
+
+	if len(delFRR) > 0 {
+		slog.Info("batch-removing FRR routes", "count", len(delFRR), "reason", reason)
+		if err := a.routing.DelFRRRoutes(delFRR); err != nil {
+			slog.Error("failed to batch-del FRR routes", "count", len(delFRR), "ips", delFRR, "error", err)
+		}
+	}
+
+	// Remove kernel routes.
 	currentKernel, err := a.routing.ListKernelRoutes()
 	if err != nil {
 		slog.Error("failed to list kernel routes", "error", err)
 	} else {
 		for _, ip := range currentKernel {
 			if a.isManaged(ip) {
-				slog.Info("removing route", "ip", ip, "reason", reason)
-				if err := a.routing.RemoveRoute(ip); err != nil {
-					slog.Error("failed to remove route", "ip", ip, "error", err)
+				slog.Info("removing kernel route", "ip", ip, "reason", reason)
+				if err := a.routing.DelKernelRoute(ip); err != nil {
+					slog.Error("failed to remove kernel route", "ip", ip, "error", err)
 				}
 			}
 		}
 	}
 
-	// Remove any orphaned FRR routes that exist without corresponding kernel routes
-	currentFRR, err := a.routing.ListFRRRoutes()
-	if err != nil {
-		slog.Error("failed to list FRR routes", "error", err)
-		return
-	}
-	for _, ip := range currentFRR {
-		if a.isManaged(ip) {
-			slog.Info("removing orphaned FRR route", "ip", ip, "reason", reason)
-			if err := a.routing.DelFRRRoute(ip); err != nil {
-				slog.Error("failed to remove FRR route", "ip", ip, "error", err)
-			}
+	if len(delFRR) > 0 {
+		if err := a.routing.RefreshBGP(); err != nil {
+			slog.Warn("BGP soft-refresh failed, peers may wait for MRAI timer", "error", err)
 		}
 	}
 }

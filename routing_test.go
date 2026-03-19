@@ -127,7 +127,7 @@ func TestDryRunFRRRoutes(t *testing.T) {
 	}
 }
 
-func TestDryRunEnsureRemoveRoute(t *testing.T) {
+func TestDryRunFRRRoutesBatch(t *testing.T) {
 	rm := &RouteManager{
 		bridgeDev:   "br-ex",
 		vrfName:     "vrf-provider",
@@ -135,11 +135,66 @@ func TestDryRunEnsureRemoveRoute(t *testing.T) {
 		dryRun:      true,
 	}
 
-	if err := rm.EnsureRoute("10.0.0.1"); err != nil {
-		t.Errorf("EnsureRoute() in dry-run should not error, got: %v", err)
+	ips := []string{"10.0.0.1", "10.0.0.2", "10.0.0.3"}
+	if err := rm.AddFRRRoutes(ips); err != nil {
+		t.Errorf("AddFRRRoutes() in dry-run should not error, got: %v", err)
 	}
-	if err := rm.RemoveRoute("10.0.0.1"); err != nil {
-		t.Errorf("RemoveRoute() in dry-run should not error, got: %v", err)
+	if err := rm.DelFRRRoutes(ips); err != nil {
+		t.Errorf("DelFRRRoutes() in dry-run should not error, got: %v", err)
+	}
+}
+
+func TestFRRRoutesBatchEmpty(t *testing.T) {
+	rm := &RouteManager{
+		bridgeDev:   "br-ex",
+		vrfName:     "vrf-provider",
+		vethNexthop: "169.254.0.1",
+	}
+
+	if err := rm.AddFRRRoutes(nil); err != nil {
+		t.Errorf("AddFRRRoutes(nil) should be no-op, got: %v", err)
+	}
+	if err := rm.DelFRRRoutes(nil); err != nil {
+		t.Errorf("DelFRRRoutes(nil) should be no-op, got: %v", err)
+	}
+	if err := rm.AddFRRRoutes([]string{}); err != nil {
+		t.Errorf("AddFRRRoutes([]) should be no-op, got: %v", err)
+	}
+	if err := rm.DelFRRRoutes([]string{}); err != nil {
+		t.Errorf("DelFRRRoutes([]) should be no-op, got: %v", err)
+	}
+}
+
+func TestDryRunRefreshBGP(t *testing.T) {
+	rm := &RouteManager{
+		vrfName: "vrf-provider",
+		dryRun:  true,
+	}
+	if err := rm.RefreshBGP(); err != nil {
+		t.Errorf("RefreshBGP() in dry-run should not error, got: %v", err)
+	}
+}
+
+func TestFRRRoutesBatchValidation(t *testing.T) {
+	rm := &RouteManager{
+		bridgeDev:   "br-ex",
+		vrfName:     "vrf-provider",
+		vethNexthop: "169.254.0.1",
+		dryRun:      true,
+	}
+
+	invalid := []string{"10.0.0.1", "not-an-ip", "10.0.0.2"}
+	if err := rm.AddFRRRoutes(invalid); err == nil {
+		t.Error("AddFRRRoutes() with invalid IP should return error")
+	}
+	if err := rm.DelFRRRoutes(invalid); err == nil {
+		t.Error("DelFRRRoutes() with invalid IP should return error")
+	}
+
+	// CIDR notation is not a valid bare IP.
+	cidr := []string{"10.0.0.1/32"}
+	if err := rm.AddFRRRoutes(cidr); err == nil {
+		t.Error("AddFRRRoutes() with CIDR notation should return error")
 	}
 }
 

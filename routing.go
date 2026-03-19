@@ -1,7 +1,6 @@
 package main
 
 import (
-	"errors"
 	"fmt"
 	"log/slog"
 	"net"
@@ -67,43 +66,92 @@ func validateIP(ip string) error {
 // FRR routes via vtysh
 // =============================================================================
 
+// AddFRRRoute is a convenience wrapper for AddFRRRoutes with a single IP.
 func (rm *RouteManager) AddFRRRoute(ip string) error {
-	if rm.dryRun {
-		slog.Info("[dry-run] would add FRR route", "ip", ip, "vrf", rm.vrfName, "nexthop", rm.vethNexthop)
+	return rm.AddFRRRoutes([]string{ip})
+}
+
+// frrBatchSize is the maximum number of route operations per vtysh call.
+// This avoids hitting the OS ARG_MAX limit (~2 MB on Linux) when managing
+// thousands of FIPs at startup.
+const frrBatchSize = 500
+
+// AddFRRRoutes adds static /32 routes for all given IPs via vtysh.
+// IPs are validated before any commands are executed.  The list is chunked
+// into batches of frrBatchSize to stay within OS argument-list limits.
+func (rm *RouteManager) AddFRRRoutes(ips []string) error {
+	if len(ips) == 0 {
 		return nil
 	}
-	cmd := exec.Command("vtysh",
-		"-c", "conf t",
-		"-c", fmt.Sprintf("vrf %s", rm.vrfName),
-		"-c", fmt.Sprintf("ip route %s/32 %s", ip, rm.vethNexthop),
-		"-c", "exit-vrf",
-		"-c", "end",
-	)
-	output, err := cmd.CombinedOutput()
-	if err != nil {
-		return fmt.Errorf("vtysh add route %s: %w (output: %s)", ip, err, strings.TrimSpace(string(output)))
+	for _, ip := range ips {
+		if err := validateIP(ip); err != nil {
+			return err
+		}
 	}
-	slog.Info("FRR route ensured", "ip", ip, "vrf", rm.vrfName, "nexthop", rm.vethNexthop, "output", strings.TrimSpace(string(output)))
+	if rm.dryRun {
+		slog.Info("[dry-run] would add FRR routes", "count", len(ips), "vrf", rm.vrfName, "nexthop", rm.vethNexthop)
+		return nil
+	}
+	for start := 0; start < len(ips); start += frrBatchSize {
+		end := start + frrBatchSize
+		if end > len(ips) {
+			end = len(ips)
+		}
+		chunk := ips[start:end]
+		args := []string{"-c", "conf t", "-c", fmt.Sprintf("vrf %s", rm.vrfName)}
+		for _, ip := range chunk {
+			args = append(args, "-c", fmt.Sprintf("ip route %s/32 %s", ip, rm.vethNexthop))
+		}
+		args = append(args, "-c", "exit-vrf", "-c", "end")
+		cmd := exec.Command("vtysh", args...)
+		output, err := cmd.CombinedOutput()
+		if err != nil {
+			return fmt.Errorf("vtysh batch add %d routes: %w (output: %s)", len(chunk), err, strings.TrimSpace(string(output)))
+		}
+		slog.Info("FRR routes ensured", "count", len(chunk), "vrf", rm.vrfName, "nexthop", rm.vethNexthop)
+	}
 	return nil
 }
 
+// DelFRRRoute is a convenience wrapper for DelFRRRoutes with a single IP.
 func (rm *RouteManager) DelFRRRoute(ip string) error {
-	if rm.dryRun {
-		slog.Info("[dry-run] would remove FRR route", "ip", ip, "vrf", rm.vrfName, "nexthop", rm.vethNexthop)
+	return rm.DelFRRRoutes([]string{ip})
+}
+
+// DelFRRRoutes removes static /32 routes for all given IPs via vtysh.
+// IPs are validated before any commands are executed.  The list is chunked
+// into batches of frrBatchSize to stay within OS argument-list limits.
+func (rm *RouteManager) DelFRRRoutes(ips []string) error {
+	if len(ips) == 0 {
 		return nil
 	}
-	cmd := exec.Command("vtysh",
-		"-c", "conf t",
-		"-c", fmt.Sprintf("vrf %s", rm.vrfName),
-		"-c", fmt.Sprintf("no ip route %s/32 %s", ip, rm.vethNexthop),
-		"-c", "exit-vrf",
-		"-c", "end",
-	)
-	output, err := cmd.CombinedOutput()
-	if err != nil {
-		return fmt.Errorf("vtysh del route %s: %w (output: %s)", ip, err, strings.TrimSpace(string(output)))
+	for _, ip := range ips {
+		if err := validateIP(ip); err != nil {
+			return err
+		}
 	}
-	slog.Info("FRR route removed", "ip", ip, "vrf", rm.vrfName, "output", strings.TrimSpace(string(output)))
+	if rm.dryRun {
+		slog.Info("[dry-run] would remove FRR routes", "count", len(ips), "vrf", rm.vrfName, "nexthop", rm.vethNexthop)
+		return nil
+	}
+	for start := 0; start < len(ips); start += frrBatchSize {
+		end := start + frrBatchSize
+		if end > len(ips) {
+			end = len(ips)
+		}
+		chunk := ips[start:end]
+		args := []string{"-c", "conf t", "-c", fmt.Sprintf("vrf %s", rm.vrfName)}
+		for _, ip := range chunk {
+			args = append(args, "-c", fmt.Sprintf("no ip route %s/32 %s", ip, rm.vethNexthop))
+		}
+		args = append(args, "-c", "exit-vrf", "-c", "end")
+		cmd := exec.Command("vtysh", args...)
+		output, err := cmd.CombinedOutput()
+		if err != nil {
+			return fmt.Errorf("vtysh batch del %d routes: %w (output: %s)", len(chunk), err, strings.TrimSpace(string(output)))
+		}
+		slog.Info("FRR routes removed", "count", len(chunk), "vrf", rm.vrfName)
+	}
 	return nil
 }
 
@@ -152,33 +200,22 @@ func (rm *RouteManager) ListFRRRoutes() ([]string, error) {
 	return ips, nil
 }
 
-// =============================================================================
-// Combined operations
-// =============================================================================
-
-// EnsureRoute adds both kernel and FRR routes for an IP.
-func (rm *RouteManager) EnsureRoute(ip string) error {
-	if err := validateIP(ip); err != nil {
-		return err
+// RefreshBGP triggers an outbound BGP soft-refresh so that peers learn about
+// route changes immediately instead of waiting for the MRAI timer.
+func (rm *RouteManager) RefreshBGP() error {
+	if rm.dryRun {
+		slog.Info("[dry-run] would refresh BGP outbound")
+		return nil
 	}
-	if err := rm.AddKernelRoute(ip); err != nil {
-		return fmt.Errorf("kernel route: %w", err)
+	cmd := exec.Command("vtysh",
+		"-c", fmt.Sprintf("clear ip bgp vrf %s * soft out", rm.vrfName),
+	)
+	output, err := cmd.CombinedOutput()
+	if err != nil {
+		return fmt.Errorf("BGP soft-refresh: %w (output: %s)", err, strings.TrimSpace(string(output)))
 	}
-	if err := rm.AddFRRRoute(ip); err != nil {
-		return fmt.Errorf("FRR route: %w", err)
-	}
+	slog.Info("BGP outbound soft-refresh triggered", "vrf", rm.vrfName)
 	return nil
-}
-
-// RemoveRoute removes both FRR and kernel routes for an IP.
-// FRR is removed first to stop attracting traffic before tearing down the data plane.
-func (rm *RouteManager) RemoveRoute(ip string) error {
-	if err := validateIP(ip); err != nil {
-		return err
-	}
-	ferr := rm.DelFRRRoute(ip)
-	kerr := rm.DelKernelRoute(ip)
-	return errors.Join(ferr, kerr)
 }
 
 // =============================================================================
