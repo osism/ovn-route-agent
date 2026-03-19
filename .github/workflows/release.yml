@@ -76,7 +76,7 @@ jobs:
         run: sha256sum ovn-route-agent-linux-* ovn-route-agent_*.deb sbom.cyclonedx.json > checksums.txt
 
       - name: Attest build provenance
-        uses: actions/attest-build-provenance@v2
+        uses: actions/attest-build-provenance@v4
         with:
           subject-path: |
             artifacts/ovn-route-agent-linux-*
