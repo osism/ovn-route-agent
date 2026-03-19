@@ -7,7 +7,7 @@ import (
 	"log/slog"
 	"net"
 
-	"github.com/ovn-org/libovsdb/ovsdb"
+	"github.com/ovn-kubernetes/libovsdb/ovsdb"
 )
 
 // transactOps executes OVSDB operations and checks both the transport-level
