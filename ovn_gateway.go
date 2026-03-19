@@ -147,7 +147,7 @@ func (o *OVNClient) ensureDefaultRoute(ctx context.Context, lr LocalRouterInfo, 
 	// Route doesn't exist — create it.
 	outputPort := lr.LRPName
 	newRoute := &NBLogicalRouterStaticRoute{
-		UUID:       "new-route",
+		UUID:       "new_route",
 		IPPrefix:   "0.0.0.0/0",
 		Nexthop:    vgwIP,
 		OutputPort: &outputPort,
@@ -174,7 +174,7 @@ func (o *OVNClient) ensureDefaultRoute(ctx context.Context, lr LocalRouterInfo, 
 		Mutations: []ovsdb.Mutation{{
 			Column:  "static_routes",
 			Mutator: ovsdb.MutateOperationInsert,
-			Value:   ovsdb.UUID{GoUUID: "new-route"},
+			Value:   ovsdb.UUID{GoUUID: "new_route"},
 		}},
 	}
 
@@ -214,7 +214,7 @@ func (o *OVNClient) ensureStaticMACBinding(ctx context.Context, lrpName, ip, mac
 
 	// Create new binding.
 	newBinding := &NBStaticMACBinding{
-		UUID:        "new-mac-binding",
+		UUID:        "new_mac_binding",
 		LogicalPort: lrpName,
 		IP:          ip,
 		MAC:         mac,
