@@ -4,6 +4,7 @@ import (
 	"errors"
 	"flag"
 	"fmt"
+	"log/slog"
 	"net"
 	"os"
 	"strings"
@@ -82,6 +83,11 @@ type Config struct {
 	CleanupOnShutdown bool
 	FRRPrefixList     string // FRR prefix-list name to manage dynamically (e.g. ANNOUNCED-NETWORKS)
 
+	// Stale chassis cleanup: grace period before removing OVN NB entries
+	// from chassis that have disappeared from the SB Chassis table.
+	// 0 = disabled.
+	StaleChassisGracePeriod time.Duration
+
 	// Veth VRF leak settings
 	VethLeakEnabled      bool
 	VethProviderIP       string // IP of the veth-provider side (default: computed from VethNexthop + 1)
@@ -107,6 +113,8 @@ type configFile struct {
 	CleanupOnShutdown *bool         `yaml:"cleanup_on_shutdown"`
 
 	FRRPrefixList string `yaml:"frr_prefix_list"`
+
+	StaleChassisGracePeriod string `yaml:"stale_chassis_grace_period"`
 
 	VethLeakEnabled      *bool  `yaml:"veth_leak_enabled"`
 	VethProviderIP       string `yaml:"veth_provider_ip"`
@@ -138,6 +146,7 @@ func loadConfig(args []string) (Config, error) {
 		fCleanupOnShutdown = fs.Bool("cleanup-on-shutdown", true, "Remove all managed routes on shutdown (SIGINT/SIGTERM)")
 
 		fFRRPrefixList        = fs.String("frr-prefix-list", "", "FRR prefix-list name to manage dynamically (default: ANNOUNCED-NETWORKS)")
+		fStaleGrace           = fs.String("stale-chassis-grace-period", "", "Grace period before cleaning up entries from missing chassis (e.g. 5m, 0 to disable)")
 		fVethLeakEnabled      = fs.Bool("veth-leak-enabled", true, "Enable veth VRF route leaking")
 		fVethProviderIP       = fs.String("veth-provider-ip", "", "IP of the veth-provider side (default: veth-nexthop + 1)")
 		fVethLeakTableID      = fs.Int("veth-leak-table-id", 200, "Routing table ID for veth leak default route (1-252)")
@@ -154,17 +163,18 @@ func loadConfig(args []string) (Config, error) {
 
 	// Layer 0: defaults
 	cfg := Config{
-		BridgeDev:            "br-ex",
-		VRFName:              "vrf-provider",
-		VethNexthop:          "169.254.0.1",
-		BridgeIP:             "169.254.169.254",
-		ReconcileInterval:    60 * time.Second,
-		LogLevel:             "info",
-		CleanupOnShutdown:    true,
-		FRRPrefixList:        "ANNOUNCED-NETWORKS",
-		VethLeakEnabled:      true,
-		VethLeakTableID:      200,
-		VethLeakRulePriority: 2000,
+		BridgeDev:               "br-ex",
+		VRFName:                 "vrf-provider",
+		VethNexthop:             "169.254.0.1",
+		BridgeIP:                "169.254.169.254",
+		ReconcileInterval:       60 * time.Second,
+		LogLevel:                "info",
+		CleanupOnShutdown:       true,
+		FRRPrefixList:           "ANNOUNCED-NETWORKS",
+		StaleChassisGracePeriod: 5 * time.Minute,
+		VethLeakEnabled:         true,
+		VethLeakTableID:         200,
+		VethLeakRulePriority:    2000,
 	}
 
 	// Layer 1: config file
@@ -214,6 +224,12 @@ func loadConfig(args []string) (Config, error) {
 			cfg.CleanupOnShutdown = *fCleanupOnShutdown
 		case "frr-prefix-list":
 			cfg.FRRPrefixList = *fFRRPrefixList
+		case "stale-chassis-grace-period":
+			if d, err := time.ParseDuration(*fStaleGrace); err == nil {
+				cfg.StaleChassisGracePeriod = d
+			} else {
+				slog.Warn("ignoring invalid stale-chassis-grace-period flag value", "value", *fStaleGrace, "error", err)
+			}
 		case "veth-leak-enabled":
 			cfg.VethLeakEnabled = *fVethLeakEnabled
 		case "veth-provider-ip":
@@ -257,6 +273,10 @@ func validateConfig(cfg *Config) error {
 	// FRR prefix-list validation
 	if cfg.FRRPrefixList != "" && !isValidIdentifier(cfg.FRRPrefixList) {
 		return fmt.Errorf("invalid frr-prefix-list: %q (only alphanumeric, hyphen, underscore, dot allowed)", cfg.FRRPrefixList)
+	}
+
+	if cfg.StaleChassisGracePeriod < 0 {
+		return fmt.Errorf("invalid stale-chassis-grace-period: must be non-negative")
 	}
 
 	// Veth leak validation
@@ -370,6 +390,13 @@ func applyFileConfig(cfg *Config, fc *configFile) {
 	if fc.FRRPrefixList != "" {
 		cfg.FRRPrefixList = fc.FRRPrefixList
 	}
+	if fc.StaleChassisGracePeriod != "" {
+		if d, err := time.ParseDuration(fc.StaleChassisGracePeriod); err == nil {
+			cfg.StaleChassisGracePeriod = d
+		} else {
+			slog.Warn("ignoring invalid stale_chassis_grace_period in config file", "value", fc.StaleChassisGracePeriod, "error", err)
+		}
+	}
 	if fc.VethLeakEnabled != nil {
 		cfg.VethLeakEnabled = *fc.VethLeakEnabled
 	}
@@ -434,6 +461,13 @@ func applyEnvConfig(cfg *Config) {
 	}
 	if v := os.Getenv("OVN_ROUTE_FRR_PREFIX_LIST"); v != "" {
 		cfg.FRRPrefixList = v
+	}
+	if v := os.Getenv("OVN_ROUTE_STALE_CHASSIS_GRACE_PERIOD"); v != "" {
+		if d, err := time.ParseDuration(v); err == nil {
+			cfg.StaleChassisGracePeriod = d
+		} else {
+			slog.Warn("ignoring invalid OVN_ROUTE_STALE_CHASSIS_GRACE_PERIOD env var", "value", v, "error", err)
+		}
 	}
 	if v := os.Getenv("OVN_ROUTE_VETH_LEAK_ENABLED"); v == "0" || v == "false" {
 		cfg.VethLeakEnabled = false

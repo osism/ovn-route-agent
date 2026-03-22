@@ -4,6 +4,7 @@ import (
 	"context"
 	"fmt"
 	"log/slog"
+	"math/rand"
 	"net"
 	"sort"
 	"strings"
@@ -29,13 +30,28 @@ type Agent struct {
 	// non-zero value indicates persistent route instability (e.g. FRR
 	// misconfiguration) and triggers escalated logging.
 	consecutiveReAdds int
+
+	// missingChassis tracks when each chassis was first observed as absent
+	// from the OVN SB Chassis table. Used for stale entry cleanup with a
+	// configurable grace period.
+	missingChassis map[string]time.Time
+
+	// staleCleanupJitter is a random duration (0-30s) added to the grace
+	// period to prevent multiple agents from cleaning up simultaneously.
+	staleCleanupJitter time.Duration
 }
+
+// maxStaleCleanupJitter is the maximum random jitter added to the stale
+// chassis grace period to prevent thundering-herd cleanup across agents.
+const maxStaleCleanupJitter = 30 * time.Second
 
 func NewAgent(cfg Config) (*Agent, error) {
 	a := &Agent{
-		cfg:         cfg,
-		routing:     NewRouteManager(cfg),
-		reconcileCh: make(chan struct{}, 1),
+		cfg:                cfg,
+		routing:            NewRouteManager(cfg),
+		reconcileCh:        make(chan struct{}, 1),
+		missingChassis:     make(map[string]time.Time),
+		staleCleanupJitter: time.Duration(rand.Int63n(int64(maxStaleCleanupJitter))),
 	}
 
 	a.ovn = NewOVNClient(cfg, a.triggerReconcile)
@@ -194,6 +210,78 @@ func (a *Agent) reconcile() {
 			slog.Error("failed to clean FRR prefix-list", "error", err)
 		}
 		a.removeAllRoutes("no locally active routers")
+	}
+
+	// Check for stale chassis entries from dead nodes (runs on every agent).
+	// This runs after gateway routing reconciliation so that a surviving agent
+	// creates its own routes before removing entries from dead chassis.
+	a.cleanupStaleChassis(state.AllChassisNames)
+}
+
+// cleanupStaleChassis detects chassis that have disappeared from the SB Chassis
+// table and, after a configurable grace period (plus random jitter), removes
+// their managed NB entries. Any surviving agent can perform this cleanup.
+func (a *Agent) cleanupStaleChassis(allChassis map[string]bool) {
+	if a.cfg.StaleChassisGracePeriod <= 0 {
+		return
+	}
+
+	referencedChassis := a.ovn.ListManagedRouteChassis(a.ovn.ctx)
+	if referencedChassis == nil {
+		return
+	}
+
+	now := time.Now()
+	effectiveGrace := a.cfg.StaleChassisGracePeriod + a.staleCleanupJitter
+
+	// Update missingChassis map: add newly missing, remove returned.
+	for chassisName := range referencedChassis {
+		if allChassis[chassisName] {
+			// Chassis is back (or still alive) — remove from missing tracker.
+			if _, tracked := a.missingChassis[chassisName]; tracked {
+				slog.Info("previously missing chassis has returned", "chassis", chassisName)
+				delete(a.missingChassis, chassisName)
+			}
+		} else {
+			// Chassis is missing.
+			if _, tracked := a.missingChassis[chassisName]; !tracked {
+				a.missingChassis[chassisName] = now
+				slog.Warn("chassis referenced by managed routes is missing from SB",
+					"chassis", chassisName)
+			}
+		}
+	}
+
+	// Prune entries for chassis no longer referenced by any managed route.
+	for chassisName := range a.missingChassis {
+		if !referencedChassis[chassisName] {
+			delete(a.missingChassis, chassisName)
+		}
+	}
+
+	// Find chassis that have exceeded the grace period.
+	staleChassis := make(map[string]bool)
+	for chassisName, firstSeen := range a.missingChassis {
+		if now.Sub(firstSeen) >= effectiveGrace {
+			staleChassis[chassisName] = true
+			slog.Warn("chassis exceeded stale grace period, cleaning up managed entries",
+				"chassis", chassisName,
+				"missing_since", firstSeen,
+				"grace_period", effectiveGrace)
+		}
+	}
+
+	if len(staleChassis) == 0 {
+		return
+	}
+
+	if err := a.ovn.CleanupStaleChassisManagedEntries(a.ovn.ctx, staleChassis); err != nil {
+		slog.Error("failed to clean up stale chassis entries", "error", err)
+		return
+	}
+
+	for chassisName := range staleChassis {
+		delete(a.missingChassis, chassisName)
 	}
 }
 

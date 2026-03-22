@@ -179,6 +179,28 @@ func TestGetStateIncludesDiscoveredNetworks(t *testing.T) {
 	}
 }
 
+func TestGetStateIncludesAllChassisNames(t *testing.T) {
+	c := NewOVNClient(Config{}, nil)
+	c.state.AllChassisNames = map[string]bool{
+		"node-1": true,
+		"node-2": true,
+	}
+
+	snap := c.GetState()
+	if len(snap.AllChassisNames) != 2 {
+		t.Fatalf("AllChassisNames length = %d, want 2", len(snap.AllChassisNames))
+	}
+	if !snap.AllChassisNames["node-1"] || !snap.AllChassisNames["node-2"] {
+		t.Errorf("AllChassisNames = %v, want node-1 and node-2", snap.AllChassisNames)
+	}
+
+	// Verify snapshot is a copy.
+	snap.AllChassisNames["node-3"] = true
+	if c.state.AllChassisNames["node-3"] {
+		t.Error("GetState should return a copy of AllChassisNames")
+	}
+}
+
 func TestParseNatAddressIPs(t *testing.T) {
 	tests := []struct {
 		name    string

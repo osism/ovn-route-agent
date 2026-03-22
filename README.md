@@ -22,7 +22,8 @@ The agent monitors the OVN Southbound and Northbound databases and performs targ
    - If configured, reconciles the **FRR prefix-list** with `permit <network> ge 32 le 32` entries for each discovered provider network
    - If no routers are locally active: removes all managed routes
 5. **Reconciles** periodically as a safety net (default: every 60s)
-6. **Cleans up** on shutdown (SIGINT/SIGTERM) — removes all managed routes, OVS flows, and the bridge IP before exiting (configurable via `cleanup_on_shutdown`)
+6. **Detects stale chassis** — when a node dies without graceful shutdown, surviving agents detect its chassis disappearing from the SB Chassis table and clean up its managed OVN NB entries (static routes and MAC bindings) after a configurable grace period (default: 5m, configurable via `stale_chassis_grace_period`, set to `0` to disable). Random jitter (0-30s) prevents multiple agents from cleaning up simultaneously.
+7. **Cleans up** on shutdown (SIGINT/SIGTERM) — removes all managed routes, OVS flows, and the bridge IP before exiting (configurable via `cleanup_on_shutdown`)
 
 ## Building
 
@@ -106,6 +107,7 @@ CLI flags take precedence over values in the config file.
 | `--dry-run` | `OVN_ROUTE_DRY_RUN` | `dry_run` | `false` | Connect and reconcile but only log what would be done |
 | `--cleanup-on-shutdown` | `OVN_ROUTE_CLEANUP_ON_SHUTDOWN` | `cleanup_on_shutdown` | `true` | Remove all managed routes on shutdown; set to `false` to keep routes in place |
 | `--frr-prefix-list` | `OVN_ROUTE_FRR_PREFIX_LIST` | `frr_prefix_list` | `ANNOUNCED-NETWORKS` | FRR prefix-list name to manage dynamically; adds `permit <network> ge 32 le 32` entries for each discovered provider network (set to empty string to disable) |
+| `--stale-chassis-grace-period` | `OVN_ROUTE_STALE_CHASSIS_GRACE_PERIOD` | `stale_chassis_grace_period` | `5m` | Grace period before cleaning up OVN NB entries from chassis that have disappeared from the SB Chassis table; set to `0` to disable |
 | `--veth-leak-enabled` | `OVN_ROUTE_VETH_LEAK_ENABLED` | `veth_leak_enabled` | `true` | Enable automatic veth VRF route leaking |
 | `--veth-provider-ip` | `OVN_ROUTE_VETH_PROVIDER_IP` | `veth_provider_ip` | *(nexthop+1)* | IP of the veth-provider side (auto-computed from `veth_nexthop` + 1) |
 | `--veth-leak-table-id` | `OVN_ROUTE_VETH_LEAK_TABLE_ID` | `veth_leak_table_id` | `200` | Routing table for the leak default route (1-252, must differ from `route_table_id`) |
@@ -237,7 +239,7 @@ For each locally-active router, the agent writes two entries into the OVN Northb
 
 Together, these two entries trick OVN into forwarding SNAT reply packets out of the logical router's external port onto `br-ex`, where the kernel and FRR take over for BGP delivery. The virtual gateway IP itself is never used as an actual destination — it only serves as the logical nexthop that makes OVN's routing pipeline work.
 
-Both entries are tagged with `ExternalIDs["ovn-route-agent"] = "managed"` so the agent can track and clean them up. If a default route already exists that was **not** created by the agent (i.e. a real gateway configured by OpenStack), the agent leaves it untouched.
+Both entries are tagged with `ExternalIDs["ovn-route-agent"] = "managed"` so the agent can track and clean them up. Additionally, managed static routes carry `ExternalIDs["ovn-route-agent-chassis"]` set to the owning chassis hostname, enabling stale chassis cleanup by surviving agents when a node dies without graceful shutdown. If a default route already exists that was **not** created by the agent (i.e. a real gateway configured by OpenStack), the agent leaves it untouched.
 
 ### Creating a gatewayless provider network
 

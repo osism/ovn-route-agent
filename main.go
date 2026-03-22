@@ -57,6 +57,7 @@ func main() {
 		"reconcile_interval", cfg.ReconcileInterval,
 		"veth_leak_enabled", cfg.VethLeakEnabled,
 		"frr_prefix_list", cfg.FRRPrefixList,
+		"stale_chassis_grace_period", cfg.StaleChassisGracePeriod,
 	)
 
 	if cfg.DryRun {

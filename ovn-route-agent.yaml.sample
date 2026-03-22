@@ -72,6 +72,13 @@ ovn_nb_remote: "tcp:10.10.0.1:6641,tcp:10.10.0.2:6641,tcp:10.10.0.3:6641"
 # entries in the FRR configuration. Set to empty string to disable.
 # frr_prefix_list: "ANNOUNCED-NETWORKS"
 
+# Grace period before cleaning up OVN NB entries from chassis that have
+# disappeared from the SB Chassis table (default: 5m).
+# Any surviving agent will detect missing chassis and clean up their stale
+# static routes and MAC bindings after this period.
+# Set to "0" to disable stale chassis cleanup.
+# stale_chassis_grace_period: "5m"
+
 # Veth VRF route leaking (replaces contrib/veth-vrf-leak.sh)
 # Creates a veth pair for selective route leaking between default VRF and
 # the provider VRF. Per-network routes are managed dynamically based on

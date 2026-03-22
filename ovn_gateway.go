@@ -126,7 +126,20 @@ func (o *OVNClient) ensureDefaultRoute(ctx context.Context, lr LocalRouterInfo, 
 				return nil
 			}
 
+			localChassis := o.state.LocalChassisName
+
 			if route.Nexthop == vgwIP {
+				// Nexthop correct — check if chassis tag needs updating (migration or failover).
+				if route.ExternalIDs["ovn-route-agent-chassis"] != localChassis {
+					slog.Info("updating default route chassis tag",
+						"router", lr.RouterName, "old_chassis", route.ExternalIDs["ovn-route-agent-chassis"], "new_chassis", localChassis)
+					route.ExternalIDs["ovn-route-agent-chassis"] = localChassis
+					ops, err := o.nbClient.Where(&route).Update(&route, &route.ExternalIDs)
+					if err != nil {
+						return fmt.Errorf("build update op: %w", err)
+					}
+					return o.transactOps(ctx, ops)
+				}
 				slog.Debug("default route already exists", "router", lr.RouterName, "vgw", vgwIP)
 				return nil
 			}
@@ -136,7 +149,8 @@ func (o *OVNClient) ensureDefaultRoute(ctx context.Context, lr LocalRouterInfo, 
 			route.Nexthop = vgwIP
 			outputPort := lr.LRPName
 			route.OutputPort = &outputPort
-			ops, err := o.nbClient.Where(&route).Update(&route, &route.Nexthop, &route.OutputPort)
+			route.ExternalIDs["ovn-route-agent-chassis"] = localChassis
+			ops, err := o.nbClient.Where(&route).Update(&route, &route.Nexthop, &route.OutputPort, &route.ExternalIDs)
 			if err != nil {
 				return fmt.Errorf("build update op: %w", err)
 			}
@@ -153,7 +167,8 @@ func (o *OVNClient) ensureDefaultRoute(ctx context.Context, lr LocalRouterInfo, 
 		OutputPort: &outputPort,
 		Options:    map[string]string{},
 		ExternalIDs: map[string]string{
-			"ovn-route-agent": "managed",
+			"ovn-route-agent":         "managed",
+			"ovn-route-agent-chassis": o.state.LocalChassisName,
 		},
 	}
 
@@ -326,6 +341,160 @@ func (o *OVNClient) RemoveManagedNBEntries(ctx context.Context) error {
 			slog.Error("failed to remove static MAC binding", "lrp", b.LogicalPort, "ip", b.IP, "error", err)
 		} else {
 			slog.Info("managed static MAC binding removed", "lrp", b.LogicalPort, "ip", b.IP, "mac", b.MAC)
+		}
+	}
+
+	return nil
+}
+
+// ListManagedRouteChassis returns the set of chassis names referenced in
+// ExternalIDs["ovn-route-agent-chassis"] of all managed static routes.
+func (o *OVNClient) ListManagedRouteChassis(ctx context.Context) map[string]bool {
+	var routes []NBLogicalRouterStaticRoute
+	if err := o.nbClient.List(ctx, &routes); err != nil {
+		slog.Error("failed to list static routes for chassis scan", "error", err)
+		return nil
+	}
+	result := make(map[string]bool)
+	for _, route := range routes {
+		if route.ExternalIDs != nil && route.ExternalIDs["ovn-route-agent"] == "managed" {
+			if ch := route.ExternalIDs["ovn-route-agent-chassis"]; ch != "" {
+				result[ch] = true
+			}
+		}
+	}
+	return result
+}
+
+// staleMACBindingKey identifies a MAC binding created by the agent, derived
+// from the managed route's OutputPort (= LRP name) and Nexthop (= VGW IP).
+type staleMACBindingKey struct {
+	LogicalPort string
+	IP          string
+}
+
+// CleanupStaleChassisManagedEntries removes OVN NB entries (static routes and
+// their corresponding MAC bindings) that were created by agents on chassis
+// that no longer exist in the SB Chassis table.
+// Only entries with ExternalIDs["ovn-route-agent"] == "managed" and a matching
+// chassis tag are removed. Neutron-created entries are never touched.
+func (o *OVNClient) CleanupStaleChassisManagedEntries(ctx context.Context, staleChassis map[string]bool) error {
+	var routes []NBLogicalRouterStaticRoute
+	if err := o.nbClient.List(ctx, &routes); err != nil {
+		return fmt.Errorf("list static routes: %w", err)
+	}
+
+	var routers []NBLogicalRouter
+	if err := o.nbClient.List(ctx, &routers); err != nil {
+		return fmt.Errorf("list routers: %w", err)
+	}
+
+	// Build route UUID → router mapping.
+	routeToRouter := make(map[string]*NBLogicalRouter)
+	for i, router := range routers {
+		for _, ruuid := range router.StaticRoutes {
+			routeToRouter[ruuid] = &routers[i]
+		}
+	}
+
+	// Collect (OutputPort, Nexthop) pairs for MAC binding correlation, and
+	// track which output ports still have a live chassis owner.
+	staleBindingKeys := make(map[staleMACBindingKey]bool)
+	liveOutputPorts := make(map[string]bool)
+
+	// First pass: identify which output ports are still owned by live chassis.
+	for _, route := range routes {
+		if route.ExternalIDs == nil || route.ExternalIDs["ovn-route-agent"] != "managed" {
+			continue
+		}
+		ch := route.ExternalIDs["ovn-route-agent-chassis"]
+		if ch != "" && !staleChassis[ch] && route.OutputPort != nil {
+			liveOutputPorts[*route.OutputPort] = true
+		}
+	}
+
+	// Second pass: find and delete stale routes.
+	for _, route := range routes {
+		if route.ExternalIDs == nil || route.ExternalIDs["ovn-route-agent"] != "managed" {
+			continue
+		}
+		chassisName := route.ExternalIDs["ovn-route-agent-chassis"]
+		if chassisName == "" {
+			// Legacy route without chassis tag — skip, will be tagged on next reconcile.
+			continue
+		}
+		if !staleChassis[chassisName] {
+			continue
+		}
+
+		router := routeToRouter[route.UUID]
+		if router == nil {
+			continue
+		}
+
+		// Record (OutputPort, Nexthop) for MAC binding cleanup, but only if
+		// no live chassis also has a managed route on the same output port.
+		if route.OutputPort != nil && !liveOutputPorts[*route.OutputPort] {
+			staleBindingKeys[staleMACBindingKey{
+				LogicalPort: *route.OutputPort,
+				IP:          route.Nexthop,
+			}] = true
+		}
+
+		// Delete route: remove from router's static_routes, then delete the row.
+		mutateOp := ovsdb.Operation{
+			Op:    "mutate",
+			Table: "Logical_Router",
+			Where: []ovsdb.Condition{{
+				Column:   "_uuid",
+				Function: ovsdb.ConditionEqual,
+				Value:    ovsdb.UUID{GoUUID: router.UUID},
+			}},
+			Mutations: []ovsdb.Mutation{{
+				Column:  "static_routes",
+				Mutator: ovsdb.MutateOperationDelete,
+				Value:   ovsdb.UUID{GoUUID: route.UUID},
+			}},
+		}
+		deleteOps, err := o.nbClient.Where(&route).Delete()
+		if err != nil {
+			slog.Error("failed to build delete op for stale route", "uuid", route.UUID, "error", err)
+			continue
+		}
+		allOps := append([]ovsdb.Operation{mutateOp}, deleteOps...)
+		if err := o.transactOps(ctx, allOps); err != nil {
+			// Warn instead of Error: another agent may have already cleaned this up.
+			slog.Warn("failed to remove stale route (may already be removed by another agent)",
+				"chassis", chassisName, "router", router.Name, "prefix", route.IPPrefix, "error", err)
+		} else {
+			slog.Info("stale chassis route removed",
+				"chassis", chassisName, "router", router.Name, "prefix", route.IPPrefix, "nexthop", route.Nexthop)
+		}
+	}
+
+	// Delete MAC bindings that match the exact (LogicalPort, IP) pairs from stale routes.
+	if len(staleBindingKeys) > 0 {
+		var bindings []NBStaticMACBinding
+		if err := o.nbClient.List(ctx, &bindings); err != nil {
+			return fmt.Errorf("list static MAC bindings: %w", err)
+		}
+		for _, b := range bindings {
+			key := staleMACBindingKey{LogicalPort: b.LogicalPort, IP: b.IP}
+			if !staleBindingKeys[key] {
+				continue
+			}
+			ops, err := o.nbClient.Where(&b).Delete()
+			if err != nil {
+				slog.Error("failed to build delete op for stale MAC binding", "lrp", b.LogicalPort, "ip", b.IP, "error", err)
+				continue
+			}
+			if err := o.transactOps(ctx, ops); err != nil {
+				// Warn instead of Error: another agent may have already cleaned this up.
+				slog.Warn("failed to remove stale MAC binding (may already be removed by another agent)",
+					"lrp", b.LogicalPort, "ip", b.IP, "error", err)
+			} else {
+				slog.Info("stale chassis MAC binding removed", "lrp", b.LogicalPort, "ip", b.IP, "mac", b.MAC)
+			}
 		}
 	}
 

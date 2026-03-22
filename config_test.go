@@ -810,6 +810,96 @@ func TestLoadConfigFRRPrefixListInvalid(t *testing.T) {
 	}
 }
 
+func TestLoadConfigStaleChassisGracePeriodDefault(t *testing.T) {
+	cfg, err := loadConfig(nil)
+	if err != nil {
+		t.Fatalf("loadConfig() error: %v", err)
+	}
+	if cfg.StaleChassisGracePeriod != 5*time.Minute {
+		t.Errorf("StaleChassisGracePeriod = %v, want %v", cfg.StaleChassisGracePeriod, 5*time.Minute)
+	}
+}
+
+func TestLoadConfigStaleChassisGracePeriodCLI(t *testing.T) {
+	cfg, err := loadConfig([]string{"--stale-chassis-grace-period", "10m"})
+	if err != nil {
+		t.Fatalf("loadConfig() error: %v", err)
+	}
+	if cfg.StaleChassisGracePeriod != 10*time.Minute {
+		t.Errorf("StaleChassisGracePeriod = %v, want %v", cfg.StaleChassisGracePeriod, 10*time.Minute)
+	}
+}
+
+func TestLoadConfigStaleChassisGracePeriodDisabled(t *testing.T) {
+	cfg, err := loadConfig([]string{"--stale-chassis-grace-period", "0s"})
+	if err != nil {
+		t.Fatalf("loadConfig() error: %v", err)
+	}
+	if cfg.StaleChassisGracePeriod != 0 {
+		t.Errorf("StaleChassisGracePeriod = %v, want 0 (disabled)", cfg.StaleChassisGracePeriod)
+	}
+}
+
+func TestApplyEnvConfigStaleChassisGracePeriod(t *testing.T) {
+	cfg := Config{StaleChassisGracePeriod: 5 * time.Minute}
+	t.Setenv("OVN_ROUTE_STALE_CHASSIS_GRACE_PERIOD", "3m")
+	applyEnvConfig(&cfg)
+	if cfg.StaleChassisGracePeriod != 3*time.Minute {
+		t.Errorf("StaleChassisGracePeriod = %v, want %v", cfg.StaleChassisGracePeriod, 3*time.Minute)
+	}
+}
+
+func TestApplyFileConfigStaleChassisGracePeriod(t *testing.T) {
+	cfg := Config{StaleChassisGracePeriod: 5 * time.Minute}
+	fc := configFile{StaleChassisGracePeriod: "2m"}
+	applyFileConfig(&cfg, &fc)
+	if cfg.StaleChassisGracePeriod != 2*time.Minute {
+		t.Errorf("StaleChassisGracePeriod = %v, want %v", cfg.StaleChassisGracePeriod, 2*time.Minute)
+	}
+}
+
+func TestApplyFileConfigStaleChassisGracePeriodEmpty(t *testing.T) {
+	cfg := Config{StaleChassisGracePeriod: 5 * time.Minute}
+	fc := configFile{}
+	applyFileConfig(&cfg, &fc)
+	if cfg.StaleChassisGracePeriod != 5*time.Minute {
+		t.Errorf("StaleChassisGracePeriod = %v, want %v (should keep default)", cfg.StaleChassisGracePeriod, 5*time.Minute)
+	}
+}
+
+func TestLoadConfigStaleChassisGracePeriodYAML(t *testing.T) {
+	content := `
+ovn_sb_remote: "tcp:10.0.0.1:6642"
+ovn_nb_remote: "tcp:10.0.0.1:6641"
+veth_leak_enabled: false
+stale_chassis_grace_period: "7m"
+`
+	path := filepath.Join(t.TempDir(), "config.yaml")
+	if err := os.WriteFile(path, []byte(content), 0644); err != nil {
+		t.Fatalf("write test config: %v", err)
+	}
+
+	cfg, err := loadConfig([]string{"--config", path})
+	if err != nil {
+		t.Fatalf("loadConfig() error: %v", err)
+	}
+	if cfg.StaleChassisGracePeriod != 7*time.Minute {
+		t.Errorf("StaleChassisGracePeriod = %v, want %v", cfg.StaleChassisGracePeriod, 7*time.Minute)
+	}
+}
+
+func TestValidateConfigStaleChassisGracePeriodNegative(t *testing.T) {
+	cfg := Config{
+		VethNexthop: "169.254.0.1",
+		VRFName:     "vrf-provider",
+		StaleChassisGracePeriod: -1 * time.Minute,
+	}
+	err := validateConfig(&cfg)
+	if err == nil {
+		t.Error("expected error for negative stale-chassis-grace-period")
+	}
+}
+
 func TestApplyEnvConfigFRRPrefixList(t *testing.T) {
 	cfg := Config{}
 	t.Setenv("OVN_ROUTE_FRR_PREFIX_LIST", "MY-LIST")

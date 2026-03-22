@@ -159,6 +159,10 @@ type OVNState struct {
 
 	// Networks auto-discovered from Logical_Router_Port.Networks of locally-active routers.
 	DiscoveredNetworks []*net.IPNet
+
+	// AllChassisNames is the set of chassis hostnames currently present in
+	// the SB Chassis table. Used for stale chassis cleanup.
+	AllChassisNames map[string]bool
 }
 
 type OVNClient struct {
@@ -324,6 +328,10 @@ func (o *OVNClient) GetState() OVNState {
 	copy(localRouters, o.state.LocalRouters)
 	discoveredNets := make([]*net.IPNet, len(o.state.DiscoveredNetworks))
 	copy(discoveredNets, o.state.DiscoveredNetworks)
+	allChassis := make(map[string]bool, len(o.state.AllChassisNames))
+	for k, v := range o.state.AllChassisNames {
+		allChassis[k] = v
+	}
 	return OVNState{
 		LocalChassisName:   o.state.LocalChassisName,
 		LocalRouters:       localRouters,
@@ -331,6 +339,7 @@ func (o *OVNClient) GetState() OVNState {
 		FIPs:               append([]string{}, o.state.FIPs...),
 		SNATIPs:            append([]string{}, o.state.SNATIPs...),
 		DiscoveredNetworks: discoveredNets,
+		AllChassisNames:    allChassis,
 	}
 }
 
@@ -358,9 +367,11 @@ func (o *OVNClient) refreshState(ctx context.Context) {
 	}
 
 	chassisHostname := make(map[string]string, len(chassis))
+	allChassisNames := make(map[string]bool, len(chassis))
 	for _, ch := range chassis {
 		chassisHostname[ch.UUID] = ch.Hostname
 		chassisHostname[ch.Name] = ch.Hostname
+		allChassisNames[ch.Hostname] = true
 	}
 
 	localChassisName := o.state.LocalChassisName
@@ -523,6 +534,7 @@ func (o *OVNClient) refreshState(ctx context.Context) {
 	o.state.FIPs = fips
 	o.state.SNATIPs = snatIPs
 	o.state.DiscoveredNetworks = discoveredNets
+	o.state.AllChassisNames = allChassisNames
 	o.state.mu.Unlock()
 
 	slog.Info("state updated",
