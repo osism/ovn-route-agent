@@ -340,11 +340,8 @@ func isFileExists(err error) bool {
 // Veth VRF leak (replaces contrib/veth-vrf-leak.sh)
 // =============================================================================
 
-const (
-	vethDefaultName  = "veth-default"
-	vethProviderName = "veth-provider"
-	vethPrefixLen    = 30
-)
+// vethPrefixLen is the prefix length for the veth link-local /30 subnet.
+const vethPrefixLen = 30
 
 // SetupVethLeak creates a veth pair for selective route leaking between the
 // default VRF and the provider VRF.  The method is idempotent.

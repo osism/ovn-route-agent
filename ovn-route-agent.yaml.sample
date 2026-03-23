@@ -94,3 +94,46 @@ ovn_nb_remote: "tcp:10.10.0.1:6641,tcp:10.10.0.2:6641,tcp:10.10.0.3:6641"
 
 # Policy rule priority for veth leak rules (default: 2000)
 # veth_leak_rule_priority: 2000
+
+# =============================================================================
+# Port forwarding (DNAT)
+# =============================================================================
+# Forward traffic arriving at anycast VIP addresses to internal backends.
+# VIPs are typically announced via BGP from a loopback interface in vrf-provider.
+# Client IP is preserved (no masquerade); return traffic uses connmark-based
+# policy routing through the veth pair.
+#
+# Requires: veth_leak_enabled: true, nft binary in PATH.
+#
+# Device for VIP addresses in VRF (default: "loopback1")
+# port_forward_dev: "loopback1"
+#
+# Dedicated routing table for DNAT return traffic (default: 201)
+# Must differ from route_table_id and veth_leak_table_id.
+# port_forward_table_id: 201
+#
+# port_forwards:
+#   - vip: "198.51.100.10"
+#     manage_vip: true         # agent adds/removes this VIP on port_forward_dev
+#     masquerade: false        # SNAT with outgoing interface IP (needed when backend is not on return path)
+#     rules:
+#       - proto: tcp
+#         port: 80
+#         dest_addr: "10.0.0.100"
+#       - proto: tcp
+#         port: 443
+#         dest_addr: "10.0.0.100"
+#       - proto: tcp
+#         port: 53
+#         dest_addr: "10.0.0.200"
+#         dest_port: 1053       # port translation: VIP:53 -> 10.0.0.200:1053
+#       - proto: udp
+#         port: 53
+#         dest_addr: "10.0.0.200"
+#         dest_port: 1053
+#   - vip: "198.51.100.20"
+#     manage_vip: false         # VIP already exists on the interface
+#     rules:
+#       - proto: tcp
+#         port: 443
+#         dest_addr: "10.0.0.100"

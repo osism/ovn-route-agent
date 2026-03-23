@@ -9,6 +9,12 @@ import (
 	"strings"
 )
 
+// Veth interface names shared between routing and nftables code.
+const (
+	vethDefaultName  = "veth-default"
+	vethProviderName = "veth-provider"
+)
+
 // RouteManager handles kernel routes on the provider bridge and FRR static routes.
 type RouteManager struct {
 	bridgeDev    string
@@ -27,6 +33,12 @@ type RouteManager struct {
 
 	// FRR prefix-list management
 	frrPrefixList string
+
+	// Port forwarding (DNAT) settings
+	portForwardEnabled bool
+	portForwardDev     string
+	portForwardTableID int
+	portForwards       []PortForwardVIP
 
 	// Cached OVS discovery results (populated on first use).
 	cachedPatchPort string
@@ -47,6 +59,10 @@ func NewRouteManager(cfg Config) *RouteManager {
 		vethLeakRulePriority: cfg.VethLeakRulePriority,
 		networkFilters:       cfg.NetworkFilters,
 		frrPrefixList:        cfg.FRRPrefixList,
+		portForwardEnabled:   cfg.PortForwardEnabled,
+		portForwardDev:       cfg.PortForwardDev,
+		portForwardTableID:   cfg.PortForwardTableID,
+		portForwards:         cfg.PortForwards,
 	}
 	if cfg.OVSWrapper != "" {
 		rm.ovsWrapper = strings.Fields(cfg.OVSWrapper)

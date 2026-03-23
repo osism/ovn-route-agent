@@ -91,6 +91,11 @@ func (a *Agent) Run(ctx context.Context) error {
 		return fmt.Errorf("veth VRF leak setup: %w", err)
 	}
 
+	// Set up port forwarding (DNAT) rules (requires veth pair).
+	if err := a.routing.SetupPortForward(); err != nil {
+		return fmt.Errorf("port forward setup: %w", err)
+	}
+
 	if a.cfg.GatewayPort == "" {
 		slog.Info("tracking all chassisredirect ports (multi-router mode)")
 	} else {
@@ -160,6 +165,14 @@ func (a *Agent) reconcile() {
 	// Combine FIPs and SNAT IPs, deduplicate
 	desiredIPs := uniqueIPs(append(state.FIPs, state.SNATIPs...))
 
+	// Add port forward VIPs to desired IPs — these need kernel routes on
+	// br-ex and FRR static routes for BGP announcement, independent of
+	// whether any OVN routers are locally active.
+	for _, pf := range a.cfg.PortForwards {
+		desiredIPs = append(desiredIPs, pf.VIP)
+	}
+	desiredIPs = uniqueIPs(desiredIPs)
+
 	slog.Info("reconciling",
 		"has_local_routers", state.HasLocalRouters,
 		"local_routers", len(state.LocalRouters),
@@ -199,8 +212,6 @@ func (a *Agent) reconcile() {
 		if err := a.routing.ReconcileFRRPrefixList(a.effectiveFilters); err != nil {
 			slog.Error("failed to reconcile FRR prefix-list", "error", err)
 		}
-
-		a.ensureRoutes(desiredIPs)
 	} else {
 		// No locally active routers — remove per-network veth leak and prefix-list entries.
 		if err := a.routing.ReconcileVethLeakNetworks(nil); err != nil {
@@ -209,7 +220,21 @@ func (a *Agent) reconcile() {
 		if err := a.routing.ReconcileFRRPrefixList(nil); err != nil {
 			slog.Error("failed to clean FRR prefix-list", "error", err)
 		}
-		a.removeAllRoutes("no locally active routers")
+	}
+
+	// Port forwarding reconciliation runs regardless of local router
+	// presence — DNAT VIPs are managed independently of OVN gateway state.
+	if err := a.routing.ReconcilePortForward(a.effectiveFilters); err != nil {
+		slog.Error("failed to reconcile port forwarding", "error", err)
+	}
+
+	// Ensure routes for all desired IPs (FIPs, SNATs, and port forward VIPs).
+	// When no local routers are present but port forwards are configured,
+	// this still installs VIP routes on br-ex and in FRR.
+	if len(desiredIPs) > 0 || state.HasLocalRouters {
+		a.ensureRoutes(desiredIPs)
+	} else {
+		a.removeAllRoutes("no locally active routers and no port forward VIPs")
 	}
 
 	// Check for stale chassis entries from dead nodes (runs on every agent).
@@ -463,6 +488,10 @@ func (a *Agent) cleanup() {
 	}
 	if err := a.routing.CleanupRoutingTable(); err != nil {
 		slog.Error("failed to flush routing table", "error", err)
+	}
+	// Tear down port forwarding before veth leak (DNAT return route uses veth).
+	if err := a.routing.TeardownPortForward(); err != nil {
+		slog.Error("failed to tear down port forwarding", "error", err)
 	}
 	if err := a.routing.TeardownVethLeak(); err != nil {
 		slog.Error("failed to tear down veth VRF leak", "error", err)

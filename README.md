@@ -1,6 +1,6 @@
 # ovn-route-agent
 
-Event-driven Floating IP route synchronization agent for OVN-based OpenStack environments. A real-time daemon that watches OVN databases directly via the OVSDB protocol.
+Event-driven network agent for OVN-based OpenStack environments. A real-time daemon that watches OVN databases directly via the OVSDB protocol to synchronize Floating IP routes and optionally forward traffic from anycast VIPs to internal backends.
 
 ## How it works
 
@@ -21,9 +21,10 @@ The agent monitors the OVN Southbound and Northbound databases and performs targ
    - Ensures `/32` **kernel routes** (with IP rules when using a dedicated routing table) and **FRR static routes** in the VRF for each FIP/SNAT IP
    - If configured, reconciles the **FRR prefix-list** with `permit <network> ge 32 le 32` entries for each discovered provider network
    - If no routers are locally active: removes all managed routes
-5. **Reconciles** periodically as a safety net (default: every 60s)
-6. **Detects stale chassis** — when a node dies without graceful shutdown, surviving agents detect its chassis disappearing from the SB Chassis table and clean up its managed OVN NB entries (static routes and MAC bindings) after a configurable grace period (default: 5m, configurable via `stale_chassis_grace_period`, set to `0` to disable). Random jitter (0-30s) prevents multiple agents from cleaning up simultaneously.
-7. **Cleans up** on shutdown (SIGINT/SIGTERM) — removes all managed routes, OVS flows, and the bridge IP before exiting (configurable via `cleanup_on_shutdown`)
+5. **Port forwarding (DNAT)** — optionally forwards traffic from anycast VIP addresses (on a loopback interface in the VRF) to internal backends. Client IPs are preserved using connmark-based return routing through the veth pair. A `forward_veth_guard` nftables chain restricts the veth return path to legitimate traffic only. Requires `nft` binary and `veth_leak_enabled: true`.
+6. **Reconciles** periodically as a safety net (default: every 60s)
+7. **Detects stale chassis** — when a node dies without graceful shutdown, surviving agents detect its chassis disappearing from the SB Chassis table and clean up its managed OVN NB entries (static routes and MAC bindings) after a configurable grace period (default: 5m, configurable via `stale_chassis_grace_period`, set to `0` to disable). Random jitter (0-30s) prevents multiple agents from cleaning up simultaneously.
+8. **Cleans up** on shutdown (SIGINT/SIGTERM) — removes all managed routes, OVS flows, and the bridge IP before exiting (configurable via `cleanup_on_shutdown`)
 
 ## Building
 
@@ -112,6 +113,9 @@ CLI flags take precedence over values in the config file.
 | `--veth-provider-ip` | `OVN_ROUTE_VETH_PROVIDER_IP` | `veth_provider_ip` | *(nexthop+1)* | IP of the veth-provider side (auto-computed from `veth_nexthop` + 1) |
 | `--veth-leak-table-id` | `OVN_ROUTE_VETH_LEAK_TABLE_ID` | `veth_leak_table_id` | `200` | Routing table for the leak default route (1-252, must differ from `route_table_id`) |
 | `--veth-leak-rule-priority` | `OVN_ROUTE_VETH_LEAK_RULE_PRIORITY` | `veth_leak_rule_priority` | `2000` | Policy rule priority for veth leak rules |
+| `--port-forward-dev` | `OVN_ROUTE_PORT_FORWARD_DEV` | `port_forward_dev` | `loopback1` | Loopback device for VIP addresses in VRF |
+| `--port-forward-table-id` | `OVN_ROUTE_PORT_FORWARD_TABLE_ID` | `port_forward_table_id` | `201` | Routing table for DNAT return traffic (1-252, must differ from `route_table_id` and `veth_leak_table_id`) |
+| — | — | `port_forwards` | *(empty)* | List of VIPs with DNAT rules (YAML only, see [sample config](ovn-route-agent.yaml.sample)) |
 | `--version` | — | — | — | Print version and exit |
 
 ## Installation
@@ -193,6 +197,7 @@ sudo journalctl -u ovn-route-agent -f
 - **FRR**: `vtysh` must be available and the VRF + BGP configuration must already exist
 - **Linux**: Provider bridge (e.g. `br-ex`) must exist
 - **VRF route leaking**: The agent automatically creates and manages a veth pair connecting the default VRF to `vrf-provider` (enabled by default via `--veth-leak-enabled`). Per-network routes are reconciled dynamically based on auto-discovered or configured provider networks.
+- **nftables**: `nft` binary must be in PATH (required for port forwarding / DNAT)
 - **Permissions**: Root or `CAP_NET_ADMIN` for netlink route manipulation
 
 ## Multi-router support
@@ -297,6 +302,204 @@ cookie=0x999,priority=900,ip,in_port=<patch-port>,actions=mod_dl_dst:<br-ex-mac>
 ```
 
 This allows the kernel to accept and route the packets normally (via the `/32` kernel routes and policy rules into `vrf-provider` for BGP delivery).
+
+## Port forwarding (DNAT)
+
+### Background: the problem
+
+Some services running on the gateway nodes themselves (not inside VMs) need to be reachable via the same anycast VIP addresses that BGP announces to the external fabric. Examples include DNS resolvers, monitoring collectors, or API proxies that run directly on the network nodes.
+
+These services listen on internal addresses (e.g. `10.0.0.200:1053`) but need to be reachable from outside via a public VIP (e.g. `198.51.100.10:53`). A simple `iptables DNAT` rule handles the destination translation, but the **return path** is the hard part: the backend's reply has a source address (`10.0.0.200`) that doesn't match any provider network — so it would be routed via the default VRF instead of through `vrf-provider` where BGP can deliver it to the external client.
+
+The naive fix would be SNAT/masquerade, which rewrites the source to the VIP address. But this **destroys the client IP** — the backend sees the VIP as the source instead of the real client, breaking logging, rate limiting, ACLs, and any protocol that depends on client identity.
+
+### Solution: connmark-based return routing
+
+The agent uses nftables with connection tracking marks (connmarks) to steer DNAT return traffic through the veth pair into `vrf-provider` — without masquerade, preserving the original client IP end-to-end. For cases where the return path cannot work without source NAT (e.g. backend on a different network segment), per-VIP masquerade can be enabled as an opt-in escape hatch via `masquerade: true`.
+
+The mechanism works in three stages:
+
+**1. DNAT (prerouting)** — Translates the destination for incoming traffic:
+
+```
+ip daddr 198.51.100.10 tcp dport 53 dnat to 10.0.0.200:1053
+```
+
+Traffic arriving at the VIP is rewritten to the internal backend address. If `dest_port` is configured, port translation also occurs (e.g. public port 53 → backend port 1053).
+
+**2. Conntrack zone assignment (prerouting_ctzone, raw priority)** — Assigns a shared conntrack zone before conntrack processing. This is critical because DNAT'd traffic crosses VRF boundaries (original enters on the provider VRF, reply enters on the default VRF). Without a shared zone, conntrack cannot correlate them and reverse NAT fails silently:
+
+```
+# Original direction: client → VIP:port
+ip daddr 198.51.100.10 tcp dport 53 ct zone set 1
+
+# Reply direction: backend:port → client
+ip saddr 10.0.0.200 tcp sport 1053 ct zone set 1
+```
+
+**3. Fwmark tagging (prerouting_fwmark, filter priority)** — Marks DNAT'd packets with direction-specific fwmarks for policy routing. Two marks steer traffic into different routing tables:
+
+```
+# Original direction (client→backend): fwmark 0x100 → lookup main
+# Escapes the VRF so DNAT'd traffic reaches the backend via the default VRF
+ct direction original ct status dnat ct original daddr { 198.51.100.10 } meta mark set 0x100
+
+# Reply direction (backend→client): fwmark 0x200 → lookup table 201
+# Routes reply through veth pair back into vrf-provider for BGP delivery
+ct direction reply ct status dnat ct original daddr { 198.51.100.10 } meta mark set 0x200
+```
+
+**4. Policy routing** — Two fwmark-based `ip rule` entries steer DNAT'd traffic bidirectionally:
+
+```
+ip rule: fwmark 0x100 → lookup main       (priority 150, original direction)
+ip rule: fwmark 0x200 → lookup table 201   (priority 151, reply direction)
+table 201: default via 169.254.0.2 dev veth-default
+```
+
+The forward rule escapes the VRF so packets reach the backend. The reply rule sends the backend's response back through the veth pair into `vrf-provider`, where FRR/BGP delivers it to the external client. The client IP is preserved throughout — no masquerade anywhere in the path.
+
+A `postrouting_fwmark_clear` chain clears the `0x200` fwmark before packets cross the veth pair, preventing a routing loop where the mark would match again inside the provider VRF.
+
+### Why conntrack-based fwmark instead of simpler alternatives?
+
+| Approach | Client IP preserved? | Problem |
+|----------|---------------------|---------|
+| SNAT/masquerade | No | Backend sees VIP as source, not the real client |
+| Source-based routing (`ip rule from <backend>`) | Yes | Catches **all** traffic from the backend, not just DNAT replies — breaks normal connectivity |
+| Conntrack + fwmark | Yes | Only marks packets belonging to DNAT'd connections — surgical, no side effects |
+
+The conntrack-based approach is the only one that selectively routes just the DNAT return traffic without affecting any other traffic from the backend. It uses `ct status dnat` and `ct direction` to identify packets belonging to DNAT'd connections and assigns direction-specific fwmarks for policy routing.
+
+### The `forward_veth_guard` chain
+
+The veth pair between default VRF and `vrf-provider` is a controlled leak — only specific traffic should traverse it backwards (from default VRF into `vrf-provider`). Without a guard, any packet in the default VRF that happens to be routed via the veth pair could leak into `vrf-provider`.
+
+The `forward_veth_guard` nftables chain enforces a whitelist on traffic exiting through `veth-default`:
+
+```
+chain forward_veth_guard {
+    type filter hook forward priority filter; policy accept;
+
+    # Allow legitimate veth-leak return traffic (SNAT replies from provider networks)
+    oifname "veth-default" ip saddr { 192.0.2.0/24, 198.51.100.0/24 } accept
+
+    # Allow DNAT reply traffic (identified by fwmark 0x200 from prerouting_fwmark)
+    oifname "veth-default" meta mark 0x200 accept
+
+    # Drop everything else — prevents unintended traffic from leaking into vrf-provider
+    oifname "veth-default" drop
+}
+```
+
+The provider network CIDRs in the first rule are populated dynamically from the same auto-discovered (or manually configured) networks used by the rest of the agent. They are updated on every reconciliation cycle.
+
+### VIP address management
+
+Each VIP can optionally be managed by the agent (`manage_vip: true`). When enabled, the agent adds the VIP as a `/32` address on the configured loopback interface (default: `loopback1`) inside `vrf-provider`. This is the address that FRR announces via BGP to make the VIP reachable from the external fabric.
+
+When `manage_vip: false`, the VIP address must already exist on the interface (e.g. configured statically or by another tool).
+
+### Packet flow: DNAT forward and return path
+
+#### Forward path (external client → backend)
+
+```
+ External client
+ src=203.0.113.50  dst=198.51.100.10:53
+         │
+         │ BGP route: 198.51.100.10/32
+         ▼
+ ┌──────────────────────────────────────────────────────────────┐
+ │                       vrf-provider                           │
+ │                                                              │
+ │  lo: 198.51.100.10/32 (VIP, managed by agent)                │
+ │  FRR/BGP announces this /32 to external fabric               │
+ │                                                              │
+ │  Packet arrives via BGP peering                              │
+ │  /32 route: 198.51.100.10 via 169.254.0.1                    │
+ │                                                              │
+ │  veth-provider (169.254.0.2/30)                              │
+ └──────────────┬───────────────────────────────────────────────┘
+                │ veth pair
+ ┌──────────────▼───────────────────────────────────────────────┐
+ │  veth-default (169.254.0.1/30)        Default VRF            │
+ │                                                              │
+ │  nft prerouting_ctzone:                                      │
+ │  ├─ ct zone set 1 (shared zone for cross-VRF conntrack)      │
+ │  nft prerouting_dnat:                                        │
+ │  ├─ DNAT 198.51.100.10:53 → 10.0.0.200:1053                  │
+ │  nft prerouting_fwmark:                                      │
+ │  ├─ ct direction original + ct status dnat → fwmark 0x100    │
+ │  ip rule: fwmark 0x100 → lookup main (escapes VRF)           │
+ │                                                              │
+ │  Kernel delivers to local backend process                    │
+ │  └─ dst=10.0.0.200:1053 (client IP 203.0.113.50 preserved)   │
+ └──────────────────────────────────────────────────────────────┘
+```
+
+#### Return path (backend → external client)
+
+```
+ ┌──────────────────────────────────────────────────────────────┐
+ │                        Default VRF                           │
+ │                                                              │
+ │  Backend replies:                                            │
+ │  └─ src=10.0.0.200:1053  dst=203.0.113.50                    │
+ │  nft prerouting_fwmark (reply direction):                    │
+ │  ├─ ct direction reply + ct status dnat → fwmark 0x200       │
+ │  Conntrack un-DNATs source address:                          │
+ │  ├─ src becomes 198.51.100.10:53                             │
+ │  ip rule: fwmark 0x200 → lookup table 201                    │
+ │  └─ table 201: default via 169.254.0.2 dev veth-default      │
+ │  nft postrouting_fwmark_clear:                               │
+ │  ├─ clears fwmark 0x200 before crossing veth (prevents loop) │
+ │                                                              │
+ │  veth-default (169.254.0.1/30)                               │
+ └──────────────┬───────────────────────────────────────────────┘
+                │ veth pair
+ ┌──────────────▼───────────────────────────────────────────────┐
+ │                       vrf-provider                           │
+ │  veth-provider (169.254.0.2/30)                              │
+ │                                                              │
+ │  FRR/BGP delivers reply to external client                   │
+ │  └─ src=198.51.100.10:53  dst=203.0.113.50                   │
+ └──────────────┬───────────────────────────────────────────────┘
+                │
+                ▼
+         External client
+         (client IP preserved end-to-end)
+```
+
+### Prerequisites
+
+- **`nft` binary** must be in PATH (the agent shells out to `nft -f -` for atomic ruleset application)
+- **IPv4 only** — VIP and backend addresses must be IPv4; IPv6 is not supported for port forwarding
+- **`veth_leak_enabled: true`** (default) — port forwarding requires the veth pair for the return path
+- **IP forwarding** on the veth interfaces — enabled automatically by the agent at startup
+
+### Example configuration
+
+```yaml
+port_forward_dev: "loopback1"   # VIP addresses go on this interface in vrf-provider
+port_forward_table_id: 201      # dedicated routing table for DNAT return traffic
+
+port_forwards:
+  - vip: "198.51.100.10"
+    manage_vip: true             # agent adds 198.51.100.10/32 to loopback1
+    rules:
+      - proto: udp
+        port: 53                 # public port
+        dest_addr: "10.0.0.200"
+        dest_port: 1053          # backend port (port translation)
+      - proto: tcp
+        port: 53
+        dest_addr: "10.0.0.200"
+        dest_port: 1053
+      - proto: tcp
+        port: 443
+        dest_addr: "10.0.0.100"  # dest_port omitted → same as port (443)
+```
 
 ## Architecture
 

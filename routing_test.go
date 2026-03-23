@@ -310,6 +310,89 @@ func TestReconcileVethLeakNetworksDryRun(t *testing.T) {
 	}
 }
 
+func TestNewRouteManagerPortForward(t *testing.T) {
+	cfg := Config{
+		BridgeDev:          "br-ex",
+		VRFName:            "vrf-provider",
+		VethNexthop:        "169.254.0.1",
+		PortForwardEnabled: true,
+		PortForwardDev:     "loopback1",
+		PortForwardTableID: 202,
+		PortForwards: []PortForwardVIP{
+			{
+				VIP:       "198.51.100.10",
+				ManageVIP: true,
+				Rules: []PortForwardRule{
+					{Proto: "tcp", Port: 80, DestAddr: "10.0.0.100"},
+				},
+			},
+		},
+	}
+	rm := NewRouteManager(cfg)
+
+	if !rm.portForwardEnabled {
+		t.Error("portForwardEnabled should be true")
+	}
+	if rm.portForwardDev != "loopback1" {
+		t.Errorf("portForwardDev = %q, want %q", rm.portForwardDev, "loopback1")
+	}
+	if rm.portForwardTableID != 202 {
+		t.Errorf("portForwardTableID = %d, want %d", rm.portForwardTableID, 202)
+	}
+	if len(rm.portForwards) != 1 {
+		t.Errorf("len(portForwards) = %d, want 1", len(rm.portForwards))
+	}
+}
+
+func TestDryRunPortForward(t *testing.T) {
+	cfg := Config{
+		BridgeDev:          "br-ex",
+		VRFName:            "vrf-provider",
+		VethNexthop:        "169.254.0.1",
+		DryRun:             true,
+		PortForwardEnabled: true,
+		PortForwardDev:     "loopback1",
+		PortForwardTableID: 201,
+		PortForwards: []PortForwardVIP{
+			{VIP: "198.51.100.10", Rules: []PortForwardRule{{Proto: "tcp", Port: 80, DestAddr: "10.0.0.100"}}},
+		},
+	}
+	rm := NewRouteManager(cfg)
+
+	if err := rm.SetupPortForward(); err != nil {
+		t.Errorf("SetupPortForward() dry-run error: %v", err)
+	}
+
+	_, cidr, _ := net.ParseCIDR("198.51.100.0/24")
+	if err := rm.ReconcilePortForward([]*net.IPNet{cidr}); err != nil {
+		t.Errorf("ReconcilePortForward() dry-run error: %v", err)
+	}
+
+	if err := rm.TeardownPortForward(); err != nil {
+		t.Errorf("TeardownPortForward() dry-run error: %v", err)
+	}
+}
+
+func TestDisabledPortForward(t *testing.T) {
+	cfg := Config{
+		BridgeDev:          "br-ex",
+		VRFName:            "vrf-provider",
+		VethNexthop:        "169.254.0.1",
+		PortForwardEnabled: false,
+	}
+	rm := NewRouteManager(cfg)
+
+	if err := rm.SetupPortForward(); err != nil {
+		t.Errorf("SetupPortForward() disabled error: %v", err)
+	}
+	if err := rm.ReconcilePortForward(nil); err != nil {
+		t.Errorf("ReconcilePortForward() disabled error: %v", err)
+	}
+	if err := rm.TeardownPortForward(); err != nil {
+		t.Errorf("TeardownPortForward() disabled error: %v", err)
+	}
+}
+
 func TestValidateIP(t *testing.T) {
 	tests := []struct {
 		ip      string

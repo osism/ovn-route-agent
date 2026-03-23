@@ -64,6 +64,22 @@ func splitAndTrim(s, sep string) []string {
 	return result
 }
 
+// PortForwardRule describes a single DNAT port forwarding rule.
+type PortForwardRule struct {
+	Proto    string `yaml:"proto"`     // "tcp" or "udp"
+	Port     int    `yaml:"port"`      // incoming port on VIP (1-65535)
+	DestAddr string `yaml:"dest_addr"` // backend IP address
+	DestPort int    `yaml:"dest_port"` // backend port (0 = same as Port)
+}
+
+// PortForwardVIP describes a VIP with its forwarding rules.
+type PortForwardVIP struct {
+	VIP        string            `yaml:"vip"`        // anycast VIP address
+	ManageVIP  bool              `yaml:"manage_vip"` // agent adds/removes VIP on port_forward_dev
+	Masquerade bool              `yaml:"masquerade"` // SNAT forwarded traffic with outgoing interface IP
+	Rules      []PortForwardRule `yaml:"rules"`
+}
+
 // Config holds all runtime configuration for the agent.
 type Config struct {
 	OVNSBRemote       string
@@ -93,6 +109,12 @@ type Config struct {
 	VethProviderIP       string // IP of the veth-provider side (default: computed from VethNexthop + 1)
 	VethLeakTableID      int    // Routing table for leak default route (default: 200)
 	VethLeakRulePriority int    // Policy rule priority (default: 2000)
+
+	// Port forwarding (DNAT) settings
+	PortForwardEnabled bool             // derived: len(PortForwards) > 0
+	PortForwardDev     string           // loopback device for VIP addresses (default: "loopback1")
+	PortForwardTableID int              // routing table for DNAT return traffic (default: 201)
+	PortForwards       []PortForwardVIP // VIP forwarding rules from config
 }
 
 // configFile is the YAML representation of the config file.
@@ -120,6 +142,10 @@ type configFile struct {
 	VethProviderIP       string `yaml:"veth_provider_ip"`
 	VethLeakTableID      *int   `yaml:"veth_leak_table_id"`
 	VethLeakRulePriority *int   `yaml:"veth_leak_rule_priority"`
+
+	PortForwardDev     string           `yaml:"port_forward_dev"`
+	PortForwardTableID *int             `yaml:"port_forward_table_id"`
+	PortForwards       []PortForwardVIP `yaml:"port_forwards"`
 }
 
 // loadConfig builds the configuration with the following priority
@@ -151,6 +177,9 @@ func loadConfig(args []string) (Config, error) {
 		fVethProviderIP       = fs.String("veth-provider-ip", "", "IP of the veth-provider side (default: veth-nexthop + 1)")
 		fVethLeakTableID      = fs.Int("veth-leak-table-id", 200, "Routing table ID for veth leak default route (1-252)")
 		fVethLeakRulePriority = fs.Int("veth-leak-rule-priority", 2000, "Policy rule priority for veth leak rules")
+
+		fPortForwardDev     = fs.String("port-forward-dev", "", "Loopback device for VIP addresses in VRF (default: loopback1)")
+		fPortForwardTableID = fs.Int("port-forward-table-id", 201, "Routing table ID for DNAT return traffic (1-252)")
 	)
 
 	if err := fs.Parse(args); err != nil {
@@ -175,6 +204,8 @@ func loadConfig(args []string) (Config, error) {
 		VethLeakEnabled:         true,
 		VethLeakTableID:         200,
 		VethLeakRulePriority:    2000,
+		PortForwardDev:          "loopback1",
+		PortForwardTableID:      201,
 	}
 
 	// Layer 1: config file
@@ -238,6 +269,10 @@ func loadConfig(args []string) (Config, error) {
 			cfg.VethLeakTableID = *fVethLeakTableID
 		case "veth-leak-rule-priority":
 			cfg.VethLeakRulePriority = *fVethLeakRulePriority
+		case "port-forward-dev":
+			cfg.PortForwardDev = *fPortForwardDev
+		case "port-forward-table-id":
+			cfg.PortForwardTableID = *fPortForwardTableID
 		}
 	})
 
@@ -295,6 +330,67 @@ func validateConfig(cfg *Config) error {
 		}
 		if net.ParseIP(cfg.VethProviderIP) == nil {
 			return fmt.Errorf("invalid veth-provider-ip: %q", cfg.VethProviderIP)
+		}
+	}
+
+	// Port forward validation
+	cfg.PortForwardEnabled = len(cfg.PortForwards) > 0
+	if cfg.PortForwardEnabled {
+		if cfg.PortForwardTableID < 1 || cfg.PortForwardTableID > 252 {
+			return fmt.Errorf("invalid port-forward-table-id: %d (must be 1-252)", cfg.PortForwardTableID)
+		}
+		if cfg.PortForwardTableID == cfg.RouteTableID && cfg.RouteTableID != 0 {
+			return fmt.Errorf("port-forward-table-id (%d) must not equal route-table-id (%d)", cfg.PortForwardTableID, cfg.RouteTableID)
+		}
+		if cfg.PortForwardTableID == cfg.VethLeakTableID {
+			return fmt.Errorf("port-forward-table-id (%d) must not equal veth-leak-table-id (%d)", cfg.PortForwardTableID, cfg.VethLeakTableID)
+		}
+		if !isValidIdentifier(cfg.PortForwardDev) {
+			return fmt.Errorf("invalid port-forward-dev: %q", cfg.PortForwardDev)
+		}
+		if !cfg.VethLeakEnabled {
+			return fmt.Errorf("port forwarding requires veth_leak_enabled=true (needs veth pair for return traffic)")
+		}
+		seenVIPs := make(map[string]bool, len(cfg.PortForwards))
+		for i, pf := range cfg.PortForwards {
+			vipIP := net.ParseIP(pf.VIP)
+			if vipIP == nil {
+				return fmt.Errorf("port_forwards[%d]: invalid VIP: %q", i, pf.VIP)
+			}
+			if vipIP.To4() == nil {
+				return fmt.Errorf("port_forwards[%d]: IPv6 VIP not supported: %q (only IPv4)", i, pf.VIP)
+			}
+			if seenVIPs[pf.VIP] {
+				return fmt.Errorf("port_forwards[%d]: duplicate VIP: %q", i, pf.VIP)
+			}
+			seenVIPs[pf.VIP] = true
+			if len(pf.Rules) == 0 {
+				return fmt.Errorf("port_forwards[%d] (vip=%s): no rules defined", i, pf.VIP)
+			}
+			seenRules := make(map[string]bool, len(pf.Rules))
+			for j, r := range pf.Rules {
+				if r.Proto != "tcp" && r.Proto != "udp" {
+					return fmt.Errorf("port_forwards[%d].rules[%d]: invalid proto %q (must be tcp or udp)", i, j, r.Proto)
+				}
+				if r.Port < 1 || r.Port > 65535 {
+					return fmt.Errorf("port_forwards[%d].rules[%d]: invalid port %d (must be 1-65535)", i, j, r.Port)
+				}
+				ruleKey := fmt.Sprintf("%s/%d", r.Proto, r.Port)
+				if seenRules[ruleKey] {
+					return fmt.Errorf("port_forwards[%d].rules[%d]: duplicate %s port %d on VIP %s", i, j, r.Proto, r.Port, pf.VIP)
+				}
+				seenRules[ruleKey] = true
+				destIP := net.ParseIP(r.DestAddr)
+				if destIP == nil {
+					return fmt.Errorf("port_forwards[%d].rules[%d]: invalid dest_addr: %q", i, j, r.DestAddr)
+				}
+				if destIP.To4() == nil {
+					return fmt.Errorf("port_forwards[%d].rules[%d]: IPv6 dest_addr not supported: %q (only IPv4)", i, j, r.DestAddr)
+				}
+				if r.DestPort < 0 || r.DestPort > 65535 {
+					return fmt.Errorf("port_forwards[%d].rules[%d]: invalid dest_port %d (must be 0-65535)", i, j, r.DestPort)
+				}
+			}
 		}
 	}
 
@@ -409,6 +505,15 @@ func applyFileConfig(cfg *Config, fc *configFile) {
 	if fc.VethLeakRulePriority != nil {
 		cfg.VethLeakRulePriority = *fc.VethLeakRulePriority
 	}
+	if fc.PortForwardDev != "" {
+		cfg.PortForwardDev = fc.PortForwardDev
+	}
+	if fc.PortForwardTableID != nil {
+		cfg.PortForwardTableID = *fc.PortForwardTableID
+	}
+	if len(fc.PortForwards) > 0 {
+		cfg.PortForwards = fc.PortForwards
+	}
 }
 
 func applyEnvConfig(cfg *Config) {
@@ -485,6 +590,15 @@ func applyEnvConfig(cfg *Config) {
 		var prio int
 		if _, err := fmt.Sscanf(v, "%d", &prio); err == nil {
 			cfg.VethLeakRulePriority = prio
+		}
+	}
+	if v := os.Getenv("OVN_ROUTE_PORT_FORWARD_DEV"); v != "" {
+		cfg.PortForwardDev = v
+	}
+	if v := os.Getenv("OVN_ROUTE_PORT_FORWARD_TABLE_ID"); v != "" {
+		var id int
+		if _, err := fmt.Sscanf(v, "%d", &id); err == nil {
+			cfg.PortForwardTableID = id
 		}
 	}
 }

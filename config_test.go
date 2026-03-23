@@ -918,6 +918,323 @@ func TestApplyFileConfigFRRPrefixList(t *testing.T) {
 	}
 }
 
+func TestPortForwardConfigParsing(t *testing.T) {
+	content := `
+ovn_sb_remote: "tcp:10.0.0.1:6642"
+ovn_nb_remote: "tcp:10.0.0.1:6641"
+port_forward_dev: "loopback1"
+port_forward_table_id: 202
+port_forwards:
+  - vip: "198.51.100.10"
+    manage_vip: true
+    rules:
+      - proto: tcp
+        port: 80
+        dest_addr: "10.0.0.100"
+      - proto: udp
+        port: 53
+        dest_addr: "10.0.0.200"
+        dest_port: 1053
+`
+	path := filepath.Join(t.TempDir(), "config.yaml")
+	if err := os.WriteFile(path, []byte(content), 0644); err != nil {
+		t.Fatalf("write test config: %v", err)
+	}
+
+	cfg, err := loadConfig([]string{"--config", path})
+	if err != nil {
+		t.Fatalf("loadConfig() error: %v", err)
+	}
+
+	if cfg.PortForwardDev != "loopback1" {
+		t.Errorf("PortForwardDev = %q, want %q", cfg.PortForwardDev, "loopback1")
+	}
+	if cfg.PortForwardTableID != 202 {
+		t.Errorf("PortForwardTableID = %d, want %d", cfg.PortForwardTableID, 202)
+	}
+	if !cfg.PortForwardEnabled {
+		t.Error("PortForwardEnabled should be true")
+	}
+	if len(cfg.PortForwards) != 1 {
+		t.Fatalf("len(PortForwards) = %d, want 1", len(cfg.PortForwards))
+	}
+	pf := cfg.PortForwards[0]
+	if pf.VIP != "198.51.100.10" {
+		t.Errorf("VIP = %q, want %q", pf.VIP, "198.51.100.10")
+	}
+	if !pf.ManageVIP {
+		t.Error("ManageVIP should be true")
+	}
+	if len(pf.Rules) != 2 {
+		t.Fatalf("len(Rules) = %d, want 2", len(pf.Rules))
+	}
+	if pf.Rules[1].DestPort != 1053 {
+		t.Errorf("Rules[1].DestPort = %d, want 1053", pf.Rules[1].DestPort)
+	}
+}
+
+func TestPortForwardValidation(t *testing.T) {
+	base := func() Config {
+		return Config{
+			VethNexthop:      "169.254.0.1",
+			VethLeakEnabled:  true,
+			VethLeakTableID:  200,
+			PortForwardDev:   "loopback1",
+			PortForwardTableID: 201,
+			PortForwards: []PortForwardVIP{
+				{
+					VIP: "198.51.100.10",
+					Rules: []PortForwardRule{
+						{Proto: "tcp", Port: 80, DestAddr: "10.0.0.100"},
+					},
+				},
+			},
+		}
+	}
+
+	t.Run("valid", func(t *testing.T) {
+		cfg := base()
+		if err := validateConfig(&cfg); err != nil {
+			t.Errorf("unexpected error: %v", err)
+		}
+		if !cfg.PortForwardEnabled {
+			t.Error("PortForwardEnabled should be true")
+		}
+	})
+
+	t.Run("disabled_when_no_forwards", func(t *testing.T) {
+		cfg := base()
+		cfg.PortForwards = nil
+		if err := validateConfig(&cfg); err != nil {
+			t.Errorf("unexpected error: %v", err)
+		}
+		if cfg.PortForwardEnabled {
+			t.Error("PortForwardEnabled should be false when no forwards")
+		}
+	})
+
+	t.Run("invalid_table_id", func(t *testing.T) {
+		cfg := base()
+		cfg.PortForwardTableID = 300
+		if err := validateConfig(&cfg); err == nil {
+			t.Error("expected error for invalid table ID")
+		}
+	})
+
+	t.Run("table_id_conflict_route", func(t *testing.T) {
+		cfg := base()
+		cfg.RouteTableID = 201
+		if err := validateConfig(&cfg); err == nil {
+			t.Error("expected error for table ID conflict with route_table_id")
+		}
+	})
+
+	t.Run("table_id_conflict_leak", func(t *testing.T) {
+		cfg := base()
+		cfg.PortForwardTableID = 200 // same as VethLeakTableID
+		if err := validateConfig(&cfg); err == nil {
+			t.Error("expected error for table ID conflict with veth_leak_table_id")
+		}
+	})
+
+	t.Run("requires_veth_leak", func(t *testing.T) {
+		cfg := base()
+		cfg.VethLeakEnabled = false
+		if err := validateConfig(&cfg); err == nil {
+			t.Error("expected error when veth leak disabled")
+		}
+	})
+
+	t.Run("invalid_vip", func(t *testing.T) {
+		cfg := base()
+		cfg.PortForwards[0].VIP = "not-an-ip"
+		if err := validateConfig(&cfg); err == nil {
+			t.Error("expected error for invalid VIP")
+		}
+	})
+
+	t.Run("ipv6_vip_rejected", func(t *testing.T) {
+		cfg := base()
+		cfg.PortForwards[0].VIP = "2001:db8::1"
+		if err := validateConfig(&cfg); err == nil {
+			t.Error("expected error for IPv6 VIP")
+		}
+	})
+
+	t.Run("no_rules", func(t *testing.T) {
+		cfg := base()
+		cfg.PortForwards[0].Rules = nil
+		if err := validateConfig(&cfg); err == nil {
+			t.Error("expected error for empty rules")
+		}
+	})
+
+	t.Run("invalid_proto", func(t *testing.T) {
+		cfg := base()
+		cfg.PortForwards[0].Rules[0].Proto = "icmp"
+		if err := validateConfig(&cfg); err == nil {
+			t.Error("expected error for invalid proto")
+		}
+	})
+
+	t.Run("invalid_port", func(t *testing.T) {
+		cfg := base()
+		cfg.PortForwards[0].Rules[0].Port = 0
+		if err := validateConfig(&cfg); err == nil {
+			t.Error("expected error for port 0")
+		}
+	})
+
+	t.Run("invalid_dest_addr", func(t *testing.T) {
+		cfg := base()
+		cfg.PortForwards[0].Rules[0].DestAddr = "invalid"
+		if err := validateConfig(&cfg); err == nil {
+			t.Error("expected error for invalid dest_addr")
+		}
+	})
+
+	t.Run("ipv6_dest_addr_rejected", func(t *testing.T) {
+		cfg := base()
+		cfg.PortForwards[0].Rules[0].DestAddr = "::1"
+		if err := validateConfig(&cfg); err == nil {
+			t.Error("expected error for IPv6 dest_addr")
+		}
+	})
+
+	t.Run("duplicate_vip", func(t *testing.T) {
+		cfg := base()
+		cfg.PortForwards = append(cfg.PortForwards, PortForwardVIP{
+			VIP:   "198.51.100.10", // same as first entry
+			Rules: []PortForwardRule{{Proto: "tcp", Port: 443, DestAddr: "10.0.0.100"}},
+		})
+		if err := validateConfig(&cfg); err == nil {
+			t.Error("expected error for duplicate VIP")
+		}
+	})
+
+	t.Run("duplicate_rule", func(t *testing.T) {
+		cfg := base()
+		cfg.PortForwards[0].Rules = append(cfg.PortForwards[0].Rules,
+			PortForwardRule{Proto: "tcp", Port: 80, DestAddr: "10.0.0.200"},
+		)
+		if err := validateConfig(&cfg); err == nil {
+			t.Error("expected error for duplicate proto/port on same VIP")
+		}
+	})
+
+	t.Run("same_port_different_proto_ok", func(t *testing.T) {
+		cfg := base()
+		cfg.PortForwards[0].Rules = append(cfg.PortForwards[0].Rules,
+			PortForwardRule{Proto: "udp", Port: 80, DestAddr: "10.0.0.200"},
+		)
+		if err := validateConfig(&cfg); err != nil {
+			t.Errorf("same port with different proto should be valid: %v", err)
+		}
+	})
+}
+
+func TestApplyEnvConfigPortForward(t *testing.T) {
+	cfg := Config{
+		PortForwardDev:     "loopback1",
+		PortForwardTableID: 201,
+	}
+
+	t.Setenv("OVN_ROUTE_PORT_FORWARD_DEV", "loopback1")
+	t.Setenv("OVN_ROUTE_PORT_FORWARD_TABLE_ID", "202")
+
+	applyEnvConfig(&cfg)
+
+	if cfg.PortForwardDev != "loopback1" {
+		t.Errorf("PortForwardDev = %q, want %q", cfg.PortForwardDev, "loopback1")
+	}
+	if cfg.PortForwardTableID != 202 {
+		t.Errorf("PortForwardTableID = %d, want %d", cfg.PortForwardTableID, 202)
+	}
+}
+
+func TestLoadConfigPortForwardCLIFlags(t *testing.T) {
+	cfg, err := loadConfig([]string{
+		"--ovn-sb-remote", "tcp:10.0.0.1:6642",
+		"--ovn-nb-remote", "tcp:10.0.0.1:6641",
+		"--port-forward-dev", "loopback1",
+		"--port-forward-table-id", "203",
+	})
+	if err != nil {
+		t.Fatalf("loadConfig() error: %v", err)
+	}
+
+	if cfg.PortForwardDev != "loopback1" {
+		t.Errorf("PortForwardDev = %q, want %q", cfg.PortForwardDev, "loopback1")
+	}
+	if cfg.PortForwardTableID != 203 {
+		t.Errorf("PortForwardTableID = %d, want %d", cfg.PortForwardTableID, 203)
+	}
+}
+
+func TestApplyFileConfigPortForward(t *testing.T) {
+	cfg := Config{
+		PortForwardDev:     "loopback1",
+		PortForwardTableID: 201,
+	}
+	tableID := 205
+	fc := configFile{
+		PortForwardDev:     "loopback1",
+		PortForwardTableID: &tableID,
+		PortForwards: []PortForwardVIP{
+			{VIP: "198.51.100.10", Rules: []PortForwardRule{{Proto: "tcp", Port: 80, DestAddr: "10.0.0.100"}}},
+		},
+	}
+
+	applyFileConfig(&cfg, &fc)
+
+	if cfg.PortForwardDev != "loopback1" {
+		t.Errorf("PortForwardDev = %q, want %q", cfg.PortForwardDev, "loopback1")
+	}
+	if cfg.PortForwardTableID != 205 {
+		t.Errorf("PortForwardTableID = %d, want %d", cfg.PortForwardTableID, 205)
+	}
+	if len(cfg.PortForwards) != 1 {
+		t.Errorf("len(PortForwards) = %d, want 1", len(cfg.PortForwards))
+	}
+}
+
+func TestApplyFileConfigPortForwardEmpty(t *testing.T) {
+	cfg := Config{
+		PortForwardDev:     "loopback1",
+		PortForwardTableID: 201,
+	}
+	fc := configFile{} // no port forward fields set
+
+	applyFileConfig(&cfg, &fc)
+
+	if cfg.PortForwardDev != "loopback1" {
+		t.Errorf("PortForwardDev should remain %q, got %q", "loopback1", cfg.PortForwardDev)
+	}
+	if cfg.PortForwardTableID != 201 {
+		t.Errorf("PortForwardTableID should remain %d, got %d", 201, cfg.PortForwardTableID)
+	}
+}
+
+func TestPortForwardDefaults(t *testing.T) {
+	cfg, err := loadConfig([]string{
+		"--ovn-sb-remote", "tcp:10.0.0.1:6642",
+		"--ovn-nb-remote", "tcp:10.0.0.1:6641",
+	})
+	if err != nil {
+		t.Fatalf("loadConfig() error: %v", err)
+	}
+
+	if cfg.PortForwardDev != "loopback1" {
+		t.Errorf("default PortForwardDev = %q, want %q", cfg.PortForwardDev, "loopback1")
+	}
+	if cfg.PortForwardTableID != 201 {
+		t.Errorf("default PortForwardTableID = %d, want %d", cfg.PortForwardTableID, 201)
+	}
+	if cfg.PortForwardEnabled {
+		t.Error("PortForwardEnabled should be false by default")
+	}
+}
+
 func TestNextIPInSubnet(t *testing.T) {
 	tests := []struct {
 		input string
