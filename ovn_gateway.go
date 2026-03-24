@@ -6,6 +6,8 @@ import (
 	"fmt"
 	"log/slog"
 	"net"
+	"strings"
+	"time"
 
 	"github.com/ovn-kubernetes/libovsdb/ovsdb"
 )
@@ -79,6 +81,88 @@ func (o *OVNClient) EnsureGatewayRouting(ctx context.Context, localRouters []Loc
 		}
 	}
 	return nil
+}
+
+// minActivePriority is the minimum priority the active chassis should
+// maintain. Drained gateways restore to priority 1, so the active chassis
+// must stay at least at 2 to prevent priority ties (and the resulting
+// tiebreak flapping) when a peer restarts.
+const minActivePriority = 2
+
+// EnsureActivePriorityLead ensures that for each locally-active router the
+// local Gateway_Chassis entry has a strictly higher priority than all peers
+// in the same HA group, and at least minActivePriority. The minimum
+// prevents reverse failovers when a drained chassis restores to priority 1
+// and the active chassis is also at 1 (because it never boosted while the
+// peer was at 0).
+func (o *OVNClient) EnsureActivePriorityLead(ctx context.Context, localRouters []LocalRouterInfo, localChassisName string) error {
+	var gwChassisList []NBGatewayChassis
+	if err := o.nbClient.List(ctx, &gwChassisList); err != nil {
+		return fmt.Errorf("list gateway chassis: %w", err)
+	}
+
+	// Build set of locally-active LRP names.
+	activeLRPs := make(map[string]bool, len(localRouters))
+	for _, lr := range localRouters {
+		activeLRPs[lr.LRPName] = true
+	}
+
+	// Group Gateway_Chassis entries by LRP, tracking local entry and max peer priority.
+	type haGroup struct {
+		local   *NBGatewayChassis
+		maxPeer int
+	}
+	groups := make(map[string]*haGroup)
+
+	for i := range gwChassisList {
+		gwc := &gwChassisList[i]
+		// Gateway_Chassis name format: {lrp_name}_{chassis_name}
+		lrpName := strings.TrimSuffix(gwc.Name, "_"+gwc.ChassisName)
+		if !activeLRPs[lrpName] {
+			continue
+		}
+
+		g, ok := groups[lrpName]
+		if !ok {
+			g = &haGroup{maxPeer: -1}
+			groups[lrpName] = g
+		}
+
+		if gwc.ChassisName == localChassisName {
+			g.local = gwc
+		} else if gwc.Priority > g.maxPeer {
+			g.maxPeer = gwc.Priority
+		}
+	}
+
+	var allOps []ovsdb.Operation
+	for lrpName, g := range groups {
+		if g.local == nil || g.maxPeer < 0 {
+			continue // No local entry or no peers
+		}
+		if g.local.Priority > g.maxPeer && g.local.Priority >= minActivePriority {
+			continue // Already has the lead with safe margin
+		}
+		newPriority := g.maxPeer + 1
+		if newPriority < minActivePriority {
+			newPriority = minActivePriority
+		}
+		slog.Info("boosting gateway chassis priority to maintain active lead",
+			"lrp", lrpName, "chassis", localChassisName,
+			"old_priority", g.local.Priority, "new_priority", newPriority)
+		g.local.Priority = newPriority
+		ops, err := o.nbClient.Where(g.local).Update(g.local, &g.local.Priority)
+		if err != nil {
+			slog.Error("failed to build priority boost op", "lrp", lrpName, "error", err)
+			continue
+		}
+		allOps = append(allOps, ops...)
+	}
+
+	if len(allOps) == 0 {
+		return nil
+	}
+	return o.transactOps(ctx, allOps)
 }
 
 // ensureDefaultRoute adds 0.0.0.0/0 via <vgwIP> on the router if not already present.
@@ -499,5 +583,154 @@ func (o *OVNClient) CleanupStaleChassisManagedEntries(ctx context.Context, stale
 	}
 
 	return nil
+}
+
+// DrainGateways sets the Gateway_Chassis priority to 0 for this chassis on
+// all locally-active router ports, causing OVN to migrate chassisredirect
+// ports to standby chassis (which have priority >= 1). It then polls the
+// SB Port_Binding table until all gateways have moved away or the context
+// deadline is exceeded.
+//
+// On the next startup, RestoreDrainedGateways sets drained entries back to
+// priority 1 (standby level) so the chassis rejoins the HA group.
+// EnsureActivePriorityLead prevents reverse failover by ensuring the
+// active chassis always has priority >= minActivePriority (currently 2),
+// which is strictly above the restore level of 1.
+func (o *OVNClient) DrainGateways(ctx context.Context, localChassisName string) error {
+	// Step 1: Find all Gateway_Chassis entries for this chassis with priority > 0.
+	var gwChassisList []NBGatewayChassis
+	if err := o.nbClient.List(ctx, &gwChassisList); err != nil {
+		return fmt.Errorf("list gateway chassis: %w", err)
+	}
+
+	var toDrain []NBGatewayChassis
+	for _, gwc := range gwChassisList {
+		if gwc.ChassisName == localChassisName && gwc.Priority > 0 {
+			toDrain = append(toDrain, gwc)
+		}
+	}
+
+	if len(toDrain) == 0 {
+		slog.Info("drain: no gateway chassis entries to drain on this chassis")
+		return nil
+	}
+
+	// Step 2: Set priority to 0 in a single batched transaction.
+	var allOps []ovsdb.Operation
+	for i := range toDrain {
+		gwc := toDrain[i]
+		oldPriority := gwc.Priority
+		gwc.Priority = 0
+		ops, err := o.nbClient.Where(&gwc).Update(&gwc, &gwc.Priority)
+		if err != nil {
+			slog.Error("drain: failed to build priority update", "name", gwc.Name, "error", err)
+			continue
+		}
+		allOps = append(allOps, ops...)
+		slog.Info("drain: gateway chassis priority lowered",
+			"name", gwc.Name, "chassis", gwc.ChassisName,
+			"old_priority", oldPriority, "new_priority", 0)
+	}
+	if len(allOps) > 0 {
+		if err := o.transactOps(ctx, allOps); err != nil {
+			return fmt.Errorf("drain: failed to lower gateway chassis priorities: %w", err)
+		}
+	}
+
+	// Step 3: Poll SB until no chassisredirect ports remain on this chassis.
+	ticker := time.NewTicker(2 * time.Second)
+	defer ticker.Stop()
+
+	for {
+		remaining, err := o.countLocalCRPorts(ctx, localChassisName)
+		if err != nil {
+			return fmt.Errorf("drain: failed to query port bindings: %w", err)
+		}
+		if remaining == 0 {
+			slog.Info("drain: complete, all gateways migrated away")
+			return nil
+		}
+		slog.Info("drain: waiting for gateway migration", "remaining_gateways", remaining)
+
+		select {
+		case <-ctx.Done():
+			slog.Warn("drain: timeout exceeded, proceeding with shutdown", "remaining_gateways", remaining)
+			return nil
+		case <-ticker.C:
+		}
+	}
+}
+
+// RestoreDrainedGateways sets Gateway_Chassis entries that were drained
+// (priority 0) back to priority 1 (standby level). This re-adds the
+// chassis to the HA group as a standby. The active chassis maintains a
+// strictly higher priority via EnsureActivePriorityLead, which prevents
+// reverse failover even when both chassis would otherwise have the same
+// priority. This should be called on startup before the first reconciliation.
+func (o *OVNClient) RestoreDrainedGateways(ctx context.Context, localChassisName string) {
+	var gwChassisList []NBGatewayChassis
+	if err := o.nbClient.List(ctx, &gwChassisList); err != nil {
+		slog.Error("restore-drain: failed to list gateway chassis", "error", err)
+		return
+	}
+
+	var allOps []ovsdb.Operation
+	for _, gwc := range gwChassisList {
+		if gwc.ChassisName != localChassisName || gwc.Priority != 0 {
+			continue
+		}
+
+		gwc.Priority = 1
+		ops, err := o.nbClient.Where(&gwc).Update(&gwc, &gwc.Priority)
+		if err != nil {
+			slog.Error("restore-drain: failed to build restore op", "name", gwc.Name, "error", err)
+			continue
+		}
+		allOps = append(allOps, ops...)
+		slog.Info("restore-drain: gateway chassis priority restored to standby",
+			"name", gwc.Name, "chassis", gwc.ChassisName, "priority", 1)
+	}
+
+	if len(allOps) == 0 {
+		return
+	}
+	if err := o.transactOps(ctx, allOps); err != nil {
+		slog.Error("restore-drain: failed to restore gateway chassis priorities", "error", err)
+	}
+}
+
+// countLocalCRPorts returns the number of chassisredirect ports currently
+// bound to the given chassis hostname in the SB Port_Binding table.
+func (o *OVNClient) countLocalCRPorts(ctx context.Context, localChassisName string) (int, error) {
+	var portBindings []SBPortBinding
+	if err := o.sbClient.List(ctx, &portBindings); err != nil {
+		return 0, fmt.Errorf("list port bindings: %w", err)
+	}
+
+	var chassis []SBChassis
+	if err := o.sbClient.List(ctx, &chassis); err != nil {
+		return 0, fmt.Errorf("list chassis: %w", err)
+	}
+
+	chassisHostname := make(map[string]string, len(chassis))
+	for _, ch := range chassis {
+		chassisHostname[ch.UUID] = ch.Hostname
+		chassisHostname[ch.Name] = ch.Hostname
+	}
+
+	count := 0
+	for _, pb := range portBindings {
+		if pb.Type != "chassisredirect" || pb.Chassis == nil || *pb.Chassis == "" {
+			continue
+		}
+		if o.cfg.GatewayPort != "" && pb.LogicalPort != o.cfg.GatewayPort {
+			continue
+		}
+		hostname := chassisHostname[*pb.Chassis]
+		if strings.EqualFold(hostname, localChassisName) {
+			count++
+		}
+	}
+	return count, nil
 }
 

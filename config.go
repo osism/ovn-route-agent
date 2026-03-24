@@ -97,6 +97,8 @@ type Config struct {
 	LogLevel          string
 	DryRun            bool
 	CleanupOnShutdown bool
+	DrainOnShutdown   bool
+	DrainTimeout      time.Duration
 	FRRPrefixList     string // FRR prefix-list name to manage dynamically (e.g. ANNOUNCED-NETWORKS)
 
 	// Stale chassis cleanup: grace period before removing OVN NB entries
@@ -133,6 +135,8 @@ type configFile struct {
 	LogLevel          string        `yaml:"log_level"`
 	DryRun            *bool         `yaml:"dry_run"`
 	CleanupOnShutdown *bool         `yaml:"cleanup_on_shutdown"`
+	DrainOnShutdown   *bool         `yaml:"drain_on_shutdown"`
+	DrainTimeout      string        `yaml:"drain_timeout"`
 
 	FRRPrefixList string `yaml:"frr_prefix_list"`
 
@@ -170,6 +174,8 @@ func loadConfig(args []string) (Config, error) {
 		fLogLevel          = fs.String("log-level", "", "Log level (debug, info, warn, error)")
 		fDryRun            = fs.Bool("dry-run", false, "Dry-run mode: connect and reconcile but only log what would be done")
 		fCleanupOnShutdown = fs.Bool("cleanup-on-shutdown", true, "Remove all managed routes on shutdown (SIGINT/SIGTERM)")
+		fDrainOnShutdown   = fs.Bool("drain-on-shutdown", true, "Drain HA gateways before shutdown by lowering Gateway_Chassis priority")
+		fDrainTimeout      = fs.String("drain-timeout", "", "Max time to wait for gateway drain (e.g. 60s)")
 
 		fFRRPrefixList        = fs.String("frr-prefix-list", "", "FRR prefix-list name to manage dynamically (default: ANNOUNCED-NETWORKS)")
 		fStaleGrace           = fs.String("stale-chassis-grace-period", "", "Grace period before cleaning up entries from missing chassis (e.g. 5m, 0 to disable)")
@@ -199,6 +205,8 @@ func loadConfig(args []string) (Config, error) {
 		ReconcileInterval:       60 * time.Second,
 		LogLevel:                "info",
 		CleanupOnShutdown:       true,
+		DrainOnShutdown:         true,
+		DrainTimeout:            60 * time.Second,
 		FRRPrefixList:           "ANNOUNCED-NETWORKS",
 		StaleChassisGracePeriod: 5 * time.Minute,
 		VethLeakEnabled:         true,
@@ -253,6 +261,12 @@ func loadConfig(args []string) (Config, error) {
 			cfg.DryRun = *fDryRun
 		case "cleanup-on-shutdown":
 			cfg.CleanupOnShutdown = *fCleanupOnShutdown
+		case "drain-on-shutdown":
+			cfg.DrainOnShutdown = *fDrainOnShutdown
+		case "drain-timeout":
+			if d, err := time.ParseDuration(*fDrainTimeout); err == nil {
+				cfg.DrainTimeout = d
+			}
 		case "frr-prefix-list":
 			cfg.FRRPrefixList = *fFRRPrefixList
 		case "stale-chassis-grace-period":
@@ -308,6 +322,13 @@ func validateConfig(cfg *Config) error {
 	// FRR prefix-list validation
 	if cfg.FRRPrefixList != "" && !isValidIdentifier(cfg.FRRPrefixList) {
 		return fmt.Errorf("invalid frr-prefix-list: %q (only alphanumeric, hyphen, underscore, dot allowed)", cfg.FRRPrefixList)
+	}
+
+	if cfg.DrainTimeout < 0 {
+		return fmt.Errorf("invalid drain-timeout: must be non-negative")
+	}
+	if cfg.DrainOnShutdown && cfg.DrainTimeout == 0 {
+		return fmt.Errorf("drain-on-shutdown requires a positive drain-timeout")
 	}
 
 	if cfg.StaleChassisGracePeriod < 0 {
@@ -483,6 +504,16 @@ func applyFileConfig(cfg *Config, fc *configFile) {
 	if fc.CleanupOnShutdown != nil {
 		cfg.CleanupOnShutdown = *fc.CleanupOnShutdown
 	}
+	if fc.DrainOnShutdown != nil {
+		cfg.DrainOnShutdown = *fc.DrainOnShutdown
+	}
+	if fc.DrainTimeout != "" {
+		if d, err := time.ParseDuration(fc.DrainTimeout); err == nil {
+			cfg.DrainTimeout = d
+		} else {
+			slog.Warn("ignoring invalid drain_timeout in config file", "value", fc.DrainTimeout, "error", err)
+		}
+	}
 	if fc.FRRPrefixList != "" {
 		cfg.FRRPrefixList = fc.FRRPrefixList
 	}
@@ -563,6 +594,16 @@ func applyEnvConfig(cfg *Config) {
 	}
 	if v := os.Getenv("OVN_ROUTE_CLEANUP_ON_SHUTDOWN"); v == "0" || v == "false" {
 		cfg.CleanupOnShutdown = false
+	}
+	if v := os.Getenv("OVN_ROUTE_DRAIN_ON_SHUTDOWN"); v == "0" || v == "false" {
+		cfg.DrainOnShutdown = false
+	}
+	if v := os.Getenv("OVN_ROUTE_DRAIN_TIMEOUT"); v != "" {
+		if d, err := time.ParseDuration(v); err == nil {
+			cfg.DrainTimeout = d
+		} else {
+			slog.Warn("ignoring invalid OVN_ROUTE_DRAIN_TIMEOUT env var", "value", v, "error", err)
+		}
 	}
 	if v := os.Getenv("OVN_ROUTE_FRR_PREFIX_LIST"); v != "" {
 		cfg.FRRPrefixList = v

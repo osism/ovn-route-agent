@@ -117,6 +117,11 @@ func (a *Agent) Run(ctx context.Context) error {
 	}
 	defer a.ovn.Close()
 
+	// Restore any gateway chassis priorities that were drained by a previous run.
+	if a.cfg.DrainOnShutdown {
+		a.ovn.RestoreDrainedGateways(ctx, a.ovn.GetState().LocalChassisName)
+	}
+
 	// Initial reconciliation
 	a.reconcile()
 
@@ -136,6 +141,16 @@ func (a *Agent) Run(ctx context.Context) error {
 	for {
 		select {
 		case <-ctx.Done():
+			// Drain must happen BEFORE cleanup and BEFORE OVN connection close.
+			// Use a fresh context since the parent ctx is already cancelled.
+			if a.cfg.DrainOnShutdown {
+				drainCtx, drainCancel := context.WithTimeout(context.Background(), a.cfg.DrainTimeout)
+				slog.Info("drain mode active, migrating gateways away", "timeout", a.cfg.DrainTimeout)
+				if err := a.ovn.DrainGateways(drainCtx, a.ovn.GetState().LocalChassisName); err != nil {
+					slog.Error("drain failed", "error", err)
+				}
+				drainCancel()
+			}
 			if a.cfg.CleanupOnShutdown {
 				slog.Info("shutting down, cleaning up routes")
 				a.cleanup()
@@ -201,6 +216,12 @@ func (a *Agent) reconcile() {
 			if err := a.ovn.EnsureGatewayRouting(a.ovn.ctx, state.LocalRouters, bridgeMAC); err != nil {
 				slog.Error("failed to ensure gateway routing", "error", err)
 			}
+		}
+
+		// Ensure the active chassis has a strictly higher priority than
+		// standby peers, preventing reverse failover after drain/restore.
+		if err := a.ovn.EnsureActivePriorityLead(a.ovn.ctx, state.LocalRouters, state.LocalChassisName); err != nil {
+			slog.Error("failed to ensure active priority lead", "error", err)
 		}
 
 		// Reconcile per-network veth leak routes and policy rules.

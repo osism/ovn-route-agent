@@ -44,6 +44,8 @@ func main() {
 		"version", version,
 		"dry_run", cfg.DryRun,
 		"cleanup_on_shutdown", cfg.CleanupOnShutdown,
+		"drain_on_shutdown", cfg.DrainOnShutdown,
+		"drain_timeout", cfg.DrainTimeout,
 		"ovn_sb_remote", cfg.OVNSBRemote,
 		"ovn_nb_remote", cfg.OVNNBRemote,
 		"bridge_dev", cfg.BridgeDev,

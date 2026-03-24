@@ -113,6 +113,15 @@ type NBStaticMACBinding struct {
 	MAC         string `ovsdb:"mac"`
 }
 
+type NBGatewayChassis struct {
+	UUID        string            `ovsdb:"_uuid"`
+	ChassisName string            `ovsdb:"chassis_name"`
+	Name        string            `ovsdb:"name"`
+	Priority    int               `ovsdb:"priority"`
+	ExternalIDs map[string]string `ovsdb:"external_ids"`
+	Options     map[string]string `ovsdb:"options"`
+}
+
 // =============================================================================
 // OVN Client wrapper
 // =============================================================================
@@ -276,6 +285,7 @@ func (o *OVNClient) Connect(ctx context.Context) error {
 		client.WithTable(&NBLogicalRouterPort{}),
 		client.WithTable(&NBLogicalRouterStaticRoute{}),
 		client.WithTable(&NBStaticMACBinding{}),
+		client.WithTable(&NBGatewayChassis{}),
 	)
 	if _, err := o.nbClient.Monitor(ctx, nbMon); err != nil {
 		return fmt.Errorf("monitor NB: %w", err)
@@ -715,6 +725,7 @@ func nbDatabaseModel() (model.ClientDBModel, error) {
 		"Logical_Router_Port":          &NBLogicalRouterPort{},
 		"Logical_Router_Static_Route":  &NBLogicalRouterStaticRoute{},
 		"Static_MAC_Binding":           &NBStaticMACBinding{},
+		"Gateway_Chassis":              &NBGatewayChassis{},
 	})
 }
 

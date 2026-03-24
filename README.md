@@ -24,7 +24,8 @@ The agent monitors the OVN Southbound and Northbound databases and performs targ
 5. **Port forwarding (DNAT)** — optionally forwards traffic from anycast VIP addresses (on a loopback interface in the VRF) to internal backends. Client IPs are preserved using connmark-based return routing through the veth pair. A `forward_veth_guard` nftables chain restricts the veth return path to legitimate traffic only. Requires `nft` binary and `veth_leak_enabled: true`.
 6. **Reconciles** periodically as a safety net (default: every 60s)
 7. **Detects stale chassis** — when a node dies without graceful shutdown, surviving agents detect its chassis disappearing from the SB Chassis table and clean up its managed OVN NB entries (static routes and MAC bindings) after a configurable grace period (default: 5m, configurable via `stale_chassis_grace_period`, set to `0` to disable). Random jitter (0-30s) prevents multiple agents from cleaning up simultaneously.
-8. **Cleans up** on shutdown (SIGINT/SIGTERM) — removes all managed routes, OVS flows, and the bridge IP before exiting (configurable via `cleanup_on_shutdown`)
+8. **Drains gateways** on shutdown (SIGINT/SIGTERM) — before cleanup, the agent lowers its `Gateway_Chassis` priority to 0 in OVN NB, causing `ovn-northd` to migrate chassisredirect ports to standby chassis (priority >= 1). On the next startup, drained entries are restored to priority 1 (standby level). The active chassis automatically maintains a minimum priority of 2 (above all possible standby peers) during reconciliation, preventing reverse failover even when a peer restores to priority 1. This eliminates the traffic disruption window between BGP route withdrawal and OVN BFD failover detection (see [Gateway drain mode](#gateway-drain-mode)). Enabled by default (`drain_on_shutdown: true`, `drain_timeout: 60s`).
+9. **Cleans up** after drain — removes all managed routes, OVS flows, and the bridge IP before exiting (configurable via `cleanup_on_shutdown`)
 
 ## Building
 
@@ -107,6 +108,8 @@ CLI flags take precedence over values in the config file.
 | `--log-level` | `OVN_ROUTE_LOG_LEVEL` | `log_level` | `info` | Log level (debug, info, warn, error) |
 | `--dry-run` | `OVN_ROUTE_DRY_RUN` | `dry_run` | `false` | Connect and reconcile but only log what would be done |
 | `--cleanup-on-shutdown` | `OVN_ROUTE_CLEANUP_ON_SHUTDOWN` | `cleanup_on_shutdown` | `true` | Remove all managed routes on shutdown; set to `false` to keep routes in place |
+| `--drain-on-shutdown` | `OVN_ROUTE_DRAIN_ON_SHUTDOWN` | `drain_on_shutdown` | `true` | Drain HA gateways before shutdown by lowering `Gateway_Chassis` priority to 0 (see [Gateway drain mode](#gateway-drain-mode)) |
+| `--drain-timeout` | `OVN_ROUTE_DRAIN_TIMEOUT` | `drain_timeout` | `60s` | Maximum time to wait for gateway drain before proceeding with shutdown |
 | `--frr-prefix-list` | `OVN_ROUTE_FRR_PREFIX_LIST` | `frr_prefix_list` | `ANNOUNCED-NETWORKS` | FRR prefix-list name to manage dynamically; adds `permit <network> ge 32 le 32` entries for each discovered provider network (set to empty string to disable) |
 | `--stale-chassis-grace-period` | `OVN_ROUTE_STALE_CHASSIS_GRACE_PERIOD` | `stale_chassis_grace_period` | `5m` | Grace period before cleaning up OVN NB entries from chassis that have disappeared from the SB Chassis table; set to `0` to disable |
 | `--veth-leak-enabled` | `OVN_ROUTE_VETH_LEAK_ENABLED` | `veth_leak_enabled` | `true` | Enable automatic veth VRF route leaking |
@@ -500,6 +503,144 @@ port_forwards:
         port: 443
         dest_addr: "10.0.0.100"  # dest_port omitted → same as port (443)
 ```
+
+## Gateway drain mode
+
+### Background: the problem
+
+When the agent shuts down (e.g. for a rolling upgrade or node maintenance), two things happen nearly simultaneously:
+
+1. **BGP withdrawal** — FRR withdraws the `/32` routes for all FIPs on this node, so the external fabric stops sending traffic here within seconds.
+2. **OVN BFD failover** — OVN detects that the gateway chassis is gone and migrates chassisredirect ports to standby chassis. This relies on BFD timeouts (typically 3×1s = 3 seconds) or periodic probing.
+
+The problem is the **gap between these two events**. During the window where BGP has already withdrawn routes but OVN has not yet completed failover, traffic that was already in flight (or cached by upstream routers) arrives at the node and gets blackholed — OVN still considers this chassis active, but the routes are gone. This causes a brief but measurable traffic disruption on every shutdown.
+
+### Solution: pre-shutdown priority drain
+
+The agent solves this by **draining gateways before cleanup**. On SIGINT/SIGTERM, before removing any routes or closing OVN connections, the agent:
+
+1. **Lowers its `Gateway_Chassis` priority to 0** in the OVN Northbound database for all locally-active router ports. Since standby chassis have priority >= 1, `ovn-northd` immediately begins migrating chassisredirect ports to standby chassis.
+2. **Polls the SB `Port_Binding` table** until all chassisredirect ports have moved away from this chassis (or the drain timeout expires).
+3. **Proceeds with normal cleanup** — by this point OVN has already migrated traffic to another chassis, so the BGP withdrawal and route cleanup cause zero disruption.
+
+On the **next startup**, before the first reconciliation, the agent detects drained entries (priority 0 on the local chassis) and **restores them to priority 1** (standby level). This re-adds the chassis to the HA group as a standby. The active chassis maintains a minimum priority of 2 via an automatic **priority lead boost** during reconciliation (see [Priority semantics](#priority-semantics)), which is strictly above the restore level of 1 — preventing reverse failover without requiring a priority tie to trigger the boost.
+
+This inverts the shutdown order: OVN failover happens **first** (triggered by the priority change), and BGP withdrawal happens **after** traffic has already moved. The result is a hitless shutdown.
+
+### Shutdown sequence
+
+```
+  SIGINT / SIGTERM received
+          │
+          ▼
+  ┌───────────────────────────────────────────────────────┐
+  │  1. DRAIN (if drain_on_shutdown=true)                 │
+  │                                                       │
+  │  For each Gateway_Chassis on this node (priority > 0):│
+  │  ├─ Set priority to 0 in OVN NB                       │
+  │  │  (batched in a single OVSDB transaction)           │
+  │  │                                                    │
+  │  ovn-northd recalculates chassisredirect bindings     │
+  │  ├─ Standby chassis (priority >= 1) become active     │
+  │  ├─ Traffic migrates to standby nodes                 │
+  │  │                                                    │
+  │  Poll SB Port_Binding until no chassisredirect        │
+  │  ports remain on this chassis (or timeout expires)    │
+  └───────────────────────┬───────────────────────────────┘
+                          │
+                          ▼
+  ┌───────────────────────────────────────────────────────┐
+  │  2. CLEANUP (if cleanup_on_shutdown=true)             │
+  │                                                       │
+  │  Remove kernel routes, FRR routes, OVS flows,         │
+  │  bridge IP, nftables rules                            │
+  │  (traffic already moved — no disruption)              │
+  └───────────────────────┬───────────────────────────────┘
+                          │
+                          ▼
+                    Agent exits
+```
+
+```
+  Agent startup
+          │
+          ▼
+  ┌───────────────────────────────────────────────────────┐
+  │  RESTORE (if drain_on_shutdown=true)                  │
+  │                                                       │
+  │  For each Gateway_Chassis on this node with           │
+  │  priority == 0:                                       │
+  │  ├─ Set priority to 1 (standby level)                 │
+  │  │  (batched in a single OVSDB transaction)           │
+  │  │                                                    │
+  │  Chassis rejoins HA group as standby                   │
+  └───────────────────────┬───────────────────────────────┘
+                          │
+                          ▼
+  ┌───────────────────────────────────────────────────────┐
+  │  RECONCILE (includes priority lead boost)             │
+  │                                                       │
+  │  If this chassis is the active gateway:               │
+  │  ├─ Compare local priority with peers in HA group     │
+  │  ├─ If local priority <= max peer priority             │
+  │  │  OR local priority < 2 (minimum active priority):  │
+  │  │  boost to max(max peer + 1, 2)                     │
+  │  │                                                    │
+  │  This ensures the active chassis always has            │
+  │  priority >= 2, strictly above the restore level (1), │
+  │  preventing reverse failover even when all peers      │
+  │  are drained.                                         │
+  └───────────────────────┬───────────────────────────────┘
+                          │
+                          ▼
+                 Normal reconciliation loop
+```
+
+### Priority semantics
+
+The agent lowers the priority to **0** rather than 1 because in typical Neutron L3 HA setups, standby chassis already have priority 1. Lowering to the same value would not trigger migration. Priority 0 is below any standby chassis, guaranteeing that `ovn-northd` redistributes the chassisredirect port.
+
+On the next startup, drained entries (priority 0) are restored to **1** (standby level), not to their original priority. This is intentional: restoring the original priority would risk making this chassis the highest-priority gateway again, triggering a reverse failover.
+
+To prevent reverse failover, the agent implements an **active priority lead boost**: during each reconciliation, the active gateway chassis ensures its `Gateway_Chassis` priority is both strictly higher than all peers and at least **2** (the minimum active priority). The minimum of 2 is critical because without it, an active chassis at priority 1 with a drained peer at priority 0 would see "already has the lead" and skip boosting — then when the peer restores to 1, both are at the same priority and OVN's tiebreaker can pick either one, causing an unintended switchback. The boost target is `max(max peer priority + 1, 2)`. This ensures:
+
+- After a failover, the new active chassis immediately establishes priority dominance (>= 2) even while the old chassis is still drained at 0
+- When the old chassis restarts and restores to priority 1, the active chassis is already at 2 — no tie, no switchback
+- The boost is idempotent: once the lead is established, subsequent reconciliations are no-ops
+
+### Configuration
+
+Drain mode is **enabled by default** with a 60-second timeout:
+
+```yaml
+# Enable/disable drain (default: true)
+drain_on_shutdown: true
+
+# Maximum time to wait for migration (default: 60s)
+# After this timeout, the agent proceeds with shutdown even if some
+# gateways have not yet migrated.
+drain_timeout: "60s"
+```
+
+Or via CLI flags:
+
+```bash
+ovn-route-agent --drain-on-shutdown=false                 # disable drain
+ovn-route-agent --drain-timeout 120s                      # increase timeout
+```
+
+Or via environment variables:
+
+```bash
+OVN_ROUTE_DRAIN_ON_SHUTDOWN=false                         # disable drain
+OVN_ROUTE_DRAIN_TIMEOUT=120s                              # increase timeout
+```
+
+### When to disable drain
+
+- **Single-chassis deployments** — if there is no standby chassis, lowering the priority has no effect and the timeout just delays shutdown.
+- **Non-HA routers** — routers without multiple `Gateway_Chassis` entries cannot fail over; drain is a no-op (the agent detects this and skips immediately).
+- **Environments where Neutron manages priorities** — if an external system actively manages `Gateway_Chassis` priorities and would conflict with the agent's changes.
 
 ## Architecture
 
