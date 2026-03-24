@@ -1,15 +1,35 @@
 [Unit]
 Description=OVN Route Agent — Real-time Floating IP route synchronization via OVN
 Documentation=https://github.com/osism/ovn-route-agent
-After=network-online.target ovn-controller.service frr.service
-Wants=network-online.target
+
+# Hard dependencies — agent cannot function without these
 Requires=frr.service
+After=frr.service
+
+# Soft dependencies — agent needs these but they may be provided by
+# different unit names (e.g. native packages vs Kolla containers).
+# Using Wants= so the agent can still be enabled on systems where
+# these unit names don't exist.
+Wants=network-online.target
+Wants=kolla-openvswitch_vswitchd-container.service
+Wants=kolla-ovn_controller-container.service
+
+# After= ensures correct ordering for both start AND stop:
+#  - Start: agent starts after these services are up
+#  - Stop: agent stops before these services go down (drain completes first)
+After=network-online.target
+After=kolla-openvswitch_vswitchd-container.service
+After=kolla-ovn_controller-container.service
 
 [Service]
 Type=simple
 ExecStart=/usr/local/bin/ovn-route-agent --config /etc/ovn-route-agent/config.yaml
 Restart=always
 RestartSec=5
+
+# Allow enough time for drain (default 30s) + cleanup before SIGKILL.
+# Must be longer than the configured drain timeout.
+TimeoutStopSec=60
 
 # Environment overrides (optional, takes precedence over config file)
 EnvironmentFile=-/etc/default/ovn-route-agent
