@@ -1,4 +1,4 @@
-module github.com/osism/ovn-route-agent
+module github.com/osism/ovn-network-agent
 
 go 1.25.0
 

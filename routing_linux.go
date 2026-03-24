@@ -12,10 +12,10 @@ import (
 	"github.com/vishvananda/netlink"
 )
 
-// rtProtoOVNRouteAgent is a custom route protocol number used to tag kernel
+// rtProtoOVNNetworkAgent is a custom route protocol number used to tag kernel
 // routes created by ReconcileVethLeakNetworks. This distinguishes them from
 // routes installed by FRR/zebra (which use RTPROT_ZEBRA or RTPROT_STATIC).
-const rtProtoOVNRouteAgent = 44
+const rtProtoOVNNetworkAgent = 44
 
 // CheckBridgeDevice verifies that the bridge device exists and that the agent
 // has sufficient privileges (root or CAP_NET_ADMIN) for route management.
@@ -593,13 +593,13 @@ func (rm *RouteManager) ReconcileVethLeakNetworks(desired []*net.IPNet) error {
 	}
 
 	// Discover current per-network VRF routes via veth-provider.
-	// We filter by our custom protocol (rtProtoOVNRouteAgent) to only find
+	// We filter by our custom protocol (rtProtoOVNNetworkAgent) to only find
 	// routes we created, ignoring routes installed by FRR (which use
 	// RTPROT_ZEBRA or RTPROT_STATIC) that share the same interface and gateway.
 	filter := &netlink.Route{
 		LinkIndex: vethProvider.Attrs().Index,
 		Table:     vrfTableID,
-		Protocol:  rtProtoOVNRouteAgent,
+		Protocol:  rtProtoOVNNetworkAgent,
 	}
 	currentRoutes, err := netlink.RouteListFiltered(netlink.FAMILY_V4, filter, netlink.RT_FILTER_OIF|netlink.RT_FILTER_TABLE|netlink.RT_FILTER_PROTOCOL)
 	if err != nil {
@@ -613,7 +613,7 @@ func (rm *RouteManager) ReconcileVethLeakNetworks(desired []*net.IPNet) error {
 		// all kernel versions. Without this check, FRR-installed /32
 		// routes (RTPROT_ZEBRA) sharing the same interface and gateway
 		// could leak into currentNets and be treated as stale.
-		if r.Dst != nil && r.Gw != nil && r.Gw.Equal(nexthopIP) && r.Protocol == rtProtoOVNRouteAgent {
+		if r.Dst != nil && r.Gw != nil && r.Gw.Equal(nexthopIP) && r.Protocol == rtProtoOVNNetworkAgent {
 			currentNets[r.Dst.String()] = true
 		}
 	}
@@ -633,7 +633,7 @@ func (rm *RouteManager) ReconcileVethLeakNetworks(desired []*net.IPNet) error {
 			Dst:       network,
 			Gw:        nexthopIP,
 			Table:     vrfTableID,
-			Protocol:  rtProtoOVNRouteAgent,
+			Protocol:  rtProtoOVNNetworkAgent,
 		}); err != nil {
 			return fmt.Errorf("add VRF route for %s: %w", network, err)
 		}
@@ -664,7 +664,7 @@ func (rm *RouteManager) ReconcileVethLeakNetworks(desired []*net.IPNet) error {
 			Dst:       staleNet,
 			Gw:        nexthopIP,
 			Table:     vrfTableID,
-			Protocol:  rtProtoOVNRouteAgent,
+			Protocol:  rtProtoOVNNetworkAgent,
 		}); err != nil {
 			if !isNoSuchRoute(err) {
 				slog.Warn("failed to remove stale VRF route", "network", key, "error", err)

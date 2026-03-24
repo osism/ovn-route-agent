@@ -18,7 +18,7 @@ func main() {
 	cfg, err := loadConfig(os.Args[1:])
 	if err != nil {
 		if errors.Is(err, errVersionRequested) {
-			fmt.Println("ovn-route-agent", version)
+			fmt.Println("ovn-network-agent", version)
 			os.Exit(0)
 		}
 		if errors.Is(err, flag.ErrHelp) {
@@ -31,7 +31,7 @@ func main() {
 	setupLogging(cfg.LogLevel)
 
 	if cfg.OVNSBRemote == "" || cfg.OVNNBRemote == "" {
-		slog.Error("OVN database remotes are required, set --ovn-sb-remote / --ovn-nb-remote, OVN_ROUTE_OVN_SB_REMOTE / OVN_ROUTE_OVN_NB_REMOTE, or use a config file (--config)")
+		slog.Error("OVN database remotes are required, set --ovn-sb-remote / --ovn-nb-remote, OVN_NETWORK_OVN_SB_REMOTE / OVN_NETWORK_OVN_NB_REMOTE, or use a config file (--config)")
 		os.Exit(1)
 	}
 
@@ -40,7 +40,7 @@ func main() {
 		networkMode = "manual"
 	}
 
-	slog.Info("ovn-route-agent starting",
+	slog.Info("ovn-network-agent starting",
 		"version", version,
 		"dry_run", cfg.DryRun,
 		"cleanup_on_shutdown", cfg.CleanupOnShutdown,
@@ -90,7 +90,7 @@ func main() {
 		os.Exit(1)
 	}
 
-	slog.Info("ovn-route-agent stopped")
+	slog.Info("ovn-network-agent stopped")
 }
 
 func setupLogging(level string) {

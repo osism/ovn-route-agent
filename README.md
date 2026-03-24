@@ -1,4 +1,4 @@
-# ovn-route-agent
+# ovn-network-agent
 
 Event-driven network agent for OVN-based OpenStack environments. A real-time daemon that watches OVN databases directly via the OVSDB protocol to synchronize Floating IP routes and optionally forward traffic from anycast VIPs to internal backends.
 
@@ -49,7 +49,7 @@ make vet
 sudo make install
 ```
 
-Produces a single binary `ovn-route-agent`.
+Produces a single binary `ovn-network-agent`.
 
 ## Configuration
 
@@ -60,16 +60,16 @@ Settings are loaded with the following priority (highest wins):
 ### Config file (YAML)
 
 ```bash
-ovn-route-agent --config /etc/ovn-route-agent/config.yaml
+ovn-network-agent --config /etc/ovn-network-agent/config.yaml
 # or via environment variable
-OVN_ROUTE_CONFIG=/etc/ovn-route-agent/config.yaml ovn-route-agent
+OVN_NETWORK_CONFIG=/etc/ovn-network-agent/config.yaml ovn-network-agent
 ```
 
-See [`ovn-route-agent.yaml.sample`](ovn-route-agent.yaml.sample) for a full example.
+See [`ovn-network-agent.yaml.sample`](ovn-network-agent.yaml.sample) for a full example.
 
 ### Example
 
-Config file `/etc/ovn-route-agent/config.yaml` with the base settings:
+Config file `/etc/ovn-network-agent/config.yaml` with the base settings:
 
 ```yaml
 ovn_sb_remote: "tcp:10.10.0.1:6642,tcp:10.10.0.2:6642,tcp:10.10.0.3:6642"
@@ -84,7 +84,7 @@ ovn_nb_remote: "tcp:10.10.0.1:6641,tcp:10.10.0.2:6641,tcp:10.10.0.3:6641"
 Run with the config file, overriding log level and enabling dry-run via CLI flags:
 
 ```bash
-ovn-route-agent --config /etc/ovn-route-agent/config.yaml --log-level debug --dry-run
+ovn-network-agent --config /etc/ovn-network-agent/config.yaml --log-level debug --dry-run
 ```
 
 CLI flags take precedence over values in the config file.
@@ -93,105 +93,105 @@ CLI flags take precedence over values in the config file.
 
 | Flag | Env Var | Config key | Default | Description |
 |------|---------|------------|---------|-------------|
-| `--config` | `OVN_ROUTE_CONFIG` | — | | Path to YAML config file |
-| `--ovn-sb-remote` | `OVN_ROUTE_OVN_SB_REMOTE` | `ovn_sb_remote` | *(required)* | OVN Southbound DB remote, comma-separated for cluster failover |
-| `--ovn-nb-remote` | `OVN_ROUTE_OVN_NB_REMOTE` | `ovn_nb_remote` | *(required)* | OVN Northbound DB remote, comma-separated for cluster failover |
-| `--bridge-dev` | `OVN_ROUTE_BRIDGE_DEV` | `bridge_dev` | `br-ex` | Provider bridge device |
-| `--vrf-name` | `OVN_ROUTE_VRF_NAME` | `vrf_name` | `vrf-provider` | VRF name for FRR routes |
-| `--veth-nexthop` | `OVN_ROUTE_VETH_NEXTHOP` | `veth_nexthop` | `169.254.0.1` | Nexthop for FRR static routes |
-| `--network-cidr` | `OVN_ROUTE_NETWORK_CIDR` | `network_cidr` | *(empty = auto-discover)* | Filter FIPs by CIDRs; when empty, networks are auto-discovered from OVN `Logical_Router_Port.Networks` |
-| `--gateway-port` | `OVN_ROUTE_GATEWAY_PORT` | `gateway_port` | *(empty = all)* | Chassisredirect port filter; empty = track all routers automatically |
-| `--route-table-id` | `OVN_ROUTE_ROUTE_TABLE_ID` | `route_table_id` | `0` | Routing table ID for FIP routes (1-252); 0 = main table |
-| `--bridge-ip` | `OVN_ROUTE_BRIDGE_IP` | `bridge_ip` | `169.254.169.254` | Link-local IP added to the bridge device for ARP resolution |
-| `--ovs-wrapper` | `OVN_ROUTE_OVS_WRAPPER` | `ovs_wrapper` | *(empty)* | Command prefix for containerized OVS (e.g. `docker exec openvswitch_vswitchd`) |
-| `--reconcile-interval` | `OVN_ROUTE_RECONCILE_INTERVAL` | `reconcile_interval` | `60s` | Full reconciliation interval |
-| `--log-level` | `OVN_ROUTE_LOG_LEVEL` | `log_level` | `info` | Log level (debug, info, warn, error) |
-| `--dry-run` | `OVN_ROUTE_DRY_RUN` | `dry_run` | `false` | Connect and reconcile but only log what would be done |
-| `--cleanup-on-shutdown` | `OVN_ROUTE_CLEANUP_ON_SHUTDOWN` | `cleanup_on_shutdown` | `true` | Remove all managed routes on shutdown; set to `false` to keep routes in place |
-| `--drain-on-shutdown` | `OVN_ROUTE_DRAIN_ON_SHUTDOWN` | `drain_on_shutdown` | `true` | Drain HA gateways before shutdown by lowering `Gateway_Chassis` priority to 0 (see [Gateway drain mode](#gateway-drain-mode)) |
-| `--drain-timeout` | `OVN_ROUTE_DRAIN_TIMEOUT` | `drain_timeout` | `60s` | Maximum time to wait for gateway drain before proceeding with shutdown |
-| `--frr-prefix-list` | `OVN_ROUTE_FRR_PREFIX_LIST` | `frr_prefix_list` | `ANNOUNCED-NETWORKS` | FRR prefix-list name to manage dynamically; adds `permit <network> ge 32 le 32` entries for each discovered provider network (set to empty string to disable) |
-| `--stale-chassis-grace-period` | `OVN_ROUTE_STALE_CHASSIS_GRACE_PERIOD` | `stale_chassis_grace_period` | `5m` | Grace period before cleaning up OVN NB entries from chassis that have disappeared from the SB Chassis table; set to `0` to disable |
-| `--veth-leak-enabled` | `OVN_ROUTE_VETH_LEAK_ENABLED` | `veth_leak_enabled` | `true` | Enable automatic veth VRF route leaking |
-| `--veth-provider-ip` | `OVN_ROUTE_VETH_PROVIDER_IP` | `veth_provider_ip` | *(nexthop+1)* | IP of the veth-provider side (auto-computed from `veth_nexthop` + 1) |
-| `--veth-leak-table-id` | `OVN_ROUTE_VETH_LEAK_TABLE_ID` | `veth_leak_table_id` | `200` | Routing table for the leak default route (1-252, must differ from `route_table_id`) |
-| `--veth-leak-rule-priority` | `OVN_ROUTE_VETH_LEAK_RULE_PRIORITY` | `veth_leak_rule_priority` | `2000` | Policy rule priority for veth leak rules |
-| `--port-forward-dev` | `OVN_ROUTE_PORT_FORWARD_DEV` | `port_forward_dev` | `loopback1` | Loopback device for VIP addresses in VRF |
-| `--port-forward-table-id` | `OVN_ROUTE_PORT_FORWARD_TABLE_ID` | `port_forward_table_id` | `201` | Routing table for DNAT return traffic (1-252, must differ from `route_table_id` and `veth_leak_table_id`) |
-| — | — | `port_forwards` | *(empty)* | List of VIPs with DNAT rules (YAML only, see [sample config](ovn-route-agent.yaml.sample)) |
+| `--config` | `OVN_NETWORK_CONFIG` | — | | Path to YAML config file |
+| `--ovn-sb-remote` | `OVN_NETWORK_OVN_SB_REMOTE` | `ovn_sb_remote` | *(required)* | OVN Southbound DB remote, comma-separated for cluster failover |
+| `--ovn-nb-remote` | `OVN_NETWORK_OVN_NB_REMOTE` | `ovn_nb_remote` | *(required)* | OVN Northbound DB remote, comma-separated for cluster failover |
+| `--bridge-dev` | `OVN_NETWORK_BRIDGE_DEV` | `bridge_dev` | `br-ex` | Provider bridge device |
+| `--vrf-name` | `OVN_NETWORK_VRF_NAME` | `vrf_name` | `vrf-provider` | VRF name for FRR routes |
+| `--veth-nexthop` | `OVN_NETWORK_VETH_NEXTHOP` | `veth_nexthop` | `169.254.0.1` | Nexthop for FRR static routes |
+| `--network-cidr` | `OVN_NETWORK_NETWORK_CIDR` | `network_cidr` | *(empty = auto-discover)* | Filter FIPs by CIDRs; when empty, networks are auto-discovered from OVN `Logical_Router_Port.Networks` |
+| `--gateway-port` | `OVN_NETWORK_GATEWAY_PORT` | `gateway_port` | *(empty = all)* | Chassisredirect port filter; empty = track all routers automatically |
+| `--route-table-id` | `OVN_NETWORK_ROUTE_TABLE_ID` | `route_table_id` | `0` | Routing table ID for FIP routes (1-252); 0 = main table |
+| `--bridge-ip` | `OVN_NETWORK_BRIDGE_IP` | `bridge_ip` | `169.254.169.254` | Link-local IP added to the bridge device for ARP resolution |
+| `--ovs-wrapper` | `OVN_NETWORK_OVS_WRAPPER` | `ovs_wrapper` | *(empty)* | Command prefix for containerized OVS (e.g. `docker exec openvswitch_vswitchd`) |
+| `--reconcile-interval` | `OVN_NETWORK_RECONCILE_INTERVAL` | `reconcile_interval` | `60s` | Full reconciliation interval |
+| `--log-level` | `OVN_NETWORK_LOG_LEVEL` | `log_level` | `info` | Log level (debug, info, warn, error) |
+| `--dry-run` | `OVN_NETWORK_DRY_RUN` | `dry_run` | `false` | Connect and reconcile but only log what would be done |
+| `--cleanup-on-shutdown` | `OVN_NETWORK_CLEANUP_ON_SHUTDOWN` | `cleanup_on_shutdown` | `true` | Remove all managed routes on shutdown; set to `false` to keep routes in place |
+| `--drain-on-shutdown` | `OVN_NETWORK_DRAIN_ON_SHUTDOWN` | `drain_on_shutdown` | `true` | Drain HA gateways before shutdown by lowering `Gateway_Chassis` priority to 0 (see [Gateway drain mode](#gateway-drain-mode)) |
+| `--drain-timeout` | `OVN_NETWORK_DRAIN_TIMEOUT` | `drain_timeout` | `60s` | Maximum time to wait for gateway drain before proceeding with shutdown |
+| `--frr-prefix-list` | `OVN_NETWORK_FRR_PREFIX_LIST` | `frr_prefix_list` | `ANNOUNCED-NETWORKS` | FRR prefix-list name to manage dynamically; adds `permit <network> ge 32 le 32` entries for each discovered provider network (set to empty string to disable) |
+| `--stale-chassis-grace-period` | `OVN_NETWORK_STALE_CHASSIS_GRACE_PERIOD` | `stale_chassis_grace_period` | `5m` | Grace period before cleaning up OVN NB entries from chassis that have disappeared from the SB Chassis table; set to `0` to disable |
+| `--veth-leak-enabled` | `OVN_NETWORK_VETH_LEAK_ENABLED` | `veth_leak_enabled` | `true` | Enable automatic veth VRF route leaking |
+| `--veth-provider-ip` | `OVN_NETWORK_VETH_PROVIDER_IP` | `veth_provider_ip` | *(nexthop+1)* | IP of the veth-provider side (auto-computed from `veth_nexthop` + 1) |
+| `--veth-leak-table-id` | `OVN_NETWORK_VETH_LEAK_TABLE_ID` | `veth_leak_table_id` | `200` | Routing table for the leak default route (1-252, must differ from `route_table_id`) |
+| `--veth-leak-rule-priority` | `OVN_NETWORK_VETH_LEAK_RULE_PRIORITY` | `veth_leak_rule_priority` | `2000` | Policy rule priority for veth leak rules |
+| `--port-forward-dev` | `OVN_NETWORK_PORT_FORWARD_DEV` | `port_forward_dev` | `loopback1` | Loopback device for VIP addresses in VRF |
+| `--port-forward-table-id` | `OVN_NETWORK_PORT_FORWARD_TABLE_ID` | `port_forward_table_id` | `201` | Routing table for DNAT return traffic (1-252, must differ from `route_table_id` and `veth_leak_table_id`) |
+| — | — | `port_forwards` | *(empty)* | List of VIPs with DNAT rules (YAML only, see [sample config](ovn-network-agent.yaml.sample)) |
 | `--version` | — | — | — | Print version and exit |
 
 ## Installation
 
-Pre-built binaries and Debian packages for `amd64` and `arm64` are available on the [GitHub Releases](https://github.com/osism/ovn-route-agent/releases) page.
+Pre-built binaries and Debian packages for `amd64` and `arm64` are available on the [GitHub Releases](https://github.com/osism/ovn-network-agent/releases) page.
 
 ### Debian package
 
 ```bash
 # Download the .deb package (replace VERSION and ARCH as needed)
-curl -LO https://github.com/osism/ovn-route-agent/releases/download/vVERSION/ovn-route-agent_VERSION_ARCH.deb
+curl -LO https://github.com/osism/ovn-network-agent/releases/download/vVERSION/ovn-network-agent_VERSION_ARCH.deb
 
 # Example: v0.1.0, amd64
-curl -LO https://github.com/osism/ovn-route-agent/releases/download/v0.1.0/ovn-route-agent_0.1.0_amd64.deb
+curl -LO https://github.com/osism/ovn-network-agent/releases/download/v0.1.0/ovn-network-agent_0.1.0_amd64.deb
 
 # Install
-sudo dpkg -i ovn-route-agent_0.1.0_amd64.deb
+sudo dpkg -i ovn-network-agent_0.1.0_amd64.deb
 ```
 
 The package installs:
 
-- `/usr/bin/ovn-route-agent` — the binary
-- `/lib/systemd/system/ovn-route-agent.service` — systemd service
-- `/etc/default/ovn-route-agent` — environment defaults (preserved on upgrade)
-- `/etc/ovn-route-agent/config.yaml.sample` — sample configuration
+- `/usr/bin/ovn-network-agent` — the binary
+- `/lib/systemd/system/ovn-network-agent.service` — systemd service
+- `/etc/default/ovn-network-agent` — environment defaults (preserved on upgrade)
+- `/etc/ovn-network-agent/config.yaml.sample` — sample configuration
 
 After installation, create your configuration and start the service:
 
 ```bash
-sudo cp /etc/ovn-route-agent/config.yaml.sample /etc/ovn-route-agent/config.yaml
-sudo vi /etc/ovn-route-agent/config.yaml
-sudo systemctl enable --now ovn-route-agent
+sudo cp /etc/ovn-network-agent/config.yaml.sample /etc/ovn-network-agent/config.yaml
+sudo vi /etc/ovn-network-agent/config.yaml
+sudo systemctl enable --now ovn-network-agent
 ```
 
 ### Binary
 
 ```bash
 # Download the static binary (replace ARCH as needed: amd64 or arm64)
-curl -LO https://github.com/osism/ovn-route-agent/releases/download/vVERSION/ovn-route-agent-linux-ARCH
+curl -LO https://github.com/osism/ovn-network-agent/releases/download/vVERSION/ovn-network-agent-linux-ARCH
 
 # Example: v0.1.0, amd64
-curl -LO https://github.com/osism/ovn-route-agent/releases/download/v0.1.0/ovn-route-agent-linux-amd64
+curl -LO https://github.com/osism/ovn-network-agent/releases/download/v0.1.0/ovn-network-agent-linux-amd64
 
 # Install
-sudo install -m 0755 ovn-route-agent-linux-amd64 /usr/local/bin/ovn-route-agent
+sudo install -m 0755 ovn-network-agent-linux-amd64 /usr/local/bin/ovn-network-agent
 ```
 
 Set up the systemd service and configuration manually:
 
 ```bash
-sudo cp ovn-route-agent.service /etc/systemd/system/
-sudo cp ovn-route-agent.default /etc/default/ovn-route-agent
+sudo cp ovn-network-agent.service /etc/systemd/system/
+sudo cp ovn-network-agent.default /etc/default/ovn-network-agent
 
-sudo mkdir -p /etc/ovn-route-agent
-sudo cp ovn-route-agent.yaml.sample /etc/ovn-route-agent/config.yaml
-sudo vi /etc/ovn-route-agent/config.yaml
+sudo mkdir -p /etc/ovn-network-agent
+sudo cp ovn-network-agent.yaml.sample /etc/ovn-network-agent/config.yaml
+sudo vi /etc/ovn-network-agent/config.yaml
 
 sudo systemctl daemon-reload
-sudo systemctl enable --now ovn-route-agent
+sudo systemctl enable --now ovn-network-agent
 ```
 
 ### From source
 
 ```bash
 make build-static
-sudo install -m 0755 ovn-route-agent /usr/local/bin/ovn-route-agent
+sudo install -m 0755 ovn-network-agent /usr/local/bin/ovn-network-agent
 ```
 
 ### Check status
 
 ```bash
-sudo systemctl status ovn-route-agent
-sudo journalctl -u ovn-route-agent -f
+sudo systemctl status ovn-network-agent
+sudo journalctl -u ovn-network-agent -f
 ```
 
 ## Prerequisites
@@ -247,7 +247,7 @@ For each locally-active router, the agent writes two entries into the OVN Northb
 
 Together, these two entries trick OVN into forwarding SNAT reply packets out of the logical router's external port onto `br-ex`, where the kernel and FRR take over for BGP delivery. The virtual gateway IP itself is never used as an actual destination — it only serves as the logical nexthop that makes OVN's routing pipeline work.
 
-Both entries are tagged with `ExternalIDs["ovn-route-agent"] = "managed"` so the agent can track and clean them up. Additionally, managed static routes carry `ExternalIDs["ovn-route-agent-chassis"]` set to the owning chassis hostname, enabling stale chassis cleanup by surviving agents when a node dies without graceful shutdown. If a default route already exists that was **not** created by the agent (i.e. a real gateway configured by OpenStack), the agent leaves it untouched.
+Both entries are tagged with `ExternalIDs["ovn-network-agent"] = "managed"` so the agent can track and clean them up. Additionally, managed static routes carry `ExternalIDs["ovn-network-agent-chassis"]` set to the owning chassis hostname, enabling stale chassis cleanup by surviving agents when a node dies without graceful shutdown. If a default route already exists that was **not** created by the agent (i.e. a real gateway configured by OpenStack), the agent leaves it untouched.
 
 ### Creating a gatewayless provider network
 
@@ -658,15 +658,15 @@ drain_timeout: "60s"
 Or via CLI flags:
 
 ```bash
-ovn-route-agent --drain-on-shutdown=false                 # disable drain
-ovn-route-agent --drain-timeout 120s                      # increase timeout
+ovn-network-agent --drain-on-shutdown=false                 # disable drain
+ovn-network-agent --drain-timeout 120s                      # increase timeout
 ```
 
 Or via environment variables:
 
 ```bash
-OVN_ROUTE_DRAIN_ON_SHUTDOWN=false                         # disable drain
-OVN_ROUTE_DRAIN_TIMEOUT=120s                              # increase timeout
+OVN_NETWORK_DRAIN_ON_SHUTDOWN=false                         # disable drain
+OVN_NETWORK_DRAIN_TIMEOUT=120s                              # increase timeout
 ```
 
 ### When to disable drain
@@ -691,7 +691,7 @@ The agent monitors OVN databases and writes routing state into four subsystems. 
                               │                          │          │ MAC_Binding   │
                               ▼                          ▼          └───────────────┘
                   ┌──────────────────────────────────────────────┐
-                  │                 ovn-route-agent              │
+                  │                 ovn-network-agent              │
                   │                                              │
                   │  ┌────────────┐    ┌──────────────────────┐  │
                   │  │  OVSDB IDL │    │   Event Processing   │  │
@@ -815,7 +815,7 @@ The agent creates the veth pair and assigns link-local addresses at startup (`--
 
 ## Origin
 
-This agent is based on the shell script [`ovn-route-agent.sh`](./contrib/ovn-route-agent.sh) which served as the original prototype. The built-in veth VRF leak functionality (`--veth-leak-enabled`) replaces the standalone script [`veth-vrf-leak.sh`](./contrib/veth-vrf-leak.sh).
+This agent is based on the shell script [`ovn-network-agent.sh`](./contrib/ovn-network-agent.sh) which served as the original prototype. The built-in veth VRF leak functionality (`--veth-leak-enabled`) replaces the standalone script [`veth-vrf-leak.sh`](./contrib/veth-vrf-leak.sh).
 
 ## License
 

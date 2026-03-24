@@ -24,7 +24,7 @@ func TestBuildNftRuleset(t *testing.T) {
 	result := buildNftRuleset(forwards, []*net.IPNet{provNet})
 
 	// Verify table structure
-	if !strings.Contains(result, "table ip ovn-route-agent {") {
+	if !strings.Contains(result, "table ip ovn-network-agent {") {
 		t.Error("missing table declaration")
 	}
 

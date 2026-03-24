@@ -111,7 +111,7 @@ network_cidr:
 
 func TestApplyEnvConfigMultipleCIDRs(t *testing.T) {
 	cfg := Config{}
-	t.Setenv("OVN_ROUTE_NETWORK_CIDR", "10.0.0.0/24,172.16.0.0/12")
+	t.Setenv("OVN_NETWORK_NETWORK_CIDR", "10.0.0.0/24,172.16.0.0/12")
 	applyEnvConfig(&cfg)
 
 	if len(cfg.NetworkCIDRs) != 2 {
@@ -188,11 +188,11 @@ func TestApplyEnvConfig(t *testing.T) {
 		LogLevel:  "info",
 	}
 
-	t.Setenv("OVN_ROUTE_OVN_SB_REMOTE", "tcp:10.0.0.99:6642")
-	t.Setenv("OVN_ROUTE_LOG_LEVEL", "debug")
-	t.Setenv("OVN_ROUTE_RECONCILE_INTERVAL", "5m")
-	t.Setenv("OVN_ROUTE_NETWORK_CIDR", "10.0.0.0/24")
-	t.Setenv("OVN_ROUTE_GATEWAY_PORT", "cr-lrp-test")
+	t.Setenv("OVN_NETWORK_OVN_SB_REMOTE", "tcp:10.0.0.99:6642")
+	t.Setenv("OVN_NETWORK_LOG_LEVEL", "debug")
+	t.Setenv("OVN_NETWORK_RECONCILE_INTERVAL", "5m")
+	t.Setenv("OVN_NETWORK_NETWORK_CIDR", "10.0.0.0/24")
+	t.Setenv("OVN_NETWORK_GATEWAY_PORT", "cr-lrp-test")
 
 	applyEnvConfig(&cfg)
 
@@ -222,7 +222,7 @@ func TestApplyEnvConfigInvalidDuration(t *testing.T) {
 		ReconcileInterval: 60 * time.Second,
 	}
 
-	t.Setenv("OVN_ROUTE_RECONCILE_INTERVAL", "notaduration")
+	t.Setenv("OVN_NETWORK_RECONCILE_INTERVAL", "notaduration")
 
 	applyEnvConfig(&cfg)
 
@@ -337,10 +337,10 @@ func TestLoadConfigDryRunDefault(t *testing.T) {
 
 func TestApplyEnvConfigDryRun(t *testing.T) {
 	cfg := Config{}
-	t.Setenv("OVN_ROUTE_DRY_RUN", "true")
+	t.Setenv("OVN_NETWORK_DRY_RUN", "true")
 	applyEnvConfig(&cfg)
 	if !cfg.DryRun {
-		t.Error("DryRun should be true when OVN_ROUTE_DRY_RUN=true")
+		t.Error("DryRun should be true when OVN_NETWORK_DRY_RUN=true")
 	}
 }
 
@@ -376,19 +376,19 @@ func TestLoadConfigCleanupOnShutdownDisabledViaCLI(t *testing.T) {
 
 func TestApplyEnvConfigCleanupOnShutdownFalse(t *testing.T) {
 	cfg := Config{CleanupOnShutdown: true}
-	t.Setenv("OVN_ROUTE_CLEANUP_ON_SHUTDOWN", "false")
+	t.Setenv("OVN_NETWORK_CLEANUP_ON_SHUTDOWN", "false")
 	applyEnvConfig(&cfg)
 	if cfg.CleanupOnShutdown {
-		t.Error("CleanupOnShutdown should be false when OVN_ROUTE_CLEANUP_ON_SHUTDOWN=false")
+		t.Error("CleanupOnShutdown should be false when OVN_NETWORK_CLEANUP_ON_SHUTDOWN=false")
 	}
 }
 
 func TestApplyEnvConfigCleanupOnShutdownZero(t *testing.T) {
 	cfg := Config{CleanupOnShutdown: true}
-	t.Setenv("OVN_ROUTE_CLEANUP_ON_SHUTDOWN", "0")
+	t.Setenv("OVN_NETWORK_CLEANUP_ON_SHUTDOWN", "0")
 	applyEnvConfig(&cfg)
 	if cfg.CleanupOnShutdown {
-		t.Error("CleanupOnShutdown should be false when OVN_ROUTE_CLEANUP_ON_SHUTDOWN=0")
+		t.Error("CleanupOnShutdown should be false when OVN_NETWORK_CLEANUP_ON_SHUTDOWN=0")
 	}
 }
 
@@ -585,7 +585,7 @@ func TestLoadConfigRouteTableIDInvalid(t *testing.T) {
 
 func TestApplyEnvConfigRouteTableID(t *testing.T) {
 	cfg := Config{}
-	t.Setenv("OVN_ROUTE_ROUTE_TABLE_ID", "42")
+	t.Setenv("OVN_NETWORK_ROUTE_TABLE_ID", "42")
 	applyEnvConfig(&cfg)
 
 	if cfg.RouteTableID != 42 {
@@ -714,10 +714,10 @@ func TestLoadConfigVethLeakTableIDInvalid(t *testing.T) {
 
 func TestApplyEnvConfigVethLeak(t *testing.T) {
 	cfg := Config{VethLeakEnabled: true}
-	t.Setenv("OVN_ROUTE_VETH_LEAK_ENABLED", "false")
-	t.Setenv("OVN_ROUTE_VETH_PROVIDER_IP", "169.254.0.5")
-	t.Setenv("OVN_ROUTE_VETH_LEAK_TABLE_ID", "201")
-	t.Setenv("OVN_ROUTE_VETH_LEAK_RULE_PRIORITY", "3000")
+	t.Setenv("OVN_NETWORK_VETH_LEAK_ENABLED", "false")
+	t.Setenv("OVN_NETWORK_VETH_PROVIDER_IP", "169.254.0.5")
+	t.Setenv("OVN_NETWORK_VETH_LEAK_TABLE_ID", "201")
+	t.Setenv("OVN_NETWORK_VETH_LEAK_RULE_PRIORITY", "3000")
 	applyEnvConfig(&cfg)
 
 	if cfg.VethLeakEnabled {
@@ -843,7 +843,7 @@ func TestLoadConfigStaleChassisGracePeriodDisabled(t *testing.T) {
 
 func TestApplyEnvConfigStaleChassisGracePeriod(t *testing.T) {
 	cfg := Config{StaleChassisGracePeriod: 5 * time.Minute}
-	t.Setenv("OVN_ROUTE_STALE_CHASSIS_GRACE_PERIOD", "3m")
+	t.Setenv("OVN_NETWORK_STALE_CHASSIS_GRACE_PERIOD", "3m")
 	applyEnvConfig(&cfg)
 	if cfg.StaleChassisGracePeriod != 3*time.Minute {
 		t.Errorf("StaleChassisGracePeriod = %v, want %v", cfg.StaleChassisGracePeriod, 3*time.Minute)
@@ -903,7 +903,7 @@ func TestValidateConfigStaleChassisGracePeriodNegative(t *testing.T) {
 
 func TestApplyEnvConfigFRRPrefixList(t *testing.T) {
 	cfg := Config{}
-	t.Setenv("OVN_ROUTE_FRR_PREFIX_LIST", "MY-LIST")
+	t.Setenv("OVN_NETWORK_FRR_PREFIX_LIST", "MY-LIST")
 	applyEnvConfig(&cfg)
 	if cfg.FRRPrefixList != "MY-LIST" {
 		t.Errorf("FRRPrefixList = %q, want %q", cfg.FRRPrefixList, "MY-LIST")
@@ -1140,8 +1140,8 @@ func TestApplyEnvConfigPortForward(t *testing.T) {
 		PortForwardTableID: 201,
 	}
 
-	t.Setenv("OVN_ROUTE_PORT_FORWARD_DEV", "loopback1")
-	t.Setenv("OVN_ROUTE_PORT_FORWARD_TABLE_ID", "202")
+	t.Setenv("OVN_NETWORK_PORT_FORWARD_DEV", "loopback1")
+	t.Setenv("OVN_NETWORK_PORT_FORWARD_TABLE_ID", "202")
 
 	applyEnvConfig(&cfg)
 

@@ -33,10 +33,10 @@ jobs:
           GOARCH: ${{ matrix.goarch }}
         run: |
           go build -trimpath -ldflags "-s -w -X main.version=${{ github.sha }}" \
-            -o ovn-route-agent-${{ matrix.goos }}-${{ matrix.goarch }} .
+            -o ovn-network-agent-${{ matrix.goos }}-${{ matrix.goarch }} .
 
       - uses: actions/upload-artifact@v7
         with:
-          name: ovn-route-agent-${{ matrix.goos }}-${{ matrix.goarch }}
-          path: ovn-route-agent-${{ matrix.goos }}-${{ matrix.goarch }}
+          name: ovn-network-agent-${{ matrix.goos }}-${{ matrix.goarch }}
+          path: ovn-network-agent-${{ matrix.goos }}-${{ matrix.goarch }}
           retention-days: 7

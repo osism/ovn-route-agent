@@ -171,10 +171,10 @@ type configFile struct {
 // loadConfig builds the configuration with the following priority
 // (highest wins): CLI flags > environment variables > config file > defaults.
 func loadConfig(args []string) (Config, error) {
-	fs := flag.NewFlagSet("ovn-route-agent", flag.ContinueOnError)
+	fs := flag.NewFlagSet("ovn-network-agent", flag.ContinueOnError)
 
 	var (
-		configPath  = fs.String("config", os.Getenv("OVN_ROUTE_CONFIG"), "Path to YAML config file")
+		configPath  = fs.String("config", os.Getenv("OVN_NETWORK_CONFIG"), "Path to YAML config file")
 		showVersion = fs.Bool("version", false, "Print version and exit")
 		fOVNSB      = fs.String("ovn-sb-remote", "", "OVN Southbound DB remote, comma-separated for cluster")
 		fOVNNB      = fs.String("ovn-nb-remote", "", "OVN Northbound DB remote, comma-separated for cluster")
@@ -585,95 +585,95 @@ func applyFileConfig(cfg *Config, fc *configFile) {
 }
 
 func applyEnvConfig(cfg *Config) {
-	if v := os.Getenv("OVN_ROUTE_OVN_SB_REMOTE"); v != "" {
+	if v := os.Getenv("OVN_NETWORK_OVN_SB_REMOTE"); v != "" {
 		cfg.OVNSBRemote = v
 	}
-	if v := os.Getenv("OVN_ROUTE_OVN_NB_REMOTE"); v != "" {
+	if v := os.Getenv("OVN_NETWORK_OVN_NB_REMOTE"); v != "" {
 		cfg.OVNNBRemote = v
 	}
-	if v := os.Getenv("OVN_ROUTE_BRIDGE_DEV"); v != "" {
+	if v := os.Getenv("OVN_NETWORK_BRIDGE_DEV"); v != "" {
 		cfg.BridgeDev = v
 	}
-	if v := os.Getenv("OVN_ROUTE_VRF_NAME"); v != "" {
+	if v := os.Getenv("OVN_NETWORK_VRF_NAME"); v != "" {
 		cfg.VRFName = v
 	}
-	if v := os.Getenv("OVN_ROUTE_VETH_NEXTHOP"); v != "" {
+	if v := os.Getenv("OVN_NETWORK_VETH_NEXTHOP"); v != "" {
 		cfg.VethNexthop = v
 	}
-	if v := os.Getenv("OVN_ROUTE_NETWORK_CIDR"); v != "" {
+	if v := os.Getenv("OVN_NETWORK_NETWORK_CIDR"); v != "" {
 		cfg.NetworkCIDRs = splitAndTrim(v, ",")
 	}
-	if v := os.Getenv("OVN_ROUTE_GATEWAY_PORT"); v != "" {
+	if v := os.Getenv("OVN_NETWORK_GATEWAY_PORT"); v != "" {
 		cfg.GatewayPort = v
 	}
-	if v := os.Getenv("OVN_ROUTE_BRIDGE_IP"); v != "" {
+	if v := os.Getenv("OVN_NETWORK_BRIDGE_IP"); v != "" {
 		cfg.BridgeIP = v
 	}
-	if v := os.Getenv("OVN_ROUTE_OVS_WRAPPER"); v != "" {
+	if v := os.Getenv("OVN_NETWORK_OVS_WRAPPER"); v != "" {
 		cfg.OVSWrapper = v
 	}
-	if v := os.Getenv("OVN_ROUTE_ROUTE_TABLE_ID"); v != "" {
+	if v := os.Getenv("OVN_NETWORK_ROUTE_TABLE_ID"); v != "" {
 		var id int
 		if _, err := fmt.Sscanf(v, "%d", &id); err == nil {
 			cfg.RouteTableID = id
 		}
 	}
-	if v := os.Getenv("OVN_ROUTE_RECONCILE_INTERVAL"); v != "" {
+	if v := os.Getenv("OVN_NETWORK_RECONCILE_INTERVAL"); v != "" {
 		if d, err := time.ParseDuration(v); err == nil {
 			cfg.ReconcileInterval = d
 		}
 	}
-	if v := os.Getenv("OVN_ROUTE_LOG_LEVEL"); v != "" {
+	if v := os.Getenv("OVN_NETWORK_LOG_LEVEL"); v != "" {
 		cfg.LogLevel = v
 	}
-	if v := os.Getenv("OVN_ROUTE_DRY_RUN"); v == "1" || v == "true" {
+	if v := os.Getenv("OVN_NETWORK_DRY_RUN"); v == "1" || v == "true" {
 		cfg.DryRun = true
 	}
-	if v := os.Getenv("OVN_ROUTE_CLEANUP_ON_SHUTDOWN"); v == "0" || v == "false" {
+	if v := os.Getenv("OVN_NETWORK_CLEANUP_ON_SHUTDOWN"); v == "0" || v == "false" {
 		cfg.CleanupOnShutdown = false
 	}
-	if v := os.Getenv("OVN_ROUTE_DRAIN_ON_SHUTDOWN"); v == "0" || v == "false" {
+	if v := os.Getenv("OVN_NETWORK_DRAIN_ON_SHUTDOWN"); v == "0" || v == "false" {
 		cfg.DrainOnShutdown = false
 	}
-	if v := os.Getenv("OVN_ROUTE_DRAIN_TIMEOUT"); v != "" {
+	if v := os.Getenv("OVN_NETWORK_DRAIN_TIMEOUT"); v != "" {
 		if d, err := time.ParseDuration(v); err == nil {
 			cfg.DrainTimeout = d
 		} else {
-			slog.Warn("ignoring invalid OVN_ROUTE_DRAIN_TIMEOUT env var", "value", v, "error", err)
+			slog.Warn("ignoring invalid OVN_NETWORK_DRAIN_TIMEOUT env var", "value", v, "error", err)
 		}
 	}
-	if v := os.Getenv("OVN_ROUTE_FRR_PREFIX_LIST"); v != "" {
+	if v := os.Getenv("OVN_NETWORK_FRR_PREFIX_LIST"); v != "" {
 		cfg.FRRPrefixList = v
 	}
-	if v := os.Getenv("OVN_ROUTE_STALE_CHASSIS_GRACE_PERIOD"); v != "" {
+	if v := os.Getenv("OVN_NETWORK_STALE_CHASSIS_GRACE_PERIOD"); v != "" {
 		if d, err := time.ParseDuration(v); err == nil {
 			cfg.StaleChassisGracePeriod = d
 		} else {
-			slog.Warn("ignoring invalid OVN_ROUTE_STALE_CHASSIS_GRACE_PERIOD env var", "value", v, "error", err)
+			slog.Warn("ignoring invalid OVN_NETWORK_STALE_CHASSIS_GRACE_PERIOD env var", "value", v, "error", err)
 		}
 	}
-	if v := os.Getenv("OVN_ROUTE_VETH_LEAK_ENABLED"); v == "0" || v == "false" {
+	if v := os.Getenv("OVN_NETWORK_VETH_LEAK_ENABLED"); v == "0" || v == "false" {
 		cfg.VethLeakEnabled = false
 	}
-	if v := os.Getenv("OVN_ROUTE_VETH_PROVIDER_IP"); v != "" {
+	if v := os.Getenv("OVN_NETWORK_VETH_PROVIDER_IP"); v != "" {
 		cfg.VethProviderIP = v
 	}
-	if v := os.Getenv("OVN_ROUTE_VETH_LEAK_TABLE_ID"); v != "" {
+	if v := os.Getenv("OVN_NETWORK_VETH_LEAK_TABLE_ID"); v != "" {
 		var id int
 		if _, err := fmt.Sscanf(v, "%d", &id); err == nil {
 			cfg.VethLeakTableID = id
 		}
 	}
-	if v := os.Getenv("OVN_ROUTE_VETH_LEAK_RULE_PRIORITY"); v != "" {
+	if v := os.Getenv("OVN_NETWORK_VETH_LEAK_RULE_PRIORITY"); v != "" {
 		var prio int
 		if _, err := fmt.Sscanf(v, "%d", &prio); err == nil {
 			cfg.VethLeakRulePriority = prio
 		}
 	}
-	if v := os.Getenv("OVN_ROUTE_PORT_FORWARD_DEV"); v != "" {
+	if v := os.Getenv("OVN_NETWORK_PORT_FORWARD_DEV"); v != "" {
 		cfg.PortForwardDev = v
 	}
-	if v := os.Getenv("OVN_ROUTE_PORT_FORWARD_TABLE_ID"); v != "" {
+	if v := os.Getenv("OVN_NETWORK_PORT_FORWARD_TABLE_ID"); v != "" {
 		var id int
 		if _, err := fmt.Sscanf(v, "%d", &id); err == nil {
 			cfg.PortForwardTableID = id

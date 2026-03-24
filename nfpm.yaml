@@ -1,4 +1,4 @@
-name: ovn-route-agent
+name: ovn-network-agent
 arch: ${GOARCH}
 platform: linux
 version: ${VERSION}
@@ -7,30 +7,30 @@ priority: optional
 maintainer: OSISM GmbH <info@osism.tech>
 description: Real-time Floating IP route synchronization via OVN
 vendor: OSISM GmbH
-homepage: https://github.com/osism/ovn-route-agent
+homepage: https://github.com/osism/ovn-network-agent
 license: Apache-2.0
 
 depends:
   - frr
 
 contents:
-  - src: ./ovn-route-agent-linux-${GOARCH}
-    dst: /usr/bin/ovn-route-agent
+  - src: ./ovn-network-agent-linux-${GOARCH}
+    dst: /usr/bin/ovn-network-agent
     expand: true
     file_info:
       mode: 0755
 
-  - src: ./ovn-route-agent.service.pkg
-    dst: /lib/systemd/system/ovn-route-agent.service
+  - src: ./ovn-network-agent.service.pkg
+    dst: /lib/systemd/system/ovn-network-agent.service
 
-  - src: ./ovn-route-agent.default
-    dst: /etc/default/ovn-route-agent
+  - src: ./ovn-network-agent.default
+    dst: /etc/default/ovn-network-agent
     type: config
 
-  - src: ./ovn-route-agent.yaml.sample
-    dst: /etc/ovn-route-agent/config.yaml.sample
+  - src: ./ovn-network-agent.yaml.sample
+    dst: /etc/ovn-network-agent/config.yaml.sample
 
-  - dst: /etc/ovn-route-agent
+  - dst: /etc/ovn-network-agent
     type: dir
 
 scripts:

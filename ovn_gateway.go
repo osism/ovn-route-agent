@@ -200,7 +200,7 @@ func (o *OVNClient) ensureDefaultRoute(ctx context.Context, lr LocalRouterInfo, 
 		}
 		if route.IPPrefix == "0.0.0.0/0" {
 			// Check if this route was created by the agent.
-			isManaged := route.ExternalIDs != nil && route.ExternalIDs["ovn-route-agent"] == "managed"
+			isManaged := route.ExternalIDs != nil && route.ExternalIDs["ovn-network-agent"] == "managed"
 
 			if !isManaged {
 				// A default route exists that was NOT created by the agent
@@ -214,10 +214,10 @@ func (o *OVNClient) ensureDefaultRoute(ctx context.Context, lr LocalRouterInfo, 
 
 			if route.Nexthop == vgwIP {
 				// Nexthop correct — check if chassis tag needs updating (migration or failover).
-				if route.ExternalIDs["ovn-route-agent-chassis"] != localChassis {
+				if route.ExternalIDs["ovn-network-agent-chassis"] != localChassis {
 					slog.Info("updating default route chassis tag",
-						"router", lr.RouterName, "old_chassis", route.ExternalIDs["ovn-route-agent-chassis"], "new_chassis", localChassis)
-					route.ExternalIDs["ovn-route-agent-chassis"] = localChassis
+						"router", lr.RouterName, "old_chassis", route.ExternalIDs["ovn-network-agent-chassis"], "new_chassis", localChassis)
+					route.ExternalIDs["ovn-network-agent-chassis"] = localChassis
 					ops, err := o.nbClient.Where(&route).Update(&route, &route.ExternalIDs)
 					if err != nil {
 						return fmt.Errorf("build update op: %w", err)
@@ -233,7 +233,7 @@ func (o *OVNClient) ensureDefaultRoute(ctx context.Context, lr LocalRouterInfo, 
 			route.Nexthop = vgwIP
 			outputPort := lr.LRPName
 			route.OutputPort = &outputPort
-			route.ExternalIDs["ovn-route-agent-chassis"] = localChassis
+			route.ExternalIDs["ovn-network-agent-chassis"] = localChassis
 			ops, err := o.nbClient.Where(&route).Update(&route, &route.Nexthop, &route.OutputPort, &route.ExternalIDs)
 			if err != nil {
 				return fmt.Errorf("build update op: %w", err)
@@ -251,8 +251,8 @@ func (o *OVNClient) ensureDefaultRoute(ctx context.Context, lr LocalRouterInfo, 
 		OutputPort: &outputPort,
 		Options:    map[string]string{},
 		ExternalIDs: map[string]string{
-			"ovn-route-agent":         "managed",
-			"ovn-route-agent-chassis": o.state.LocalChassisName,
+			"ovn-network-agent":         "managed",
+			"ovn-network-agent-chassis": o.state.LocalChassisName,
 		},
 	}
 
@@ -362,7 +362,7 @@ func (o *OVNClient) RemoveManagedNBEntries(ctx context.Context) error {
 	}
 
 	for _, route := range routes {
-		if route.ExternalIDs == nil || route.ExternalIDs["ovn-route-agent"] != "managed" {
+		if route.ExternalIDs == nil || route.ExternalIDs["ovn-network-agent"] != "managed" {
 			continue
 		}
 
@@ -432,7 +432,7 @@ func (o *OVNClient) RemoveManagedNBEntries(ctx context.Context) error {
 }
 
 // ListManagedRouteChassis returns the set of chassis names referenced in
-// ExternalIDs["ovn-route-agent-chassis"] of all managed static routes.
+// ExternalIDs["ovn-network-agent-chassis"] of all managed static routes.
 func (o *OVNClient) ListManagedRouteChassis(ctx context.Context) map[string]bool {
 	var routes []NBLogicalRouterStaticRoute
 	if err := o.nbClient.List(ctx, &routes); err != nil {
@@ -441,8 +441,8 @@ func (o *OVNClient) ListManagedRouteChassis(ctx context.Context) map[string]bool
 	}
 	result := make(map[string]bool)
 	for _, route := range routes {
-		if route.ExternalIDs != nil && route.ExternalIDs["ovn-route-agent"] == "managed" {
-			if ch := route.ExternalIDs["ovn-route-agent-chassis"]; ch != "" {
+		if route.ExternalIDs != nil && route.ExternalIDs["ovn-network-agent"] == "managed" {
+			if ch := route.ExternalIDs["ovn-network-agent-chassis"]; ch != "" {
 				result[ch] = true
 			}
 		}
@@ -460,7 +460,7 @@ type staleMACBindingKey struct {
 // CleanupStaleChassisManagedEntries removes OVN NB entries (static routes and
 // their corresponding MAC bindings) that were created by agents on chassis
 // that no longer exist in the SB Chassis table.
-// Only entries with ExternalIDs["ovn-route-agent"] == "managed" and a matching
+// Only entries with ExternalIDs["ovn-network-agent"] == "managed" and a matching
 // chassis tag are removed. Neutron-created entries are never touched.
 func (o *OVNClient) CleanupStaleChassisManagedEntries(ctx context.Context, staleChassis map[string]bool) error {
 	var routes []NBLogicalRouterStaticRoute
@@ -488,10 +488,10 @@ func (o *OVNClient) CleanupStaleChassisManagedEntries(ctx context.Context, stale
 
 	// First pass: identify which output ports are still owned by live chassis.
 	for _, route := range routes {
-		if route.ExternalIDs == nil || route.ExternalIDs["ovn-route-agent"] != "managed" {
+		if route.ExternalIDs == nil || route.ExternalIDs["ovn-network-agent"] != "managed" {
 			continue
 		}
-		ch := route.ExternalIDs["ovn-route-agent-chassis"]
+		ch := route.ExternalIDs["ovn-network-agent-chassis"]
 		if ch != "" && !staleChassis[ch] && route.OutputPort != nil {
 			liveOutputPorts[*route.OutputPort] = true
 		}
@@ -499,10 +499,10 @@ func (o *OVNClient) CleanupStaleChassisManagedEntries(ctx context.Context, stale
 
 	// Second pass: find and delete stale routes.
 	for _, route := range routes {
-		if route.ExternalIDs == nil || route.ExternalIDs["ovn-route-agent"] != "managed" {
+		if route.ExternalIDs == nil || route.ExternalIDs["ovn-network-agent"] != "managed" {
 			continue
 		}
-		chassisName := route.ExternalIDs["ovn-route-agent-chassis"]
+		chassisName := route.ExternalIDs["ovn-network-agent-chassis"]
 		if chassisName == "" {
 			// Legacy route without chassis tag — skip, will be tagged on next reconcile.
 			continue

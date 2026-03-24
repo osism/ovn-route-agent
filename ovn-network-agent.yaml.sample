@@ -1,10 +1,10 @@
-# ovn-route-agent configuration file
+# ovn-network-agent configuration file
 #
 # Configuration priority (highest wins):
 #   CLI flags > environment variables > config file > defaults
 #
 # Usage:
-#   ovn-route-agent --config /etc/ovn-route-agent/config.yaml
+#   ovn-network-agent --config /etc/ovn-network-agent/config.yaml
 
 # OVN Southbound DB remote (required)
 # Comma-separated for clustered setups (failover).

@@ -1,49 +1,49 @@
-# /etc/default/ovn-route-agent — Environment configuration for ovn-route-agent.service
+# /etc/default/ovn-network-agent — Environment configuration for ovn-network-agent.service
 #
 # OVN Southbound DB connection (required)
 # The agent runs on network/gateway nodes and connects to the OVN databases
 # on the control nodes via TCP. Comma-separated for clustered setups (failover).
-OVN_ROUTE_OVN_SB_REMOTE=tcp:10.10.0.1:6642,tcp:10.10.0.2:6642,tcp:10.10.0.3:6642
+OVN_NETWORK_OVN_SB_REMOTE=tcp:10.10.0.1:6642,tcp:10.10.0.2:6642,tcp:10.10.0.3:6642
 
 # OVN Northbound DB connection (required)
-OVN_ROUTE_OVN_NB_REMOTE=tcp:10.10.0.1:6641,tcp:10.10.0.2:6641,tcp:10.10.0.3:6641
+OVN_NETWORK_OVN_NB_REMOTE=tcp:10.10.0.1:6641,tcp:10.10.0.2:6641,tcp:10.10.0.3:6641
 
 # Provider bridge device for kernel routes
-#OVN_ROUTE_BRIDGE_DEV=br-ex
+#OVN_NETWORK_BRIDGE_DEV=br-ex
 
 # VRF name for FRR static routes
-#OVN_ROUTE_VRF_NAME=vrf-provider
+#OVN_NETWORK_VRF_NAME=vrf-provider
 
 # VRF veth nexthop for FRR static routes
-#OVN_ROUTE_VETH_NEXTHOP=169.254.0.1
+#OVN_NETWORK_VETH_NEXTHOP=169.254.0.1
 
 # Filter FIPs by CIDRs (comma-separated, e.g. 192.0.2.0/24,198.51.100.0/24)
 # Leave empty to manage all NAT IPs without filtering
-#OVN_ROUTE_NETWORK_CIDR=
+#OVN_NETWORK_NETWORK_CIDR=
 
 # Logical port name for gateway chassis selection
 # Set when multiple gateway routers exist
-#OVN_ROUTE_GATEWAY_PORT=
+#OVN_NETWORK_GATEWAY_PORT=
 
 # Full reconciliation interval (Go duration format)
-#OVN_ROUTE_RECONCILE_INTERVAL=60s
+#OVN_NETWORK_RECONCILE_INTERVAL=60s
 
 # Log level: debug, info, warn, error
-#OVN_ROUTE_LOG_LEVEL=info
+#OVN_NETWORK_LOG_LEVEL=info
 
 # Remove all managed routes on shutdown (default: true)
 # Set to false to keep routes in place when the agent stops
-#OVN_ROUTE_CLEANUP_ON_SHUTDOWN=true
+#OVN_NETWORK_CLEANUP_ON_SHUTDOWN=true
 
 # Veth VRF route leaking (replaces contrib/veth-vrf-leak.sh)
 # Set to false to disable automatic veth pair setup for VRF route leaking
-#OVN_ROUTE_VETH_LEAK_ENABLED=true
+#OVN_NETWORK_VETH_LEAK_ENABLED=true
 
 # IP of the veth-provider side (default: computed from VETH_NEXTHOP + 1)
-#OVN_ROUTE_VETH_PROVIDER_IP=169.254.0.2
+#OVN_NETWORK_VETH_PROVIDER_IP=169.254.0.2
 
 # Routing table ID for the leak default route (1-252, must differ from ROUTE_TABLE_ID)
-#OVN_ROUTE_VETH_LEAK_TABLE_ID=200
+#OVN_NETWORK_VETH_LEAK_TABLE_ID=200
 
 # Policy rule priority for veth leak rules
-#OVN_ROUTE_VETH_LEAK_RULE_PRIORITY=2000
+#OVN_NETWORK_VETH_LEAK_RULE_PRIORITY=2000

@@ -1,6 +1,6 @@
 [Unit]
-Description=OVN Route Agent — Real-time Floating IP route synchronization via OVN
-Documentation=https://github.com/osism/ovn-route-agent
+Description=OVN Network Agent — Real-time Floating IP route synchronization via OVN
+Documentation=https://github.com/osism/ovn-network-agent
 
 # Hard dependencies — agent cannot function without these
 Requires=frr.service
@@ -23,7 +23,7 @@ After=kolla-ovn_controller-container.service
 
 [Service]
 Type=simple
-ExecStart=/usr/local/bin/ovn-route-agent --config /etc/ovn-route-agent/config.yaml
+ExecStart=/usr/local/bin/ovn-network-agent --config /etc/ovn-network-agent/config.yaml
 Restart=always
 RestartSec=5
 
@@ -32,7 +32,7 @@ RestartSec=5
 TimeoutStopSec=60
 
 # Environment overrides (optional, takes precedence over config file)
-EnvironmentFile=-/etc/default/ovn-route-agent
+EnvironmentFile=-/etc/default/ovn-network-agent
 
 # Security hardening
 NoNewPrivileges=no
@@ -45,7 +45,7 @@ ProtectSystem=false
 # Logging
 StandardOutput=journal
 StandardError=journal
-SyslogIdentifier=ovn-route-agent
+SyslogIdentifier=ovn-network-agent
 
 [Install]
 WantedBy=multi-user.target

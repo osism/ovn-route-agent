@@ -35,12 +35,12 @@ jobs:
         run: |
           VERSION="${GITHUB_REF_NAME}"
           go build -trimpath -ldflags "-s -w -X main.version=${VERSION}" \
-            -o ovn-route-agent-${{ matrix.goos }}-${{ matrix.goarch }} .
+            -o ovn-network-agent-${{ matrix.goos }}-${{ matrix.goarch }} .
 
       - name: Build .deb package
         run: |
           VERSION="${GITHUB_REF_NAME#v}"
-          sed 's|/usr/local/bin/|/usr/bin/|' ovn-route-agent.service > ovn-route-agent.service.pkg
+          sed 's|/usr/local/bin/|/usr/bin/|' ovn-network-agent.service > ovn-network-agent.service.pkg
           go install github.com/goreleaser/nfpm/v2/cmd/nfpm@latest
           GOARCH=${{ matrix.goarch }} VERSION="${VERSION}" nfpm package --packager deb --target .
 
@@ -48,8 +48,8 @@ jobs:
         with:
           name: build-${{ matrix.goos }}-${{ matrix.goarch }}
           path: |
-            ovn-route-agent-${{ matrix.goos }}-${{ matrix.goarch }}
-            ovn-route-agent_*.deb
+            ovn-network-agent-${{ matrix.goos }}-${{ matrix.goarch }}
+            ovn-network-agent_*.deb
 
   release:
     needs: build
@@ -73,14 +73,14 @@ jobs:
 
       - name: Create checksums
         working-directory: artifacts
-        run: sha256sum ovn-route-agent-linux-* ovn-route-agent_*.deb sbom.cyclonedx.json > checksums.txt
+        run: sha256sum ovn-network-agent-linux-* ovn-network-agent_*.deb sbom.cyclonedx.json > checksums.txt
 
       - name: Attest build provenance
         uses: actions/attest-build-provenance@v4
         with:
           subject-path: |
-            artifacts/ovn-route-agent-linux-*
-            artifacts/ovn-route-agent_*.deb
+            artifacts/ovn-network-agent-linux-*
+            artifacts/ovn-network-agent_*.deb
 
       - name: Install cosign
         uses: sigstore/cosign-installer@v3
@@ -88,7 +88,7 @@ jobs:
       - name: Sign artifacts with cosign
         working-directory: artifacts
         run: |
-          for file in ovn-route-agent-linux-* ovn-route-agent_*.deb sbom.cyclonedx.json checksums.txt; do
+          for file in ovn-network-agent-linux-* ovn-network-agent_*.deb sbom.cyclonedx.json checksums.txt; do
             cosign sign-blob --yes --bundle="${file}.bundle" "${file}"
           done
 
@@ -103,9 +103,9 @@ jobs:
         with:
           body: ${{ steps.changelog.outputs.content }}
           files: |
-            artifacts/ovn-route-agent-linux-amd64
-            artifacts/ovn-route-agent-linux-arm64
-            artifacts/ovn-route-agent_*.deb
+            artifacts/ovn-network-agent-linux-amd64
+            artifacts/ovn-network-agent-linux-arm64
+            artifacts/ovn-network-agent_*.deb
             artifacts/sbom.cyclonedx.json
             artifacts/checksums.txt
             artifacts/*.bundle

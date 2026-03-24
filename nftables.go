@@ -8,7 +8,7 @@ import (
 )
 
 const (
-	nftTableName       = "ovn-route-agent"
+	nftTableName       = "ovn-network-agent"
 	dnatFwmark         = 0x100 // fwmark on original-direction DNAT'd packets → lookup main
 	dnatReplyFwmark    = 0x200 // fwmark on reply-direction DNAT'd packets → lookup VRF
 	dnatFwmarkPriority = 150   // ip rule priority; must be < 1000 (l3mdev VRF rule)

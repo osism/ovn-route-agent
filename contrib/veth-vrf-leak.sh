@@ -2,11 +2,11 @@
 #
 # veth-vrf-leak.sh - VRF Route Leaking via veth Pair
 #
-# DEPRECATED: This functionality is now built into the ovn-route-agent Go
+# DEPRECATED: This functionality is now built into the ovn-network-agent Go
 # daemon (--veth-leak-enabled, enabled by default). The agent sets up and
 # tears down the veth pair automatically on startup/shutdown. This script
 # is kept here for reference only.
-# See: https://github.com/osism/ovn-route-agent#vrf-route-leaking
+# See: https://github.com/osism/ovn-network-agent#vrf-route-leaking
 #
 # This script sets up a veth pair to enable selective route leaking
 # between the default VRF and the "vrf-provider" VRF. This allows
@@ -78,12 +78,12 @@
 #
 # The networks file contains one CIDR network per line (blank lines and
 # lines starting with # are ignored).
-# Default: /etc/ovn-route-agent/networks.txt
+# Default: /etc/ovn-network-agent/networks.txt
 #
 set -euo pipefail
 
 ACTION="${1:-up}"
-NETWORKS_FILE="${2:-/etc/ovn-route-agent/networks.txt}"
+NETWORKS_FILE="${2:-/etc/ovn-network-agent/networks.txt}"
 
 VETH_DEFAULT_IP="${VETH_DEFAULT_IP:-169.254.0.1}"
 VETH_PROVIDER_IP="${VETH_PROVIDER_IP:-169.254.0.2}"

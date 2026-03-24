@@ -2,12 +2,12 @@
 set -euo pipefail
 
 # ============================================================================
-# ovn-route-agent.sh — Floating IP /32 route sync based on OVN Gateway Chassis
+# ovn-network-agent.sh — Floating IP /32 route sync based on OVN Gateway Chassis
 #
 # DEPRECATED: This shell script is the original prototype that served as the
-# starting point for the ovn-route-agent Go daemon. It is kept here for
+# starting point for the ovn-network-agent Go daemon. It is kept here for
 # reference only. Use the Go binary for production deployments.
-# See: https://github.com/osism/ovn-route-agent
+# See: https://github.com/osism/ovn-network-agent
 #
 # What it does:
 #   1. Determines whether this node is the active OVN gateway chassis by
@@ -25,12 +25,12 @@ set -euo pipefail
 #
 # Usage:
 #   Run via cron or systemd timer on each gateway node, e.g. every 30s:
-#     */1 * * * * /usr/local/bin/ovn-route-agent.sh
+#     */1 * * * * /usr/local/bin/ovn-network-agent.sh
 #     (cron minimum is 1 min; use a systemd timer for 30s intervals)
 # ============================================================================
 
 HOSTNAME=$(hostname)
-LOG_PREFIX="ovn-route-agent"
+LOG_PREFIX="ovn-network-agent"
 OVN_CONTAINER="ovn_controller"  # Adjust if different
 
 # Floating IP range — adjust to your setup (example uses RFC 5737 TEST-NET-1)
