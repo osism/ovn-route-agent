@@ -2,6 +2,7 @@ package main
 
 import (
 	"errors"
+	"fmt"
 	"net"
 	"os"
 	"path/filepath"
@@ -1232,6 +1233,167 @@ func TestPortForwardDefaults(t *testing.T) {
 	}
 	if cfg.PortForwardEnabled {
 		t.Error("PortForwardEnabled should be false by default")
+	}
+}
+
+func TestDestAddrsHelper(t *testing.T) {
+	tests := []struct {
+		name     string
+		rule     PortForwardRule
+		wantLen  int
+		wantAddr string // first element, if any
+	}{
+		{
+			name:     "dest_addrs_set",
+			rule:     PortForwardRule{DestAddrs: []string{"10.0.0.1", "10.0.0.2"}},
+			wantLen:  2,
+			wantAddr: "10.0.0.1",
+		},
+		{
+			name:     "dest_addr_set",
+			rule:     PortForwardRule{DestAddr: "10.0.0.1"},
+			wantLen:  1,
+			wantAddr: "10.0.0.1",
+		},
+		{
+			name:    "neither_set",
+			rule:    PortForwardRule{},
+			wantLen: 0,
+		},
+		{
+			name:     "dest_addrs_takes_precedence",
+			rule:     PortForwardRule{DestAddr: "10.0.0.99", DestAddrs: []string{"10.0.0.1"}},
+			wantLen:  1,
+			wantAddr: "10.0.0.1",
+		},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			got := tt.rule.destAddrs()
+			if len(got) != tt.wantLen {
+				t.Fatalf("destAddrs() len = %d, want %d", len(got), tt.wantLen)
+			}
+			if tt.wantLen > 0 && got[0] != tt.wantAddr {
+				t.Errorf("destAddrs()[0] = %q, want %q", got[0], tt.wantAddr)
+			}
+		})
+	}
+}
+
+func TestPortForwardMultiBackendValidation(t *testing.T) {
+	base := func() Config {
+		return Config{
+			VethNexthop:        "169.254.0.1",
+			VethLeakEnabled:    true,
+			VethLeakTableID:    200,
+			PortForwardDev:     "loopback1",
+			PortForwardTableID: 201,
+			PortForwards: []PortForwardVIP{
+				{
+					VIP: "198.51.100.10",
+					Rules: []PortForwardRule{
+						{Proto: "udp", Port: 53, DestAddrs: []string{"10.0.0.200", "10.0.0.201"}, DestPort: 1053},
+					},
+				},
+			},
+		}
+	}
+
+	t.Run("valid_multi_backend", func(t *testing.T) {
+		cfg := base()
+		if err := validateConfig(&cfg); err != nil {
+			t.Errorf("unexpected error: %v", err)
+		}
+	})
+
+	t.Run("dest_addr_and_dest_addrs_mutually_exclusive", func(t *testing.T) {
+		cfg := base()
+		cfg.PortForwards[0].Rules[0].DestAddr = "10.0.0.200"
+		if err := validateConfig(&cfg); err == nil {
+			t.Error("expected error when both dest_addr and dest_addrs are set")
+		}
+	})
+
+	t.Run("no_dest_addr_at_all", func(t *testing.T) {
+		cfg := base()
+		cfg.PortForwards[0].Rules[0].DestAddrs = nil
+		if err := validateConfig(&cfg); err == nil {
+			t.Error("expected error when neither dest_addr nor dest_addrs is set")
+		}
+	})
+
+	t.Run("invalid_addr_in_dest_addrs", func(t *testing.T) {
+		cfg := base()
+		cfg.PortForwards[0].Rules[0].DestAddrs = []string{"10.0.0.200", "invalid"}
+		if err := validateConfig(&cfg); err == nil {
+			t.Error("expected error for invalid address in dest_addrs")
+		}
+	})
+
+	t.Run("ipv6_in_dest_addrs", func(t *testing.T) {
+		cfg := base()
+		cfg.PortForwards[0].Rules[0].DestAddrs = []string{"10.0.0.200", "::1"}
+		if err := validateConfig(&cfg); err == nil {
+			t.Error("expected error for IPv6 in dest_addrs")
+		}
+	})
+
+	t.Run("duplicate_in_dest_addrs", func(t *testing.T) {
+		cfg := base()
+		cfg.PortForwards[0].Rules[0].DestAddrs = []string{"10.0.0.200", "10.0.0.200"}
+		if err := validateConfig(&cfg); err == nil {
+			t.Error("expected error for duplicate address in dest_addrs")
+		}
+	})
+
+	t.Run("too_many_backends", func(t *testing.T) {
+		cfg := base()
+		addrs := make([]string, 257)
+		for i := range addrs {
+			addrs[i] = fmt.Sprintf("10.%d.%d.%d", i/65536%256, i/256%256, i%256+1)
+		}
+		cfg.PortForwards[0].Rules[0].DestAddrs = addrs
+		if err := validateConfig(&cfg); err == nil {
+			t.Error("expected error when dest_addrs exceeds max backends")
+		}
+	})
+}
+
+func TestPortForwardConfigParsingDestAddrs(t *testing.T) {
+	content := `
+ovn_sb_remote: "tcp:10.0.0.1:6642"
+ovn_nb_remote: "tcp:10.0.0.1:6641"
+port_forwards:
+  - vip: "198.51.100.10"
+    manage_vip: true
+    rules:
+      - proto: udp
+        port: 53
+        dest_addrs:
+          - "10.0.0.200"
+          - "10.0.0.201"
+          - "10.0.0.202"
+        dest_port: 1053
+`
+	path := filepath.Join(t.TempDir(), "config.yaml")
+	if err := os.WriteFile(path, []byte(content), 0644); err != nil {
+		t.Fatalf("write test config: %v", err)
+	}
+
+	cfg, err := loadConfig([]string{"--config", path})
+	if err != nil {
+		t.Fatalf("loadConfig() error: %v", err)
+	}
+
+	if len(cfg.PortForwards) != 1 {
+		t.Fatalf("len(PortForwards) = %d, want 1", len(cfg.PortForwards))
+	}
+	r := cfg.PortForwards[0].Rules[0]
+	if len(r.DestAddrs) != 3 {
+		t.Fatalf("len(DestAddrs) = %d, want 3", len(r.DestAddrs))
+	}
+	if r.DestAddrs[0] != "10.0.0.200" || r.DestAddrs[1] != "10.0.0.201" || r.DestAddrs[2] != "10.0.0.202" {
+		t.Errorf("DestAddrs = %v, want [10.0.0.200 10.0.0.201 10.0.0.202]", r.DestAddrs)
 	}
 }
 

@@ -1,6 +1,7 @@
 package main
 
 import (
+	"fmt"
 	"net"
 	"strings"
 	"testing"
@@ -259,6 +260,99 @@ func TestBuildNftRulesetNoMasquerade(t *testing.T) {
 	// Should NOT have postrouting SNAT chain
 	if strings.Contains(result, "postrouting_snat") {
 		t.Error("should not have SNAT chain when no VIP has masquerade enabled")
+	}
+}
+
+func TestBuildNftRulesetMultiBackend(t *testing.T) {
+	forwards := []PortForwardVIP{
+		{
+			VIP: "198.51.100.10",
+			Rules: []PortForwardRule{
+				{Proto: "udp", Port: 53, DestAddrs: []string{"10.0.0.200", "10.0.0.201", "10.0.0.202"}, DestPort: 1053},
+			},
+		},
+	}
+
+	result := buildNftRuleset(forwards, nil)
+
+	// Verify jhash-based DNAT rule
+	expected := "ip daddr 198.51.100.10 udp dport 53 dnat to jhash ip saddr mod 3 map { 0 : 10.0.0.200:1053, 1 : 10.0.0.201:1053, 2 : 10.0.0.202:1053 }"
+	if !strings.Contains(result, expected) {
+		t.Errorf("missing jhash DNAT rule.\nwant: %s\ngot:\n%s", expected, result)
+	}
+
+	// Verify conntrack zone entries for ALL backends
+	for _, addr := range []string{"10.0.0.200", "10.0.0.201", "10.0.0.202"} {
+		ct := fmt.Sprintf("ip saddr %s udp sport 1053 ct zone set 1", addr)
+		if !strings.Contains(result, ct) {
+			t.Errorf("missing ctzone rule for backend %s", addr)
+		}
+	}
+}
+
+func TestBuildNftRulesetMultiBackendTwoBackends(t *testing.T) {
+	forwards := []PortForwardVIP{
+		{
+			VIP: "198.51.100.10",
+			Rules: []PortForwardRule{
+				{Proto: "tcp", Port: 443, DestAddrs: []string{"10.0.0.100", "10.0.0.101"}},
+			},
+		},
+	}
+
+	result := buildNftRuleset(forwards, nil)
+
+	// With two backends, jhash mod 2
+	expected := "ip daddr 198.51.100.10 tcp dport 443 dnat to jhash ip saddr mod 2 map { 0 : 10.0.0.100:443, 1 : 10.0.0.101:443 }"
+	if !strings.Contains(result, expected) {
+		t.Errorf("missing jhash DNAT rule for 2 backends.\nwant: %s\ngot:\n%s", expected, result)
+	}
+}
+
+func TestBuildNftRulesetSingleElementDestAddrs(t *testing.T) {
+	// A dest_addrs list with one entry should produce direct DNAT, not jhash.
+	forwards := []PortForwardVIP{
+		{
+			VIP: "198.51.100.10",
+			Rules: []PortForwardRule{
+				{Proto: "tcp", Port: 80, DestAddrs: []string{"10.0.0.100"}},
+			},
+		},
+	}
+
+	result := buildNftRuleset(forwards, nil)
+
+	if !strings.Contains(result, "ip daddr 198.51.100.10 tcp dport 80 dnat to 10.0.0.100:80") {
+		t.Error("single-element dest_addrs should produce direct DNAT")
+	}
+	if strings.Contains(result, "jhash") {
+		t.Error("single-element dest_addrs should not use jhash")
+	}
+}
+
+func TestBuildNftRulesetMixedSingleAndMultiBackend(t *testing.T) {
+	forwards := []PortForwardVIP{
+		{
+			VIP: "198.51.100.10",
+			Rules: []PortForwardRule{
+				// Single backend: should use direct DNAT
+				{Proto: "tcp", Port: 443, DestAddr: "10.0.0.100"},
+				// Multi backend: should use jhash
+				{Proto: "udp", Port: 53, DestAddrs: []string{"10.0.0.200", "10.0.0.201"}, DestPort: 1053},
+			},
+		},
+	}
+
+	result := buildNftRuleset(forwards, nil)
+
+	// Single backend → direct DNAT
+	if !strings.Contains(result, "ip daddr 198.51.100.10 tcp dport 443 dnat to 10.0.0.100:443") {
+		t.Error("single-backend rule should use direct DNAT, not jhash")
+	}
+
+	// Multi backend → jhash
+	if !strings.Contains(result, "jhash ip saddr mod 2 map") {
+		t.Error("multi-backend rule should use jhash")
 	}
 }
 

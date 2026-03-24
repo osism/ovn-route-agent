@@ -17,13 +17,14 @@ const (
 )
 
 // buildNftRuleset generates the complete nftables ruleset for port forwarding.
-// It produces up to five chains:
+// It produces up to six chains:
 //   - prerouting_ctzone: assigns a shared conntrack zone to both directions
 //     of DNAT'd flows (runs at raw priority, before conntrack)
 //   - prerouting_dnat: DNAT rules for each VIP:port → backend
 //   - prerouting_fwmark: marks DNAT'd packets for policy routing
 //   - forward_veth_guard: whitelist-based security for veth return path
-//   - postrouting_snat: masquerade for masquerade-enabled VIPs
+//   - postrouting_fwmark_clear: clears reply fwmark before veth crossing
+//   - postrouting_snat: masquerade for masquerade-enabled VIPs (optional)
 //
 // The conntrack zone is critical: DNAT'd traffic crosses VRF boundaries
 // (original arrives on provider/VRF, reply arrives on control-plane/default VRF).
@@ -64,6 +65,10 @@ func buildNftRuleset(forwards []PortForwardVIP, providerNetworks []*net.IPNet) s
 	b.WriteString("        type filter hook prerouting priority raw; policy accept;\n")
 	for _, pf := range forwards {
 		for _, r := range pf.Rules {
+			addrs := r.destAddrs()
+			if len(addrs) == 0 {
+				continue
+			}
 			destPort := r.DestPort
 			if destPort == 0 {
 				destPort = r.Port
@@ -71,14 +76,20 @@ func buildNftRuleset(forwards []PortForwardVIP, providerNetworks []*net.IPNet) s
 			// Match original direction: client → VIP:port
 			fmt.Fprintf(&b, "        ip daddr %s %s dport %d ct zone set %d\n",
 				pf.VIP, r.Proto, r.Port, dnatCTZone)
-			// Match reply direction: backend:port → masquerade'd IP
-			fmt.Fprintf(&b, "        ip saddr %s %s sport %d ct zone set %d\n",
-				r.DestAddr, r.Proto, destPort, dnatCTZone)
+			// Match reply direction: backend:port → client
+			// Each backend address needs its own ctzone entry.
+			for _, addr := range addrs {
+				fmt.Fprintf(&b, "        ip saddr %s %s sport %d ct zone set %d\n",
+					addr, r.Proto, destPort, dnatCTZone)
+			}
 		}
 	}
 	b.WriteString("    }\n")
 
-	// Chain: DNAT rules
+	// Chain: DNAT rules.
+	// For rules with a single backend: direct DNAT.
+	// For rules with multiple backends: jhash on source IP for sticky
+	// load balancing — the same client IP always maps to the same backend.
 	b.WriteString("    chain prerouting_dnat {\n")
 	b.WriteString("        type nat hook prerouting priority dstnat; policy accept;\n")
 	for _, pf := range forwards {
@@ -87,8 +98,26 @@ func buildNftRuleset(forwards []PortForwardVIP, providerNetworks []*net.IPNet) s
 			if destPort == 0 {
 				destPort = r.Port
 			}
-			fmt.Fprintf(&b, "        ip daddr %s %s dport %d dnat to %s:%d\n",
-				pf.VIP, r.Proto, r.Port, r.DestAddr, destPort)
+			addrs := r.destAddrs()
+			if len(addrs) == 0 {
+				continue
+			}
+			if len(addrs) == 1 {
+				fmt.Fprintf(&b, "        ip daddr %s %s dport %d dnat to %s:%d\n",
+					pf.VIP, r.Proto, r.Port, addrs[0], destPort)
+			} else {
+				// jhash: consistent source-IP hashing distributes clients
+				// across backends. Same client IP → same backend (sticky).
+				fmt.Fprintf(&b, "        ip daddr %s %s dport %d dnat to jhash ip saddr mod %d map { ",
+					pf.VIP, r.Proto, r.Port, len(addrs))
+				for i, addr := range addrs {
+					if i > 0 {
+						b.WriteString(", ")
+					}
+					fmt.Fprintf(&b, "%d : %s:%d", i, addr, destPort)
+				}
+				b.WriteString(" }\n")
+			}
 		}
 	}
 	b.WriteString("    }\n")

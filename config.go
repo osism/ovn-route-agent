@@ -65,11 +65,27 @@ func splitAndTrim(s, sep string) []string {
 }
 
 // PortForwardRule describes a single DNAT port forwarding rule.
+// A rule can have a single backend (DestAddr) or multiple backends (DestAddrs).
+// When multiple backends are configured, nftables jhash-based source-IP hashing
+// is used to consistently map clients to the same backend (sticky load balancing).
 type PortForwardRule struct {
-	Proto    string `yaml:"proto"`     // "tcp" or "udp"
-	Port     int    `yaml:"port"`      // incoming port on VIP (1-65535)
-	DestAddr string `yaml:"dest_addr"` // backend IP address
-	DestPort int    `yaml:"dest_port"` // backend port (0 = same as Port)
+	Proto     string   `yaml:"proto"`      // "tcp" or "udp"
+	Port      int      `yaml:"port"`       // incoming port on VIP (1-65535)
+	DestAddr  string   `yaml:"dest_addr"`  // single backend IP address (mutually exclusive with dest_addrs)
+	DestAddrs []string `yaml:"dest_addrs"` // multiple backend IP addresses for sticky hashing
+	DestPort  int      `yaml:"dest_port"`  // backend port (0 = same as Port)
+}
+
+// destAddrs returns the effective list of backend addresses for the rule.
+// It merges the singular DestAddr and plural DestAddrs fields.
+func (r *PortForwardRule) destAddrs() []string {
+	if len(r.DestAddrs) > 0 {
+		return r.DestAddrs
+	}
+	if r.DestAddr != "" {
+		return []string{r.DestAddr}
+	}
+	return nil
 }
 
 // PortForwardVIP describes a VIP with its forwarding rules.
@@ -389,7 +405,8 @@ func validateConfig(cfg *Config) error {
 				return fmt.Errorf("port_forwards[%d] (vip=%s): no rules defined", i, pf.VIP)
 			}
 			seenRules := make(map[string]bool, len(pf.Rules))
-			for j, r := range pf.Rules {
+			for j := range pf.Rules {
+				r := &pf.Rules[j]
 				if r.Proto != "tcp" && r.Proto != "udp" {
 					return fmt.Errorf("port_forwards[%d].rules[%d]: invalid proto %q (must be tcp or udp)", i, j, r.Proto)
 				}
@@ -401,12 +418,32 @@ func validateConfig(cfg *Config) error {
 					return fmt.Errorf("port_forwards[%d].rules[%d]: duplicate %s port %d on VIP %s", i, j, r.Proto, r.Port, pf.VIP)
 				}
 				seenRules[ruleKey] = true
-				destIP := net.ParseIP(r.DestAddr)
-				if destIP == nil {
-					return fmt.Errorf("port_forwards[%d].rules[%d]: invalid dest_addr: %q", i, j, r.DestAddr)
+
+				// Validate dest_addr / dest_addrs: exactly one must be set.
+				if r.DestAddr != "" && len(r.DestAddrs) > 0 {
+					return fmt.Errorf("port_forwards[%d].rules[%d]: dest_addr and dest_addrs are mutually exclusive", i, j)
 				}
-				if destIP.To4() == nil {
-					return fmt.Errorf("port_forwards[%d].rules[%d]: IPv6 dest_addr not supported: %q (only IPv4)", i, j, r.DestAddr)
+				addrs := r.destAddrs()
+				if len(addrs) == 0 {
+					return fmt.Errorf("port_forwards[%d].rules[%d]: dest_addr or dest_addrs required", i, j)
+				}
+				const maxBackends = 256
+				if len(addrs) > maxBackends {
+					return fmt.Errorf("port_forwards[%d].rules[%d]: dest_addrs has %d entries (max %d)", i, j, len(addrs), maxBackends)
+				}
+				seen := make(map[string]bool, len(addrs))
+				for k, addr := range addrs {
+					destIP := net.ParseIP(addr)
+					if destIP == nil {
+						return fmt.Errorf("port_forwards[%d].rules[%d]: invalid dest_addr[%d]: %q", i, j, k, addr)
+					}
+					if destIP.To4() == nil {
+						return fmt.Errorf("port_forwards[%d].rules[%d]: IPv6 dest_addr not supported: %q (only IPv4)", i, j, addr)
+					}
+					if seen[addr] {
+						return fmt.Errorf("port_forwards[%d].rules[%d]: duplicate dest_addr: %q", i, j, addr)
+					}
+					seen[addr] = true
 				}
 				if r.DestPort < 0 || r.DestPort > 65535 {
 					return fmt.Errorf("port_forwards[%d].rules[%d]: invalid dest_port %d (must be 0-65535)", i, j, r.DestPort)

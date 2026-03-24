@@ -67,7 +67,7 @@ ovn_nb_remote: "tcp:10.10.0.1:6641,tcp:10.10.0.2:6641,tcp:10.10.0.3:6641"
 # cleanup_on_shutdown: true
 
 # Drain HA gateways before shutdown (default: true)
-# When enabled, the agent lowers its Gateway_Chassis priority to 1 on shutdown,
+# When enabled, the agent lowers its Gateway_Chassis priority to 0 on shutdown,
 # causing OVN to migrate chassisredirect ports to standby chassis before cleanup.
 # This eliminates the traffic disruption window between BGP withdrawal and OVN failover.
 # Note: Priorities are NOT restored on shutdown. Neutron's L3 HA scheduler will
@@ -132,17 +132,20 @@ ovn_nb_remote: "tcp:10.10.0.1:6641,tcp:10.10.0.2:6641,tcp:10.10.0.3:6641"
 #     rules:
 #       - proto: tcp
 #         port: 80
-#         dest_addr: "10.0.0.100"
+#         dest_addr: "10.0.0.100"       # single backend
 #       - proto: tcp
 #         port: 443
 #         dest_addr: "10.0.0.100"
 #       - proto: tcp
 #         port: 53
 #         dest_addr: "10.0.0.200"
-#         dest_port: 1053       # port translation: VIP:53 -> 10.0.0.200:1053
+#         dest_port: 1053                # port translation: VIP:53 -> 10.0.0.200:1053
 #       - proto: udp
 #         port: 53
-#         dest_addr: "10.0.0.200"
+#         dest_addrs:                    # multiple backends: sticky source-IP hashing
+#           - "10.0.0.200"
+#           - "10.0.0.201"
+#           - "10.0.0.202"
 #         dest_port: 1053
 #   - vip: "198.51.100.20"
 #     manage_vip: false         # VIP already exists on the interface

@@ -21,7 +21,7 @@ The agent monitors the OVN Southbound and Northbound databases and performs targ
    - Ensures `/32` **kernel routes** (with IP rules when using a dedicated routing table) and **FRR static routes** in the VRF for each FIP/SNAT IP
    - If configured, reconciles the **FRR prefix-list** with `permit <network> ge 32 le 32` entries for each discovered provider network
    - If no routers are locally active: removes all managed routes
-5. **Port forwarding (DNAT)** — optionally forwards traffic from anycast VIP addresses (on a loopback interface in the VRF) to internal backends. Client IPs are preserved using connmark-based return routing through the veth pair. A `forward_veth_guard` nftables chain restricts the veth return path to legitimate traffic only. Requires `nft` binary and `veth_leak_enabled: true`.
+5. **Port forwarding (DNAT)** — optionally forwards traffic from anycast VIP addresses (on a loopback interface in the VRF) to internal backends. Supports multiple backends per rule with sticky source-IP hashing (`jhash`) for consistent client-to-backend mapping. Client IPs are preserved using connmark-based return routing through the veth pair. A `forward_veth_guard` nftables chain restricts the veth return path to legitimate traffic only. Requires `nft` binary and `veth_leak_enabled: true`.
 6. **Reconciles** periodically as a safety net (default: every 60s)
 7. **Detects stale chassis** — when a node dies without graceful shutdown, surviving agents detect its chassis disappearing from the SB Chassis table and clean up its managed OVN NB entries (static routes and MAC bindings) after a configurable grace period (default: 5m, configurable via `stale_chassis_grace_period`, set to `0` to disable). Random jitter (0-30s) prevents multiple agents from cleaning up simultaneously.
 8. **Drains gateways** on shutdown (SIGINT/SIGTERM) — before cleanup, the agent lowers its `Gateway_Chassis` priority to 0 in OVN NB, causing `ovn-northd` to migrate chassisredirect ports to standby chassis (priority >= 1). On the next startup, drained entries are restored to priority 1 (standby level). The active chassis automatically maintains a minimum priority of 2 (above all possible standby peers) during reconciliation, preventing reverse failover even when a peer restores to priority 1. This eliminates the traffic disruption window between BGP route withdrawal and OVN BFD failover detection (see [Gateway drain mode](#gateway-drain-mode)). Enabled by default (`drain_on_shutdown: true`, `drain_timeout: 60s`).
@@ -325,10 +325,15 @@ The mechanism works in three stages:
 **1. DNAT (prerouting)** — Translates the destination for incoming traffic:
 
 ```
+# Single backend:
 ip daddr 198.51.100.10 tcp dport 53 dnat to 10.0.0.200:1053
+
+# Multiple backends (sticky source-IP hashing):
+ip daddr 198.51.100.10 udp dport 53 dnat to jhash ip saddr mod 3 map { \
+    0 : 10.0.0.200:1053, 1 : 10.0.0.201:1053, 2 : 10.0.0.202:1053 }
 ```
 
-Traffic arriving at the VIP is rewritten to the internal backend address. If `dest_port` is configured, port translation also occurs (e.g. public port 53 → backend port 1053).
+Traffic arriving at the VIP is rewritten to the internal backend address. If `dest_port` is configured, port translation also occurs (e.g. public port 53 → backend port 1053). When multiple backends are configured via `dest_addrs`, a Jenkins hash on the client source IP distributes traffic with sticky affinity (see [Sticky load balancing](#sticky-load-balancing-multi-backend)).
 
 **2. Conntrack zone assignment (prerouting_ctzone, raw priority)** — Assigns a shared conntrack zone before conntrack processing. This is critical because DNAT'd traffic crosses VRF boundaries (original enters on the provider VRF, reply enters on the default VRF). Without a shared zone, conntrack cannot correlate them and reverse NAT fails silently:
 
@@ -493,16 +498,44 @@ port_forwards:
     rules:
       - proto: udp
         port: 53                 # public port
-        dest_addr: "10.0.0.200"
+        dest_addrs:              # multiple backends: sticky source-IP hashing
+          - "10.0.0.200"
+          - "10.0.0.201"
+          - "10.0.0.202"
         dest_port: 1053          # backend port (port translation)
       - proto: tcp
         port: 53
-        dest_addr: "10.0.0.200"
+        dest_addr: "10.0.0.200"  # single backend: direct DNAT
         dest_port: 1053
       - proto: tcp
         port: 443
         dest_addr: "10.0.0.100"  # dest_port omitted → same as port (443)
 ```
+
+### Sticky load balancing (multi-backend)
+
+When a rule specifies multiple backends via `dest_addrs`, the agent generates nftables rules using `jhash ip saddr` (Jenkins hash on the client's source IP) to consistently map the same client to the same backend:
+
+```
+ip daddr 198.51.100.10 udp dport 53 dnat to jhash ip saddr mod 3 map { \
+    0 : 10.0.0.200:1053, \
+    1 : 10.0.0.201:1053, \
+    2 : 10.0.0.202:1053  \
+}
+```
+
+**Properties:**
+
+- **Sticky**: The same client IP always reaches the same backend (deterministic hash)
+- **Distributed**: Different clients are spread evenly across all backends
+- **Conntrack-aware**: Within an established conntrack entry, replies naturally stay on the same backend; `jhash` ensures that *new* connections from the same client also land on the same backend
+- **NAT-friendly**: Clients behind the same NAT gateway (same source IP) share a backend, which is typically the desired behavior for DNS and similar services
+
+**Limitations:**
+
+- Not a consistent hash (like Maglev or ketama): when a backend is added or removed, `mod N` changes and approximately `(N-1)/N` of clients may be remapped. For DNS stickiness this is acceptable in practice.
+- `dest_addr` (single) and `dest_addrs` (list) are mutually exclusive per rule. Use `dest_addr` for single-backend rules and `dest_addrs` for multi-backend.
+- Maximum 256 backends per rule.
 
 ## Gateway drain mode
 
@@ -664,7 +697,7 @@ The agent monitors OVN databases and writes routing state into four subsystems. 
                   │  │  OVSDB IDL │    │   Event Processing   │  │
                   │  │  Monitors  │───►│                      │  │
                   │  └────────────┘    │  Fast: failover <10ms│  │
-                  │                    │  Normal: debounce 600ms │
+                  │                    │  Normal: debounce 500ms │
                   │                    └──────────┬───────────┘  │
                   │                               │              │
                   │                    ┌──────────▼───────────┐  │
