@@ -285,7 +285,7 @@ func (rm *RouteManager) reconcilePortForwardVIPs() error {
 // The delete + create is submitted as a single nft -f input to avoid a window
 // where no rules exist.
 func (rm *RouteManager) applyNftRuleset(providerNetworks []*net.IPNet) error {
-	ruleset := buildNftRuleset(rm.portForwards, providerNetworks)
+	ruleset := buildNftRuleset(rm.portForwards, providerNetworks, rm.portForwardCTZone)
 
 	// Combine delete (if exists) and create into a single atomic nft load.
 	// The delete may fail on first run (table doesn't exist yet), so we
@@ -312,6 +312,16 @@ func (rm *RouteManager) applyNftRuleset(providerNetworks []*net.IPNet) error {
 // is needed because DNAT reply traffic re-enters the VRF via veth-provider with
 // a source address (the VIP) that is local within the VRF. Without accept_local
 // the kernel drops these packets as martians.
+//
+// When port_forward_l3mdev_accept is true, the global udp/tcp_l3mdev_accept
+// sysctls are set to 1. This is needed when a DNAT backend runs on the same
+// host but in a different VRF than the VIP (e.g. backend on loopback0 in the
+// default VRF, VIP on loopback1 in the provider VRF). Without l3mdev_accept
+// the kernel refuses to deliver the DNAT'd packet to the backend socket across
+// VRF boundaries.
+//
+// NOTE: l3mdev_accept is a global sysctl that allows ALL sockets to receive
+// packets from any VRF. Only enable when same-host cross-VRF backends are used.
 func (rm *RouteManager) ensureVethForwarding() error {
 	for _, dev := range []string{vethDefaultName, vethProviderName} {
 		path := filepath.Join("/proc/sys/net/ipv4/conf", dev, "forwarding")
@@ -323,6 +333,17 @@ func (rm *RouteManager) ensureVethForwarding() error {
 		path := filepath.Join("/proc/sys/net/ipv4/conf", vethProviderName, "accept_local")
 		if err := os.WriteFile(path, []byte("1\n"), 0644); err != nil {
 			return fmt.Errorf("enable accept_local on %s: %w", vethProviderName, err)
+		}
+		if rm.portForwardL3mdevAccept {
+			for _, sysctl := range []string{
+				"/proc/sys/net/ipv4/udp_l3mdev_accept",
+				"/proc/sys/net/ipv4/tcp_l3mdev_accept",
+			} {
+				if err := os.WriteFile(sysctl, []byte("1\n"), 0644); err != nil {
+					return fmt.Errorf("enable %s: %w", filepath.Base(sysctl), err)
+				}
+			}
+			slog.Info("l3mdev_accept enabled for cross-VRF same-host DNAT backends")
 		}
 	}
 	slog.Debug("IP forwarding enabled on veth interfaces")

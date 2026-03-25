@@ -977,11 +977,12 @@ port_forwards:
 func TestPortForwardValidation(t *testing.T) {
 	base := func() Config {
 		return Config{
-			VethNexthop:      "169.254.0.1",
-			VethLeakEnabled:  true,
-			VethLeakTableID:  200,
-			PortForwardDev:   "loopback1",
+			VethNexthop:        "169.254.0.1",
+			VethLeakEnabled:    true,
+			VethLeakTableID:    200,
+			PortForwardDev:     "loopback1",
 			PortForwardTableID: 201,
+			PortForwardCTZone:  64000,
 			PortForwards: []PortForwardVIP{
 				{
 					VIP: "198.51.100.10",
@@ -1288,6 +1289,7 @@ func TestPortForwardMultiBackendValidation(t *testing.T) {
 			VethLeakTableID:    200,
 			PortForwardDev:     "loopback1",
 			PortForwardTableID: 201,
+			PortForwardCTZone:  64000,
 			PortForwards: []PortForwardVIP{
 				{
 					VIP: "198.51.100.10",

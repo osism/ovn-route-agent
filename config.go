@@ -69,11 +69,21 @@ func splitAndTrim(s, sep string) []string {
 // When multiple backends are configured, nftables jhash-based source-IP hashing
 // is used to consistently map clients to the same backend (sticky load balancing).
 type PortForwardRule struct {
-	Proto     string   `yaml:"proto"`      // "tcp" or "udp"
-	Port      int      `yaml:"port"`       // incoming port on VIP (1-65535)
-	DestAddr  string   `yaml:"dest_addr"`  // single backend IP address (mutually exclusive with dest_addrs)
-	DestAddrs []string `yaml:"dest_addrs"` // multiple backend IP addresses for sticky hashing
-	DestPort  int      `yaml:"dest_port"`  // backend port (0 = same as Port)
+	Proto      string   `yaml:"proto"`      // "tcp" or "udp"
+	Port       int      `yaml:"port"`       // incoming port on VIP (1-65535)
+	DestAddr   string   `yaml:"dest_addr"`  // single backend IP address (mutually exclusive with dest_addrs)
+	DestAddrs  []string `yaml:"dest_addrs"` // multiple backend IP addresses for sticky hashing
+	DestPort   int      `yaml:"dest_port"`  // backend port (0 = same as Port)
+	Masquerade *bool    `yaml:"masquerade"` // per-rule masquerade override (nil = inherit from VIP)
+}
+
+// effectiveMasquerade returns the masquerade setting for this rule.
+// If the rule has an explicit setting, it wins. Otherwise the VIP-level default is used.
+func (r *PortForwardRule) effectiveMasquerade(vipDefault bool) bool {
+	if r.Masquerade != nil {
+		return *r.Masquerade
+	}
+	return vipDefault
 }
 
 // destAddrs returns the effective list of backend addresses for the rule.
@@ -90,10 +100,11 @@ func (r *PortForwardRule) destAddrs() []string {
 
 // PortForwardVIP describes a VIP with its forwarding rules.
 type PortForwardVIP struct {
-	VIP        string            `yaml:"vip"`        // anycast VIP address
-	ManageVIP  bool              `yaml:"manage_vip"` // agent adds/removes VIP on port_forward_dev
-	Masquerade bool              `yaml:"masquerade"` // SNAT forwarded traffic with outgoing interface IP
-	Rules      []PortForwardRule `yaml:"rules"`
+	VIP               string            `yaml:"vip"`                // anycast VIP address
+	ManageVIP         bool              `yaml:"manage_vip"`         // agent adds/removes VIP on port_forward_dev
+	Masquerade        bool              `yaml:"masquerade"`         // SNAT forwarded traffic with outgoing interface IP
+	HairpinMasquerade bool              `yaml:"hairpin_masquerade"` // SNAT only traffic from provider networks (fixes hairpin NAT)
+	Rules             []PortForwardRule `yaml:"rules"`
 }
 
 // Config holds all runtime configuration for the agent.
@@ -129,10 +140,12 @@ type Config struct {
 	VethLeakRulePriority int    // Policy rule priority (default: 2000)
 
 	// Port forwarding (DNAT) settings
-	PortForwardEnabled bool             // derived: len(PortForwards) > 0
-	PortForwardDev     string           // loopback device for VIP addresses (default: "loopback1")
-	PortForwardTableID int              // routing table for DNAT return traffic (default: 201)
-	PortForwards       []PortForwardVIP // VIP forwarding rules from config
+	PortForwardEnabled      bool             // derived: len(PortForwards) > 0
+	PortForwardDev          string           // loopback device for VIP addresses (default: "loopback1")
+	PortForwardTableID      int              // routing table for DNAT return traffic (default: 201)
+	PortForwardL3mdevAccept bool             // set udp/tcp_l3mdev_accept=1 for cross-VRF same-host backends (default: false)
+	PortForwardCTZone       int              // conntrack zone for DNAT flows; must not collide with OVN zones (default: 64000)
+	PortForwards            []PortForwardVIP // VIP forwarding rules from config
 }
 
 // configFile is the YAML representation of the config file.
@@ -163,9 +176,11 @@ type configFile struct {
 	VethLeakTableID      *int   `yaml:"veth_leak_table_id"`
 	VethLeakRulePriority *int   `yaml:"veth_leak_rule_priority"`
 
-	PortForwardDev     string           `yaml:"port_forward_dev"`
-	PortForwardTableID *int             `yaml:"port_forward_table_id"`
-	PortForwards       []PortForwardVIP `yaml:"port_forwards"`
+	PortForwardDev          string           `yaml:"port_forward_dev"`
+	PortForwardTableID      *int             `yaml:"port_forward_table_id"`
+	PortForwardL3mdevAccept *bool            `yaml:"port_forward_l3mdev_accept"`
+	PortForwardCTZone       *int             `yaml:"port_forward_ct_zone"`
+	PortForwards            []PortForwardVIP `yaml:"port_forwards"`
 }
 
 // loadConfig builds the configuration with the following priority
@@ -200,8 +215,10 @@ func loadConfig(args []string) (Config, error) {
 		fVethLeakTableID      = fs.Int("veth-leak-table-id", 200, "Routing table ID for veth leak default route (1-252)")
 		fVethLeakRulePriority = fs.Int("veth-leak-rule-priority", 2000, "Policy rule priority for veth leak rules")
 
-		fPortForwardDev     = fs.String("port-forward-dev", "", "Loopback device for VIP addresses in VRF (default: loopback1)")
-		fPortForwardTableID = fs.Int("port-forward-table-id", 201, "Routing table ID for DNAT return traffic (1-252)")
+		fPortForwardDev          = fs.String("port-forward-dev", "", "Loopback device for VIP addresses in VRF (default: loopback1)")
+		fPortForwardTableID      = fs.Int("port-forward-table-id", 201, "Routing table ID for DNAT return traffic (1-252)")
+		fPortForwardL3mdevAccept = fs.Bool("port-forward-l3mdev-accept", false, "Set udp/tcp_l3mdev_accept=1 for cross-VRF same-host DNAT backends")
+		fPortForwardCTZone       = fs.Int("port-forward-ct-zone", 64000, "Conntrack zone for DNAT flows (must not collide with OVN zones, 1-65535)")
 	)
 
 	if err := fs.Parse(args); err != nil {
@@ -230,6 +247,7 @@ func loadConfig(args []string) (Config, error) {
 		VethLeakRulePriority:    2000,
 		PortForwardDev:          "loopback1",
 		PortForwardTableID:      201,
+		PortForwardCTZone:       64000,
 	}
 
 	// Layer 1: config file
@@ -303,6 +321,10 @@ func loadConfig(args []string) (Config, error) {
 			cfg.PortForwardDev = *fPortForwardDev
 		case "port-forward-table-id":
 			cfg.PortForwardTableID = *fPortForwardTableID
+		case "port-forward-l3mdev-accept":
+			cfg.PortForwardL3mdevAccept = *fPortForwardL3mdevAccept
+		case "port-forward-ct-zone":
+			cfg.PortForwardCTZone = *fPortForwardCTZone
 		}
 	})
 
@@ -378,6 +400,9 @@ func validateConfig(cfg *Config) error {
 		}
 		if cfg.PortForwardTableID == cfg.RouteTableID && cfg.RouteTableID != 0 {
 			return fmt.Errorf("port-forward-table-id (%d) must not equal route-table-id (%d)", cfg.PortForwardTableID, cfg.RouteTableID)
+		}
+		if cfg.PortForwardCTZone < 1 || cfg.PortForwardCTZone > 65535 {
+			return fmt.Errorf("invalid port-forward-ct-zone: %d (must be 1-65535)", cfg.PortForwardCTZone)
 		}
 		if cfg.PortForwardTableID == cfg.VethLeakTableID {
 			return fmt.Errorf("port-forward-table-id (%d) must not equal veth-leak-table-id (%d)", cfg.PortForwardTableID, cfg.VethLeakTableID)
@@ -579,6 +604,12 @@ func applyFileConfig(cfg *Config, fc *configFile) {
 	if fc.PortForwardTableID != nil {
 		cfg.PortForwardTableID = *fc.PortForwardTableID
 	}
+	if fc.PortForwardL3mdevAccept != nil {
+		cfg.PortForwardL3mdevAccept = *fc.PortForwardL3mdevAccept
+	}
+	if fc.PortForwardCTZone != nil {
+		cfg.PortForwardCTZone = *fc.PortForwardCTZone
+	}
 	if len(fc.PortForwards) > 0 {
 		cfg.PortForwards = fc.PortForwards
 	}
@@ -677,6 +708,15 @@ func applyEnvConfig(cfg *Config) {
 		var id int
 		if _, err := fmt.Sscanf(v, "%d", &id); err == nil {
 			cfg.PortForwardTableID = id
+		}
+	}
+	if v := os.Getenv("OVN_NETWORK_PORT_FORWARD_L3MDEV_ACCEPT"); v == "1" || v == "true" {
+		cfg.PortForwardL3mdevAccept = true
+	}
+	if v := os.Getenv("OVN_NETWORK_PORT_FORWARD_CT_ZONE"); v != "" {
+		var zone int
+		if _, err := fmt.Sscanf(v, "%d", &zone); err == nil {
+			cfg.PortForwardCTZone = zone
 		}
 	}
 }

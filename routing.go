@@ -35,10 +35,12 @@ type RouteManager struct {
 	frrPrefixList string
 
 	// Port forwarding (DNAT) settings
-	portForwardEnabled bool
-	portForwardDev     string
-	portForwardTableID int
-	portForwards       []PortForwardVIP
+	portForwardEnabled      bool
+	portForwardDev          string
+	portForwardTableID      int
+	portForwardL3mdevAccept bool
+	portForwardCTZone       int
+	portForwards            []PortForwardVIP
 
 	// Cached OVS discovery results (populated on first use).
 	cachedPatchPort string
@@ -59,10 +61,12 @@ func NewRouteManager(cfg Config) *RouteManager {
 		vethLeakRulePriority: cfg.VethLeakRulePriority,
 		networkFilters:       cfg.NetworkFilters,
 		frrPrefixList:        cfg.FRRPrefixList,
-		portForwardEnabled:   cfg.PortForwardEnabled,
-		portForwardDev:       cfg.PortForwardDev,
-		portForwardTableID:   cfg.PortForwardTableID,
-		portForwards:         cfg.PortForwards,
+		portForwardEnabled:      cfg.PortForwardEnabled,
+		portForwardDev:          cfg.PortForwardDev,
+		portForwardTableID:      cfg.PortForwardTableID,
+		portForwardL3mdevAccept: cfg.PortForwardL3mdevAccept,
+		portForwardCTZone:       cfg.PortForwardCTZone,
+		portForwards:            cfg.PortForwards,
 	}
 	if cfg.OVSWrapper != "" {
 		rm.ovsWrapper = strings.Fields(cfg.OVSWrapper)

@@ -125,23 +125,46 @@ ovn_nb_remote: "tcp:10.10.0.1:6641,tcp:10.10.0.2:6641,tcp:10.10.0.3:6641"
 # Must differ from route_table_id and veth_leak_table_id.
 # port_forward_table_id: 201
 #
+# Conntrack zone for DNAT flows (default: 64000, range 1-65535).
+# Must not collide with OVN/OVS conntrack zones. OVN assigns zones
+# per logical datapath starting from low numbers. The high default
+# avoids collisions; only change if 64000 conflicts in your setup.
+# port_forward_ct_zone: 64000
+#
+# Enable udp/tcp_l3mdev_accept sysctl (default: false).
+# Required when a DNAT backend runs on the same host but in a different
+# VRF than the VIP (e.g. backend on loopback0 in default VRF, VIP on
+# loopback1 in provider VRF). This is a global sysctl that allows ALL
+# sockets to receive packets from any VRF — only enable when needed.
+# port_forward_l3mdev_accept: false
+#
 # port_forwards:
 #   - vip: "198.51.100.10"
 #     manage_vip: true         # agent adds/removes this VIP on port_forward_dev
-#     masquerade: false        # SNAT with outgoing interface IP (needed when backend is not on return path)
+#     masquerade: true         # VIP-level default: rules inherit unless overridden
 #     rules:
+#       # Local backend (same host): disable masquerade.
+#       # Replies use output_ctzone/output_fwmark chains.
+#       - proto: udp
+#         port: 53
+#         dest_addr: "10.0.0.200"
+#         dest_port: 1053                # port translation: VIP:53 -> 10.0.0.200:1053
+#         masquerade: false              # per-rule override: no SNAT for local backend
+#       - proto: tcp
+#         port: 53
+#         dest_addr: "10.0.0.200"
+#         dest_port: 1053
+#         masquerade: false
+#       # Remote backend (different host): inherits masquerade: true from VIP.
 #       - proto: tcp
 #         port: 80
 #         dest_addr: "10.0.0.100"       # single backend
 #       - proto: tcp
 #         port: 443
 #         dest_addr: "10.0.0.100"
-#       - proto: tcp
-#         port: 53
-#         dest_addr: "10.0.0.200"
-#         dest_port: 1053                # port translation: VIP:53 -> 10.0.0.200:1053
+#       # Multiple backends with sticky hashing:
 #       - proto: udp
-#         port: 53
+#         port: 5353
 #         dest_addrs:                    # multiple backends: sticky source-IP hashing
 #           - "10.0.0.200"
 #           - "10.0.0.201"

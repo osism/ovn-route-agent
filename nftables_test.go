@@ -21,24 +21,40 @@ func TestBuildNftRuleset(t *testing.T) {
 	}
 	_, provNet, _ := net.ParseCIDR("198.51.100.0/24")
 
-	result := buildNftRuleset(forwards, []*net.IPNet{provNet})
+	result := buildNftRuleset(forwards, []*net.IPNet{provNet}, dnatCTZoneDefault)
 
 	// Verify table structure
 	if !strings.Contains(result, "table ip ovn-network-agent {") {
 		t.Error("missing table declaration")
 	}
 
-	// Verify conntrack zone chain
+	// Verify conntrack zone chains (prerouting + output)
 	if !strings.Contains(result, "chain prerouting_ctzone") {
 		t.Error("missing prerouting_ctzone chain")
 	}
 	if !strings.Contains(result, "type filter hook prerouting priority raw") {
 		t.Error("ctzone chain must be raw priority (before conntrack)")
 	}
-	if !strings.Contains(result, "ip daddr 198.51.100.10 tcp dport 80 ct zone set 1") {
+	// Verify output_ctzone chain exists and has correct rules
+	outputCtzone := extractChain(result, "output_ctzone")
+	if outputCtzone == "" {
+		t.Fatal("missing output_ctzone chain (needed for same-host backends)")
+	}
+	if !strings.Contains(outputCtzone, "type filter hook output priority raw") {
+		t.Error("output ctzone chain must be raw priority")
+	}
+	if !strings.Contains(outputCtzone, "ip daddr 198.51.100.10 tcp dport 80 ct zone set 64000") {
+		t.Error("output_ctzone missing ctzone rule for original direction (VIP:80)")
+	}
+	if !strings.Contains(outputCtzone, "ip saddr 10.0.0.100 tcp sport 80 ct zone set 64000") {
+		t.Error("output_ctzone missing ctzone rule for reply direction (backend:80)")
+	}
+
+	// Also verify prerouting_ctzone has the same rules
+	if !strings.Contains(result, "ip daddr 198.51.100.10 tcp dport 80 ct zone set 64000") {
 		t.Error("missing ctzone rule for original direction (VIP:80)")
 	}
-	if !strings.Contains(result, "ip saddr 10.0.0.100 tcp sport 80 ct zone set 1") {
+	if !strings.Contains(result, "ip saddr 10.0.0.100 tcp sport 80 ct zone set 64000") {
 		t.Error("missing ctzone rule for reply direction (backend:80)")
 	}
 
@@ -50,7 +66,7 @@ func TestBuildNftRuleset(t *testing.T) {
 		t.Error("missing DNAT rule for port 53 with port translation")
 	}
 
-	// Verify fwmark chain marks DNAT'd packets (both directions)
+	// Verify fwmark chains mark DNAT'd packets (both directions)
 	if !strings.Contains(result, "chain prerouting_fwmark") {
 		t.Error("missing prerouting_fwmark chain")
 	}
@@ -59,6 +75,14 @@ func TestBuildNftRuleset(t *testing.T) {
 	}
 	if !strings.Contains(result, "ct direction reply ct status dnat ct original daddr 198.51.100.10 meta mark set 0x200") {
 		t.Error("missing reply fwmark rule for DNAT'd return packets")
+	}
+
+	// Verify output_fwmark chain for same-host backend replies
+	if !strings.Contains(result, "chain output_fwmark") {
+		t.Error("missing output_fwmark chain (needed for same-host backends)")
+	}
+	if !strings.Contains(result, "type route hook output priority filter") {
+		t.Error("output fwmark chain must be type route (triggers re-routing)")
 	}
 
 	// Verify guard chain allows provider network
@@ -94,7 +118,7 @@ func TestBuildNftRulesetMultipleVIPs(t *testing.T) {
 		},
 	}
 
-	result := buildNftRuleset(forwards, nil)
+	result := buildNftRuleset(forwards, nil, dnatCTZoneDefault)
 
 	if !strings.Contains(result, "ip daddr 198.51.100.10 tcp dport 80") {
 		t.Error("missing DNAT rule for first VIP")
@@ -113,6 +137,28 @@ func TestBuildNftRulesetMultipleVIPs(t *testing.T) {
 	if !strings.Contains(result, "ct direction reply ct status dnat ct original daddr { 198.51.100.10, 198.51.100.20 } meta mark set 0x200") {
 		t.Errorf("reply fwmark should use set syntax for multiple VIPs, got:\n%s", result)
 	}
+
+	// Verify output_fwmark uses set syntax for multiple VIPs
+	if !strings.Contains(result, "chain output_fwmark") {
+		t.Error("missing output_fwmark chain")
+	}
+	// Extract output_fwmark chain content and verify set syntax
+	outputFwmark := extractChain(result, "output_fwmark")
+	if !strings.Contains(outputFwmark, "ct direction reply ct status dnat ct original daddr { 198.51.100.10, 198.51.100.20 } meta mark set 0x200") {
+		t.Errorf("output_fwmark should use set syntax for multiple VIPs, got:\n%s", outputFwmark)
+	}
+
+	// Verify output_ctzone has rules for both VIPs
+	outputCtzone := extractChain(result, "output_ctzone")
+	if outputCtzone == "" {
+		t.Fatal("missing output_ctzone chain")
+	}
+	if !strings.Contains(outputCtzone, "ip daddr 198.51.100.10") {
+		t.Error("output_ctzone missing rules for first VIP")
+	}
+	if !strings.Contains(outputCtzone, "ip daddr 198.51.100.20") {
+		t.Error("output_ctzone missing rules for second VIP")
+	}
 }
 
 func TestBuildNftRulesetNoProviderNetworks(t *testing.T) {
@@ -125,7 +171,7 @@ func TestBuildNftRulesetNoProviderNetworks(t *testing.T) {
 		},
 	}
 
-	result := buildNftRuleset(forwards, nil)
+	result := buildNftRuleset(forwards, nil, dnatCTZoneDefault)
 
 	// Guard chain should not have provider network allow rule
 	if strings.Contains(result, "ip saddr {") {
@@ -148,7 +194,7 @@ func TestBuildNftRulesetDestPortDefault(t *testing.T) {
 		},
 	}
 
-	result := buildNftRuleset(forwards, nil)
+	result := buildNftRuleset(forwards, nil, dnatCTZoneDefault)
 
 	// dest_port=0 should use port as default
 	if !strings.Contains(result, "dnat to 10.0.0.100:80") {
@@ -167,7 +213,7 @@ func TestBuildNftRulesetSamePortDifferentProto(t *testing.T) {
 		},
 	}
 
-	result := buildNftRuleset(forwards, nil)
+	result := buildNftRuleset(forwards, nil, dnatCTZoneDefault)
 
 	if !strings.Contains(result, "tcp dport 53 dnat to 10.0.0.200:1053") {
 		t.Error("missing TCP DNAT rule for port 53")
@@ -187,7 +233,7 @@ func TestBuildNftRulesetMultipleProviderNetworks(t *testing.T) {
 	_, net1, _ := net.ParseCIDR("198.51.100.0/24")
 	_, net2, _ := net.ParseCIDR("203.0.113.0/24")
 
-	result := buildNftRuleset(forwards, []*net.IPNet{net1, net2})
+	result := buildNftRuleset(forwards, []*net.IPNet{net1, net2}, dnatCTZoneDefault)
 
 	if !strings.Contains(result, "198.51.100.0/24, 203.0.113.0/24") {
 		t.Errorf("guard chain should contain both provider networks, got:\n%s", result)
@@ -202,7 +248,7 @@ func TestBuildNftRulesetMaxPort(t *testing.T) {
 		},
 	}
 
-	result := buildNftRuleset(forwards, nil)
+	result := buildNftRuleset(forwards, nil, dnatCTZoneDefault)
 
 	if !strings.Contains(result, "tcp dport 65535 dnat to 10.0.0.100:65535") {
 		t.Error("missing rule for max port 65535")
@@ -226,22 +272,88 @@ func TestBuildNftRulesetMasquerade(t *testing.T) {
 		},
 	}
 
-	result := buildNftRuleset(forwards, nil)
+	result := buildNftRuleset(forwards, nil, dnatCTZoneDefault)
 
-	// Should have postrouting SNAT chain
+	// Should have postrouting SNAT chain (VIP-level masquerade inherits to rules)
 	if !strings.Contains(result, "chain postrouting_snat") {
 		t.Fatal("missing postrouting_snat chain")
 	}
 	if !strings.Contains(result, "type nat hook postrouting priority srcnat") {
 		t.Error("missing srcnat hook in SNAT chain")
 	}
-	// Only masquerade-enabled VIP should get a masquerade rule
-	if !strings.Contains(result, "ct status dnat ct original daddr 198.51.100.10 masquerade") {
-		t.Errorf("missing masquerade rule for masquerade-enabled VIP, got:\n%s", result)
+	// Per-backend masquerade rule for the masquerade-enabled VIP's backend
+	if !strings.Contains(result, "ip daddr 10.0.0.100 tcp dport 443 ct status dnat masquerade") {
+		t.Errorf("missing per-backend masquerade rule, got:\n%s", result)
 	}
-	// Non-masquerade VIP should NOT have a masquerade rule
-	if strings.Contains(result, "198.51.100.20 masquerade") {
-		t.Error("non-masquerade VIP should not have masquerade rule")
+	// Non-masquerade VIP's backend should NOT have a masquerade rule
+	if strings.Contains(result, "10.0.0.200") && strings.Contains(result, "masquerade") {
+		snat := extractChain(result, "postrouting_snat")
+		if strings.Contains(snat, "10.0.0.200") {
+			t.Error("non-masquerade VIP's backend should not have masquerade rule")
+		}
+	}
+}
+
+func TestBuildNftRulesetPerRuleMasquerade(t *testing.T) {
+	// Mirrors the real-world scenario: one VIP with both local and remote
+	// backends. Local backends (DNS → same host) must NOT be masqueraded,
+	// remote backends (HTTP → different host) MUST be masqueraded.
+	masqTrue := true
+	masqFalse := false
+	forwards := []PortForwardVIP{
+		{
+			VIP:        "194.93.78.239",
+			ManageVIP:  true,
+			Masquerade: true, // VIP-level default
+			Rules: []PortForwardRule{
+				// Local backend: override masquerade to false
+				{Proto: "udp", Port: 53, DestAddr: "10.1.8.32", DestPort: 1053, Masquerade: &masqFalse},
+				{Proto: "tcp", Port: 53, DestAddr: "10.1.8.32", DestPort: 1053, Masquerade: &masqFalse},
+				// Remote backends: inherit VIP masquerade (true)
+				{Proto: "tcp", Port: 80, DestAddr: "10.1.8.226"},
+				{Proto: "tcp", Port: 443, DestAddr: "10.1.8.226"},
+				// Explicit true also works
+				{Proto: "tcp", Port: 8080, DestAddr: "10.1.8.227", Masquerade: &masqTrue},
+			},
+		},
+	}
+
+	result := buildNftRuleset(forwards, nil, dnatCTZoneDefault)
+	snat := extractChain(result, "postrouting_snat")
+	if snat == "" {
+		t.Fatal("missing postrouting_snat chain")
+	}
+
+	// Remote backends should have masquerade rules
+	if !strings.Contains(snat, "ip daddr 10.1.8.226 tcp dport 80 ct status dnat masquerade") {
+		t.Errorf("missing masquerade for remote backend :80, got:\n%s", snat)
+	}
+	if !strings.Contains(snat, "ip daddr 10.1.8.226 tcp dport 443 ct status dnat masquerade") {
+		t.Errorf("missing masquerade for remote backend :443, got:\n%s", snat)
+	}
+	if !strings.Contains(snat, "ip daddr 10.1.8.227 tcp dport 8080 ct status dnat masquerade") {
+		t.Errorf("missing masquerade for explicit-true backend, got:\n%s", snat)
+	}
+
+	// Local backends must NOT have masquerade rules
+	if strings.Contains(snat, "10.1.8.32") {
+		t.Errorf("local backend 10.1.8.32 must NOT be masqueraded, got:\n%s", snat)
+	}
+
+	// Verify DNAT rules exist for ALL backends (local and remote)
+	if !strings.Contains(result, "dnat to 10.1.8.32:1053") {
+		t.Error("missing DNAT rule for local backend")
+	}
+	if !strings.Contains(result, "dnat to 10.1.8.226:80") {
+		t.Error("missing DNAT rule for remote backend :80")
+	}
+
+	// Verify output chains exist (needed for local backend)
+	if !strings.Contains(result, "chain output_ctzone") {
+		t.Error("missing output_ctzone chain")
+	}
+	if !strings.Contains(result, "chain output_fwmark") {
+		t.Error("missing output_fwmark chain")
 	}
 }
 
@@ -255,7 +367,7 @@ func TestBuildNftRulesetNoMasquerade(t *testing.T) {
 		},
 	}
 
-	result := buildNftRuleset(forwards, nil)
+	result := buildNftRuleset(forwards, nil, dnatCTZoneDefault)
 
 	// Should NOT have postrouting SNAT chain
 	if strings.Contains(result, "postrouting_snat") {
@@ -273,7 +385,7 @@ func TestBuildNftRulesetMultiBackend(t *testing.T) {
 		},
 	}
 
-	result := buildNftRuleset(forwards, nil)
+	result := buildNftRuleset(forwards, nil, dnatCTZoneDefault)
 
 	// Verify jhash-based DNAT rule
 	expected := "ip daddr 198.51.100.10 udp dport 53 dnat to jhash ip saddr mod 3 map { 0 : 10.0.0.200:1053, 1 : 10.0.0.201:1053, 2 : 10.0.0.202:1053 }"
@@ -283,7 +395,7 @@ func TestBuildNftRulesetMultiBackend(t *testing.T) {
 
 	// Verify conntrack zone entries for ALL backends
 	for _, addr := range []string{"10.0.0.200", "10.0.0.201", "10.0.0.202"} {
-		ct := fmt.Sprintf("ip saddr %s udp sport 1053 ct zone set 1", addr)
+		ct := fmt.Sprintf("ip saddr %s udp sport 1053 ct zone set 64000", addr)
 		if !strings.Contains(result, ct) {
 			t.Errorf("missing ctzone rule for backend %s", addr)
 		}
@@ -300,7 +412,7 @@ func TestBuildNftRulesetMultiBackendTwoBackends(t *testing.T) {
 		},
 	}
 
-	result := buildNftRuleset(forwards, nil)
+	result := buildNftRuleset(forwards, nil, dnatCTZoneDefault)
 
 	// With two backends, jhash mod 2
 	expected := "ip daddr 198.51.100.10 tcp dport 443 dnat to jhash ip saddr mod 2 map { 0 : 10.0.0.100:443, 1 : 10.0.0.101:443 }"
@@ -320,7 +432,7 @@ func TestBuildNftRulesetSingleElementDestAddrs(t *testing.T) {
 		},
 	}
 
-	result := buildNftRuleset(forwards, nil)
+	result := buildNftRuleset(forwards, nil, dnatCTZoneDefault)
 
 	if !strings.Contains(result, "ip daddr 198.51.100.10 tcp dport 80 dnat to 10.0.0.100:80") {
 		t.Error("single-element dest_addrs should produce direct DNAT")
@@ -343,7 +455,7 @@ func TestBuildNftRulesetMixedSingleAndMultiBackend(t *testing.T) {
 		},
 	}
 
-	result := buildNftRuleset(forwards, nil)
+	result := buildNftRuleset(forwards, nil, dnatCTZoneDefault)
 
 	// Single backend → direct DNAT
 	if !strings.Contains(result, "ip daddr 198.51.100.10 tcp dport 443 dnat to 10.0.0.100:443") {
@@ -354,5 +466,138 @@ func TestBuildNftRulesetMixedSingleAndMultiBackend(t *testing.T) {
 	if !strings.Contains(result, "jhash ip saddr mod 2 map") {
 		t.Error("multi-backend rule should use jhash")
 	}
+}
+
+func TestBuildNftRulesetHairpinMasquerade(t *testing.T) {
+	_, provNet, _ := net.ParseCIDR("5.182.234.0/24")
+	forwards := []PortForwardVIP{
+		{
+			VIP:               "194.93.78.239",
+			ManageVIP:         true,
+			HairpinMasquerade: true,
+			Rules: []PortForwardRule{
+				{Proto: "tcp", Port: 80, DestAddr: "10.1.8.226"},
+				{Proto: "tcp", Port: 443, DestAddr: "10.1.8.226"},
+			},
+		},
+	}
+
+	result := buildNftRuleset(forwards, []*net.IPNet{provNet}, dnatCTZoneDefault)
+
+	snat := extractChain(result, "postrouting_snat")
+	if snat == "" {
+		t.Fatal("missing postrouting_snat chain (needed for hairpin masquerade)")
+	}
+
+	// Hairpin masquerade rule: source from provider net, original dest is VIP
+	expected := "ip saddr 5.182.234.0/24 ct original daddr 194.93.78.239 ct status dnat masquerade"
+	if !strings.Contains(snat, expected) {
+		t.Errorf("missing hairpin masquerade rule.\nwant: %s\ngot:\n%s", expected, snat)
+	}
+
+	// Must NOT masquerade all traffic (no per-backend rules since masquerade: false)
+	if strings.Contains(snat, "ip daddr 10.1.8.226") {
+		t.Errorf("hairpin_masquerade must not emit per-backend rules, got:\n%s", snat)
+	}
+}
+
+func TestBuildNftRulesetHairpinMasqueradeMultipleProviderNets(t *testing.T) {
+	_, net1, _ := net.ParseCIDR("5.182.234.0/24")
+	_, net2, _ := net.ParseCIDR("203.0.113.0/24")
+	forwards := []PortForwardVIP{
+		{
+			VIP:               "194.93.78.239",
+			HairpinMasquerade: true,
+			Rules:             []PortForwardRule{{Proto: "tcp", Port: 80, DestAddr: "10.1.8.226"}},
+		},
+	}
+
+	result := buildNftRuleset(forwards, []*net.IPNet{net1, net2}, dnatCTZoneDefault)
+
+	snat := extractChain(result, "postrouting_snat")
+	if snat == "" {
+		t.Fatal("missing postrouting_snat chain")
+	}
+
+	expected := "ip saddr { 5.182.234.0/24, 203.0.113.0/24 } ct original daddr 194.93.78.239 ct status dnat masquerade"
+	if !strings.Contains(snat, expected) {
+		t.Errorf("missing hairpin masquerade rule with set syntax.\nwant: %s\ngot:\n%s", expected, snat)
+	}
+}
+
+func TestBuildNftRulesetHairpinMasqueradeWithoutProviderNets(t *testing.T) {
+	// hairpin_masquerade: true but no provider networks known yet (initial setup).
+	// The SNAT chain must NOT be emitted to avoid matching all traffic.
+	forwards := []PortForwardVIP{
+		{
+			VIP:               "194.93.78.239",
+			HairpinMasquerade: true,
+			Rules:             []PortForwardRule{{Proto: "tcp", Port: 80, DestAddr: "10.1.8.226"}},
+		},
+	}
+
+	result := buildNftRuleset(forwards, nil, dnatCTZoneDefault)
+
+	if strings.Contains(result, "postrouting_snat") {
+		t.Error("postrouting_snat must not be emitted when provider networks are unknown")
+	}
+}
+
+func TestBuildNftRulesetHairpinAndPerRuleMasqueradeCombined(t *testing.T) {
+	// VIP with both hairpin_masquerade and per-rule masquerade for a remote backend.
+	// Both rules should coexist in postrouting_snat.
+	masqTrue := true
+	_, provNet, _ := net.ParseCIDR("5.182.234.0/24")
+	forwards := []PortForwardVIP{
+		{
+			VIP:               "194.93.78.239",
+			HairpinMasquerade: true,
+			Rules: []PortForwardRule{
+				{Proto: "tcp", Port: 80, DestAddr: "10.1.8.226", Masquerade: &masqTrue},
+			},
+		},
+	}
+
+	result := buildNftRuleset(forwards, []*net.IPNet{provNet}, dnatCTZoneDefault)
+
+	snat := extractChain(result, "postrouting_snat")
+	if snat == "" {
+		t.Fatal("missing postrouting_snat chain")
+	}
+
+	// Per-backend masquerade rule (masquerade: true on rule)
+	if !strings.Contains(snat, "ip daddr 10.1.8.226 tcp dport 80 ct status dnat masquerade") {
+		t.Errorf("missing per-backend masquerade rule, got:\n%s", snat)
+	}
+
+	// Hairpin masquerade rule (hairpin_masquerade: true on VIP)
+	if !strings.Contains(snat, "ip saddr 5.182.234.0/24 ct original daddr 194.93.78.239 ct status dnat masquerade") {
+		t.Errorf("missing hairpin masquerade rule, got:\n%s", snat)
+	}
+}
+
+// extractChain returns the text between "chain <name> {" and its matching "}".
+// Handles nested braces from nftables set syntax (e.g. "{ VIP1, VIP2 }").
+// Returns empty string if the chain is not found.
+func extractChain(ruleset, name string) string {
+	marker := "chain " + name + " {"
+	start := strings.Index(ruleset, marker)
+	if start == -1 {
+		return ""
+	}
+	rest := ruleset[start+len(marker):]
+	depth := 1
+	for i, ch := range rest {
+		switch ch {
+		case '{':
+			depth++
+		case '}':
+			depth--
+			if depth == 0 {
+				return rest[:i]
+			}
+		}
+	}
+	return ""
 }
 

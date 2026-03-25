@@ -342,6 +342,35 @@ func TestNewRouteManagerPortForward(t *testing.T) {
 	if len(rm.portForwards) != 1 {
 		t.Errorf("len(portForwards) = %d, want 1", len(rm.portForwards))
 	}
+	if rm.portForwardL3mdevAccept {
+		t.Error("portForwardL3mdevAccept should default to false")
+	}
+}
+
+func TestNewRouteManagerPortForwardL3mdevAccept(t *testing.T) {
+	cfg := Config{
+		BridgeDev:               "br-ex",
+		VRFName:                 "vrf-provider",
+		VethNexthop:             "169.254.0.1",
+		PortForwardEnabled:      true,
+		PortForwardDev:          "loopback1",
+		PortForwardTableID:      202,
+		PortForwardL3mdevAccept: true,
+		PortForwards: []PortForwardVIP{
+			{
+				VIP:       "198.51.100.10",
+				ManageVIP: true,
+				Rules: []PortForwardRule{
+					{Proto: "tcp", Port: 80, DestAddr: "10.0.0.100"},
+				},
+			},
+		},
+	}
+	rm := NewRouteManager(cfg)
+
+	if !rm.portForwardL3mdevAccept {
+		t.Error("portForwardL3mdevAccept should be true when explicitly set")
+	}
 }
 
 func TestDryRunPortForward(t *testing.T) {

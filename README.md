@@ -21,7 +21,7 @@ The agent monitors the OVN Southbound and Northbound databases and performs targ
    - Ensures `/32` **kernel routes** (with IP rules when using a dedicated routing table) and **FRR static routes** in the VRF for each FIP/SNAT IP
    - If configured, reconciles the **FRR prefix-list** with `permit <network> ge 32 le 32` entries for each discovered provider network
    - If no routers are locally active: removes all managed routes
-5. **Port forwarding (DNAT)** — optionally forwards traffic from anycast VIP addresses (on a loopback interface in the VRF) to internal backends. Supports multiple backends per rule with sticky source-IP hashing (`jhash`) for consistent client-to-backend mapping. Client IPs are preserved using connmark-based return routing through the veth pair. A `forward_veth_guard` nftables chain restricts the veth return path to legitimate traffic only. Requires `nft` binary and `veth_leak_enabled: true`.
+5. **Port forwarding (DNAT)** — optionally forwards traffic from anycast VIP addresses (on a loopback interface in the VRF) to internal backends. Supports multiple backends per rule with sticky source-IP hashing (`jhash`) for consistent client-to-backend mapping. Client IPs are preserved using connmark-based return routing through the veth pair. Backends on the same host are handled via dedicated OUTPUT chains (`output_ctzone`, `output_fwmark`) since locally-delivered traffic bypasses the FORWARD/POSTROUTING path. Per-rule `masquerade` control allows mixing local and remote backends on the same VIP. Hairpin masquerade (`hairpin_masquerade: true`) solves the hairpin NAT problem where FIPs on the same node try to connect to a port-forwarded VIP — only source-masquerades traffic from provider networks, leaving external clients unaffected. A `forward_veth_guard` nftables chain restricts the veth return path to legitimate traffic only. Requires `nft` binary and `veth_leak_enabled: true`.
 6. **Reconciles** periodically as a safety net (default: every 60s)
 7. **Detects stale chassis** — when a node dies without graceful shutdown, surviving agents detect its chassis disappearing from the SB Chassis table and clean up its managed OVN NB entries (static routes and MAC bindings) after a configurable grace period (default: 5m, configurable via `stale_chassis_grace_period`, set to `0` to disable). Random jitter (0-30s) prevents multiple agents from cleaning up simultaneously.
 8. **Drains gateways** on shutdown (SIGINT/SIGTERM) — before cleanup, the agent lowers its `Gateway_Chassis` priority to 0 in OVN NB, causing `ovn-northd` to migrate chassisredirect ports to standby chassis (priority >= 1). On the next startup, drained entries are restored to priority 1 (standby level). The active chassis automatically maintains a minimum priority of 2 (above all possible standby peers) during reconciliation, preventing reverse failover even when a peer restores to priority 1. This eliminates the traffic disruption window between BGP route withdrawal and OVN BFD failover detection (see [Gateway drain mode](#gateway-drain-mode)). Enabled by default (`drain_on_shutdown: true`, `drain_timeout: 60s`).
@@ -118,6 +118,8 @@ CLI flags take precedence over values in the config file.
 | `--veth-leak-rule-priority` | `OVN_NETWORK_VETH_LEAK_RULE_PRIORITY` | `veth_leak_rule_priority` | `2000` | Policy rule priority for veth leak rules |
 | `--port-forward-dev` | `OVN_NETWORK_PORT_FORWARD_DEV` | `port_forward_dev` | `loopback1` | Loopback device for VIP addresses in VRF |
 | `--port-forward-table-id` | `OVN_NETWORK_PORT_FORWARD_TABLE_ID` | `port_forward_table_id` | `201` | Routing table for DNAT return traffic (1-252, must differ from `route_table_id` and `veth_leak_table_id`) |
+| `--port-forward-ct-zone` | `OVN_NETWORK_PORT_FORWARD_CT_ZONE` | `port_forward_ct_zone` | `64000` | Conntrack zone for DNAT flows (1-65535, must not collide with OVN zones) |
+| `--port-forward-l3mdev-accept` | `OVN_NETWORK_PORT_FORWARD_L3MDEV_ACCEPT` | `port_forward_l3mdev_accept` | `false` | Set `udp/tcp_l3mdev_accept=1` for cross-VRF same-host DNAT backends |
 | — | — | `port_forwards` | *(empty)* | List of VIPs with DNAT rules (YAML only, see [sample config](ovn-network-agent.yaml.sample)) |
 | `--version` | — | — | — | Print version and exit |
 
@@ -318,9 +320,9 @@ The naive fix would be SNAT/masquerade, which rewrites the source to the VIP add
 
 ### Solution: connmark-based return routing
 
-The agent uses nftables with connection tracking marks (connmarks) to steer DNAT return traffic through the veth pair into `vrf-provider` — without masquerade, preserving the original client IP end-to-end. For cases where the return path cannot work without source NAT (e.g. backend on a different network segment), per-VIP masquerade can be enabled as an opt-in escape hatch via `masquerade: true`.
+The agent uses nftables with connection tracking marks (connmarks) to steer DNAT return traffic through the veth pair into `vrf-provider` — without masquerade, preserving the original client IP end-to-end. For remote backends (different network segment, reply must return to this node), per-rule masquerade can be enabled via `masquerade: true` on individual rules or inherited from the VIP level. Local backends (same host) must NOT be masqueraded — their replies are handled by dedicated OUTPUT chains instead.
 
-The mechanism works in three stages:
+The mechanism works in six stages (the first four handle remote backends, stages 5-6 add same-host backend support):
 
 **1. DNAT (prerouting)** — Translates the destination for incoming traffic:
 
@@ -335,14 +337,14 @@ ip daddr 198.51.100.10 udp dport 53 dnat to jhash ip saddr mod 3 map { \
 
 Traffic arriving at the VIP is rewritten to the internal backend address. If `dest_port` is configured, port translation also occurs (e.g. public port 53 → backend port 1053). When multiple backends are configured via `dest_addrs`, a Jenkins hash on the client source IP distributes traffic with sticky affinity (see [Sticky load balancing](#sticky-load-balancing-multi-backend)).
 
-**2. Conntrack zone assignment (prerouting_ctzone, raw priority)** — Assigns a shared conntrack zone before conntrack processing. This is critical because DNAT'd traffic crosses VRF boundaries (original enters on the provider VRF, reply enters on the default VRF). Without a shared zone, conntrack cannot correlate them and reverse NAT fails silently:
+**2. Conntrack zone assignment (prerouting_ctzone, raw priority)** — Assigns a shared conntrack zone before conntrack processing. This is critical because DNAT'd traffic crosses VRF boundaries (original enters on the provider VRF, reply enters on the default VRF). Without a shared zone, conntrack cannot correlate them and reverse NAT fails silently. The zone number defaults to 64000 (configurable via `port_forward_ct_zone`) to avoid collisions with OVN/OVS conntrack zones:
 
 ```
 # Original direction: client → VIP:port
-ip daddr 198.51.100.10 tcp dport 53 ct zone set 1
+ip daddr 198.51.100.10 tcp dport 53 ct zone set 64000
 
 # Reply direction: backend:port → client
-ip saddr 10.0.0.200 tcp sport 1053 ct zone set 1
+ip saddr 10.0.0.200 tcp sport 1053 ct zone set 64000
 ```
 
 **3. Fwmark tagging (prerouting_fwmark, filter priority)** — Marks DNAT'd packets with direction-specific fwmarks for policy routing. Two marks steer traffic into different routing tables:
@@ -357,7 +359,21 @@ ct direction original ct status dnat ct original daddr { 198.51.100.10 } meta ma
 ct direction reply ct status dnat ct original daddr { 198.51.100.10 } meta mark set 0x200
 ```
 
-**4. Policy routing** — Two fwmark-based `ip rule` entries steer DNAT'd traffic bidirectionally:
+**4. Same-host conntrack zone (output_ctzone, raw priority)** — Mirrors `prerouting_ctzone` for the OUTPUT hook. When a DNAT backend runs on the same host, the packet is delivered locally (INPUT chain, not FORWARD). The reply from the local process (e.g. docker-proxy) originates in OUTPUT, not PREROUTING. Without this chain, conntrack cannot find the DNAT entry (wrong zone) and reverse NAT fails:
+
+```
+# Same rules as prerouting_ctzone, but in the output hook:
+ip daddr 198.51.100.10 tcp dport 53 ct zone set 64000
+ip saddr 10.0.0.200 tcp sport 1053 ct zone set 64000
+```
+
+**5. Same-host fwmark (output_fwmark, type route)** — Mirrors the reply-direction mark from `prerouting_fwmark` for locally generated replies. Uses `type route` so the mark change triggers a routing re-evaluation, steering the reply through the veth pair back into `vrf-provider`:
+
+```
+ct direction reply ct status dnat ct original daddr { 198.51.100.10 } meta mark set 0x200
+```
+
+**6. Policy routing** — Two fwmark-based `ip rule` entries steer DNAT'd traffic bidirectionally:
 
 ```
 ip rule: fwmark 0x100 → lookup main       (priority 150, original direction)
@@ -369,15 +385,37 @@ The forward rule escapes the VRF so packets reach the backend. The reply rule se
 
 A `postrouting_fwmark_clear` chain clears the `0x200` fwmark before packets cross the veth pair, preventing a routing loop where the mark would match again inside the provider VRF.
 
+**7. Per-rule masquerade (postrouting_snat, optional)** — When `masquerade: true` is set on a rule (or inherited from the VIP), SNAT is applied to traffic going to that specific backend. The masquerade rule matches on the post-DNAT destination address, so only remote backends are affected:
+
+```
+# Only masquerades traffic to remote backend 10.0.0.100, not to local backends
+ip daddr 10.0.0.100 tcp dport 443 ct status dnat masquerade
+```
+
+This per-backend granularity is essential when a VIP has both local and remote backends: local backends must NOT be masqueraded (their replies are handled by the output chains), while remote backends MUST be masqueraded so replies return to this node for reverse NAT.
+
+**8. Hairpin masquerade (postrouting_snat, optional)** — When `hairpin_masquerade: true` is set on a VIP, SNAT is applied **only to traffic whose source is within a provider network**. This solves the hairpin NAT problem: a VM with a Floating IP (FIP) on the same node that connects to the VIP gets its source address masqueraded, so the backend always replies through this node and conntrack can perform the reverse DNAT. Traffic from external clients (source outside provider networks) is never masqueraded — their client IPs are preserved end-to-end.
+
+The hairpin masquerade rule uses `ct original daddr` to match the pre-DNAT destination (the VIP), ensuring only traffic belonging to connections that were originally destined for this specific VIP is affected:
+
+```
+# Traffic from provider net → VIP, DNAT'd: masquerade so backend replies here
+ip saddr 5.182.234.0/24 ct original daddr 194.93.78.239 ct status dnat masquerade
+```
+
+Unlike the VIP-level `masquerade: true` (which masquerades ALL traffic), hairpin masquerade is source-selective. It can be combined with per-rule `masquerade` on the same VIP — both rules coexist in `postrouting_snat`. The rules are only generated when provider networks are known; if the agent starts before OVN has delivered network discovery, they appear on the first reconciliation cycle.
+
 ### Why conntrack-based fwmark instead of simpler alternatives?
 
 | Approach | Client IP preserved? | Problem |
 |----------|---------------------|---------|
-| SNAT/masquerade | No | Backend sees VIP as source, not the real client |
+| SNAT/masquerade (global) | No | Backend sees VIP as source, not the real client |
 | Source-based routing (`ip rule from <backend>`) | Yes | Catches **all** traffic from the backend, not just DNAT replies — breaks normal connectivity |
 | Conntrack + fwmark | Yes | Only marks packets belonging to DNAT'd connections — surgical, no side effects |
+| Conntrack + fwmark + per-rule masquerade | Depends | Best of both: client IP preserved for local backends, masquerade only where needed (remote backends) |
+| Conntrack + fwmark + hairpin masquerade | Depends | Client IP preserved for external clients; source-selective SNAT fixes hairpin for FIPs on the same node |
 
-The conntrack-based approach is the only one that selectively routes just the DNAT return traffic without affecting any other traffic from the backend. It uses `ct status dnat` and `ct direction` to identify packets belonging to DNAT'd connections and assigns direction-specific fwmarks for policy routing.
+The conntrack-based approach selectively routes just the DNAT return traffic without affecting any other traffic from the backend. It uses `ct status dnat` and `ct direction` to identify packets belonging to DNAT'd connections and assigns direction-specific fwmarks for policy routing. Per-rule masquerade adds surgical SNAT only for remote backends that need it, while local backends (same host) use the OUTPUT chains for return routing with the original client IP preserved. Hairpin masquerade adds a further refinement: source-selective SNAT only for provider-network traffic, solving the asymmetric routing that occurs when a FIP on the same node connects to the VIP.
 
 ### The `forward_veth_guard` chain
 
@@ -434,7 +472,7 @@ When `manage_vip: false`, the VIP address must already exist on the interface (e
  │  veth-default (169.254.0.1/30)        Default VRF            │
  │                                                              │
  │  nft prerouting_ctzone:                                      │
- │  ├─ ct zone set 1 (shared zone for cross-VRF conntrack)      │
+ │  ├─ ct zone set 64000 (shared zone for cross-VRF conntrack)  │
  │  nft prerouting_dnat:                                        │
  │  ├─ DNAT 198.51.100.10:53 → 10.0.0.200:1053                  │
  │  nft prerouting_fwmark:                                      │
@@ -446,18 +484,57 @@ When `manage_vip: false`, the VIP address must already exist on the interface (e
  └──────────────────────────────────────────────────────────────┘
 ```
 
-#### Return path (backend → external client)
+#### Return path — remote backend (backend → external client)
+
+When the backend is on a different host, the reply arrives via the network and enters PREROUTING:
 
 ```
  ┌──────────────────────────────────────────────────────────────┐
  │                        Default VRF                           │
  │                                                              │
- │  Backend replies:                                            │
+ │  Remote backend replies (arrives via network):               │
  │  └─ src=10.0.0.200:1053  dst=203.0.113.50                    │
  │  nft prerouting_fwmark (reply direction):                    │
  │  ├─ ct direction reply + ct status dnat → fwmark 0x200       │
  │  Conntrack un-DNATs source address:                          │
  │  ├─ src becomes 198.51.100.10:53                             │
+ │  ip rule: fwmark 0x200 → lookup table 201                    │
+ │  └─ table 201: default via 169.254.0.2 dev veth-default      │
+ │  nft postrouting_fwmark_clear:                               │
+ │  ├─ clears fwmark 0x200 before crossing veth (prevents loop) │
+ │                                                              │
+ │  veth-default (169.254.0.1/30)                               │
+ └──────────────┬───────────────────────────────────────────────┘
+                │ veth pair
+ ┌──────────────▼───────────────────────────────────────────────┐
+ │                       vrf-provider                           │
+ │  veth-provider (169.254.0.2/30)                              │
+ │                                                              │
+ │  FRR/BGP delivers reply to external client                   │
+ │  └─ src=198.51.100.10:53  dst=203.0.113.50                   │
+ └──────────────┬───────────────────────────────────────────────┘
+                │
+                ▼
+         External client
+         (client IP preserved end-to-end)
+```
+
+#### Return path — same-host backend (local process → external client)
+
+When the backend runs on the same node, the forward packet is delivered locally (INPUT chain), and the reply originates from the OUTPUT hook. The `output_ctzone` and `output_fwmark` chains handle this path:
+
+```
+ ┌──────────────────────────────────────────────────────────────┐
+ │                        Default VRF                           │
+ │                                                              │
+ │  Local backend replies (OUTPUT hook, not PREROUTING):        │
+ │  └─ src=10.0.0.200:1053  dst=203.0.113.50                    │
+ │  nft output_ctzone (raw priority):                           │
+ │  ├─ ct zone set 64000 (same zone as prerouting_ctzone)       │
+ │  Conntrack finds DNAT entry in zone 64000, un-DNATs:         │
+ │  ├─ src becomes 198.51.100.10:53                             │
+ │  nft output_fwmark (type route → triggers re-routing):       │
+ │  ├─ ct direction reply + ct status dnat → fwmark 0x200       │
  │  ip rule: fwmark 0x200 → lookup table 201                    │
  │  └─ table 201: default via 169.254.0.2 dev veth-default      │
  │  nft postrouting_fwmark_clear:                               │
@@ -491,25 +568,52 @@ When `manage_vip: false`, the VIP address must already exist on the interface (e
 ```yaml
 port_forward_dev: "loopback1"   # VIP addresses go on this interface in vrf-provider
 port_forward_table_id: 201      # dedicated routing table for DNAT return traffic
+# port_forward_ct_zone: 64000   # conntrack zone (default 64000, must not collide with OVN zones)
+# port_forward_l3mdev_accept: false  # set true if same-host backends are in a different VRF than the VIP
 
 port_forwards:
   - vip: "198.51.100.10"
     manage_vip: true             # agent adds 198.51.100.10/32 to loopback1
+    masquerade: true             # VIP-level default: rules inherit this unless overridden
     rules:
+      # Local backend (same host): override masquerade to false.
+      # Reply is handled by output_ctzone/output_fwmark chains.
       - proto: udp
-        port: 53                 # public port
-        dest_addrs:              # multiple backends: sticky source-IP hashing
+        port: 53
+        dest_addr: "10.0.0.200"
+        dest_port: 1053
+        masquerade: false
+      - proto: tcp
+        port: 53
+        dest_addr: "10.0.0.200"
+        dest_port: 1053
+        masquerade: false
+      # Remote backend (different host): inherits masquerade: true from VIP.
+      # SNAT ensures replies return to this node for reverse NAT.
+      - proto: tcp
+        port: 443
+        dest_addr: "10.0.0.100"
+      # Multiple backends with sticky hashing:
+      - proto: udp
+        port: 5353
+        dest_addrs:
           - "10.0.0.200"
           - "10.0.0.201"
           - "10.0.0.202"
-        dest_port: 1053          # backend port (port translation)
-      - proto: tcp
-        port: 53
-        dest_addr: "10.0.0.200"  # single backend: direct DNAT
         dest_port: 1053
+
+  # VIP with hairpin_masquerade: fixes connections from FIPs on the same node.
+  # External clients are NOT masqueraded (client IP preserved end-to-end).
+  - vip: "198.51.100.20"
+    manage_vip: true
+    hairpin_masquerade: true     # SNAT only for source IPs within provider networks
+    rules:
+      - proto: tcp
+        port: 80
+        dest_addr: "10.0.0.100"
       - proto: tcp
         port: 443
-        dest_addr: "10.0.0.100"  # dest_port omitted → same as port (443)
+        dest_addr: "10.0.0.100"
 ```
 
 ### Sticky load balancing (multi-backend)
@@ -536,6 +640,31 @@ ip daddr 198.51.100.10 udp dport 53 dnat to jhash ip saddr mod 3 map { \
 - Not a consistent hash (like Maglev or ketama): when a backend is added or removed, `mod N` changes and approximately `(N-1)/N` of clients may be remapped. For DNS stickiness this is acceptable in practice.
 - `dest_addr` (single) and `dest_addrs` (list) are mutually exclusive per rule. Use `dest_addr` for single-backend rules and `dest_addrs` for multi-backend.
 - Maximum 256 backends per rule.
+
+### Hairpin NAT
+
+**The problem:** A VM with a Floating IP (FIP) in the provider network (e.g. `5.182.234.153`) tries to reach a port-forwarded VIP (e.g. `194.93.78.239`) on the same node. ICMP to the VIP succeeds because the VIP address is local (`loopback1`) and the kernel responds directly — DNAT is never involved. TCP connections time out because:
+
+1. The VM's packet is DNAT'd: `src=5.182.234.153 dst=194.93.78.239:80` → `dst=backend_ip:80`
+2. The backend replies to `5.182.234.153` directly — but without SNAT the reply may not return through this node (asymmetric routing), so conntrack never sees it and the reverse DNAT fails silently
+
+**The fix:** Enable `hairpin_masquerade: true` on the VIP. The agent adds a source-selective SNAT rule that masquerades only traffic from provider networks:
+
+```
+# nftables postrouting_snat chain (generated when hairpin_masquerade: true)
+ip saddr 5.182.234.0/24 ct original daddr 194.93.78.239 ct status dnat masquerade
+```
+
+With this rule active:
+1. The backend receives the packet with `src=<node-control-plane-IP>` instead of the FIP
+2. The backend replies to the node's control-plane IP (always reachable)
+3. Conntrack reverses both SNAT and DNAT: the VM receives the reply from `194.93.78.239`
+
+External clients (source outside provider networks) are unaffected — their IPs are still preserved end-to-end.
+
+**Difference from `masquerade: true`:** The VIP-level `masquerade` masquerades ALL traffic. Hairpin masquerade only masquerades source IPs within the provider networks, leaving external client IPs intact.
+
+**Note:** Hairpin masquerade rules require the provider networks to be known. On the very first startup (before OVN discovery completes), the rules are absent. They are installed automatically on the first reconciliation cycle once OVN reports the provider network CIDRs.
 
 ## Gateway drain mode
 
