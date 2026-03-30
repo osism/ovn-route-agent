@@ -93,6 +93,7 @@ type NBLogicalRouter struct {
 type NBLogicalRouterPort struct {
 	UUID     string   `ovsdb:"_uuid"`
 	Name     string   `ovsdb:"name"`
+	MAC      string   `ovsdb:"mac"`
 	Networks []string `ovsdb:"networks"`
 }
 
@@ -143,12 +144,13 @@ type ovsdbClient interface {
 
 // LocalRouterInfo describes a logical router whose gateway is active on this chassis.
 type LocalRouterInfo struct {
-	RouterName  string // NB Logical_Router name
-	RouterUUID  string // NB Logical_Router UUID
-	LRPName     string // NB Logical_Router_Port name (e.g. "lrp-abc123")
-	LRPUUID     string // NB Logical_Router_Port UUID
+	RouterName  string   // NB Logical_Router name
+	RouterUUID  string   // NB Logical_Router UUID
+	LRPName     string   // NB Logical_Router_Port name (e.g. "lrp-abc123")
+	LRPUUID     string   // NB Logical_Router_Port UUID
+	LRPMAC      string   // NB Logical_Router_Port MAC (e.g. "fa:16:3e:xx:xx:xx")
 	LRPNetworks []string // NB Logical_Router_Port networks (e.g. ["198.51.100.11/24"])
-	CRPort      string // SB chassisredirect logical_port (e.g. "cr-lrp-abc123")
+	CRPort      string   // SB chassisredirect logical_port (e.g. "cr-lrp-abc123")
 }
 
 type OVNState struct {
@@ -165,6 +167,12 @@ type OVNState struct {
 	// NAT entries from NB, filtered to only locally-active routers.
 	FIPs    []string // dnat_and_snat external IPs
 	SNATIPs []string // snat external IPs
+
+	// NATIPToRouterMAC maps each FIP/SNAT external IP to the MAC of the
+	// router port that owns it. Used by hairpin flows to set dl_dst so
+	// that OVN's L2 lookup delivers the reflected packet to the correct
+	// router port.
+	NATIPToRouterMAC map[string]string
 
 	// Networks auto-discovered from Logical_Router_Port.Networks of locally-active routers.
 	DiscoveredNetworks []*net.IPNet
@@ -342,12 +350,17 @@ func (o *OVNClient) GetState() OVNState {
 	for k, v := range o.state.AllChassisNames {
 		allChassis[k] = v
 	}
+	natIPToMAC := make(map[string]string, len(o.state.NATIPToRouterMAC))
+	for k, v := range o.state.NATIPToRouterMAC {
+		natIPToMAC[k] = v
+	}
 	return OVNState{
 		LocalChassisName:   o.state.LocalChassisName,
 		LocalRouters:       localRouters,
 		HasLocalRouters:    o.state.HasLocalRouters,
 		FIPs:               append([]string{}, o.state.FIPs...),
 		SNATIPs:            append([]string{}, o.state.SNATIPs...),
+		NATIPToRouterMAC:   natIPToMAC,
 		DiscoveredNetworks: discoveredNets,
 		AllChassisNames:    allChassis,
 	}
@@ -413,9 +426,11 @@ func (o *OVNClient) refreshState(ctx context.Context) {
 	}
 	lrpNameToUUID := make(map[string]string, len(lrps))
 	lrpByUUID := make(map[string]NBLogicalRouterPort, len(lrps))
+	lrpNameToMAC := make(map[string]string, len(lrps))
 	for _, lrp := range lrps {
 		lrpNameToUUID[lrp.Name] = lrp.UUID
 		lrpByUUID[lrp.UUID] = lrp
+		lrpNameToMAC[lrp.Name] = lrp.MAC
 	}
 
 	// Resolve local LRP names → UUIDs.
@@ -433,7 +448,9 @@ func (o *OVNClient) refreshState(ctx context.Context) {
 		return
 	}
 
-	localNATUUIDs := make(map[string]bool)
+	// natUUIDToRouterMAC maps each NAT UUID to the MAC of the router port
+	// that owns it, so hairpin flows can set the correct dl_dst.
+	natUUIDToRouterMAC := make(map[string]string)
 	var localRouters []LocalRouterInfo
 	for _, router := range routers {
 		var matchedLRP *NBLogicalRouterPort
@@ -452,11 +469,14 @@ func (o *OVNClient) refreshState(ctx context.Context) {
 			RouterUUID:  router.UUID,
 			LRPName:     matchedLRP.Name,
 			LRPUUID:     matchedLRP.UUID,
+			LRPMAC:      matchedLRP.MAC,
 			LRPNetworks: matchedLRP.Networks,
 			CRPort:      localLRPNames[matchedLRP.Name],
 		})
 		for _, natUUID := range router.Nat {
-			localNATUUIDs[natUUID] = true
+			if matchedLRP.MAC != "" {
+				natUUIDToRouterMAC[natUUID] = matchedLRP.MAC
+			}
 		}
 	}
 
@@ -485,8 +505,10 @@ func (o *OVNClient) refreshState(ctx context.Context) {
 	}
 
 	var fips, snatIPs []string
+	natIPToRouterMAC := make(map[string]string)
 	for _, nat := range nats {
-		if !localNATUUIDs[nat.UUID] {
+		routerMAC, ok := natUUIDToRouterMAC[nat.UUID]
+		if !ok {
 			continue
 		}
 		ip := nat.ExternalIP
@@ -496,6 +518,7 @@ func (o *OVNClient) refreshState(ctx context.Context) {
 				continue
 			}
 		}
+		natIPToRouterMAC[ip] = routerMAC
 		switch nat.Type {
 		case "dnat_and_snat":
 			fips = append(fips, ip)
@@ -524,6 +547,7 @@ func (o *OVNClient) refreshState(ctx context.Context) {
 		if pb.ExternalIDs["neutron:device_owner"] != "network:router_gateway" {
 			continue
 		}
+		routerMAC := lrpNameToMAC[peer]
 		for _, natAddr := range pb.NatAddresses {
 			for _, ip := range parseNatAddressIPs(natAddr) {
 				if len(effectiveFilters) > 0 {
@@ -533,6 +557,9 @@ func (o *OVNClient) refreshState(ctx context.Context) {
 					}
 				}
 				snatIPs = append(snatIPs, ip)
+				if routerMAC != "" {
+					natIPToRouterMAC[ip] = routerMAC
+				}
 			}
 		}
 	}
@@ -543,6 +570,7 @@ func (o *OVNClient) refreshState(ctx context.Context) {
 	o.state.HasLocalRouters = len(localRouters) > 0
 	o.state.FIPs = fips
 	o.state.SNATIPs = snatIPs
+	o.state.NATIPToRouterMAC = natIPToRouterMAC
 	o.state.DiscoveredNetworks = discoveredNets
 	o.state.AllChassisNames = allChassisNames
 	o.state.mu.Unlock()

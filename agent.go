@@ -177,9 +177,39 @@ func (a *Agent) reconcile() {
 	// Compute effective network filters for this cycle.
 	a.effectiveFilters = a.computeEffectiveNetworks(state.DiscoveredNetworks)
 
-	// hairpinIPs = FIPs + SNATs only; port-forward VIPs are intentionally
-	// excluded because their DNAT is handled by nftables, not OVN.
-	hairpinIPs := uniqueIPs(append(state.FIPs, state.SNATIPs...))
+	// hairpinMACMap maps each IP that needs a hairpin flow to the MAC of
+	// the router port that owns it. This includes FIPs, SNAT IPs, and
+	// router gateway IPs (LRP networks). Port-forward VIPs are
+	// intentionally excluded because their DNAT is handled by nftables.
+	//
+	// The MAC is used as mod_dl_dst in the hairpin flow so that OVN's
+	// L2 lookup delivers the reflected packet to the correct router.
+	hairpinMACMap := make(map[string]string, len(state.NATIPToRouterMAC))
+	for ip, mac := range state.NATIPToRouterMAC {
+		hairpinMACMap[ip] = mac
+	}
+	// Router gateway IPs (LRP networks) are included so that VMs on a
+	// same-chassis router can reach other routers' gateway addresses,
+	// matching the behaviour seen from outside.
+	for _, lr := range state.LocalRouters {
+		for _, cidr := range lr.LRPNetworks {
+			ip, _, err := net.ParseCIDR(cidr)
+			if err != nil {
+				continue
+			}
+			if lr.LRPMAC != "" {
+				hairpinMACMap[ip.String()] = lr.LRPMAC
+			}
+		}
+	}
+
+	// hairpinIPs is the flat list of IPs for kernel routes and FRR.
+	// Map keys are already unique; just sort for deterministic ordering.
+	hairpinIPs := make([]string, 0, len(hairpinMACMap))
+	for ip := range hairpinMACMap {
+		hairpinIPs = append(hairpinIPs, ip)
+	}
+	sort.Strings(hairpinIPs)
 
 	// desiredIPs extends hairpinIPs with port-forward VIPs — these need
 	// kernel routes on br-ex and FRR static routes for BGP announcement,
@@ -211,7 +241,7 @@ func (a *Agent) reconcile() {
 		// communication. These reflect FIP/SNAT-IP traffic from OVN back
 		// into OVN's external pipeline instead of sending it to the kernel,
 		// fixing the case where two routers share the same gateway chassis.
-		if err := a.routing.ReconcileOVSHairpinFlows(hairpinIPs); err != nil {
+		if err := a.routing.ReconcileOVSHairpinFlows(hairpinMACMap); err != nil {
 			slog.Error("failed to reconcile OVS hairpin flows", "error", err)
 		}
 

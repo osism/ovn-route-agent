@@ -94,17 +94,26 @@ func (rm *RouteManager) EnsureOVSFlows() error {
 // output:in_port. OVN then processes the packet as incoming on the external
 // logical switch, allowing correct DNAT/ICMP handling without leaving the host.
 //
+// Both source and destination MACs are rewritten:
+//   - dl_src is set to the bridge device's own MAC (bridgeMAC) so the reflected
+//     packet appears as external traffic to OVN, avoiding loop detection.
+//   - dl_dst is set to the owning router port's MAC (routerMAC) so OVN's L2
+//     lookup on the external logical switch delivers the packet to the correct
+//     router. Without this, the original dl_dst may be unresolved (e.g.
+//     00:00:00:00:00:00) when OVN's ARP resolution between co-located routers
+//     has not completed.
+//
 // Priority 910 ensures hairpin fires before the MAC-tweak flow (priority 900),
 // so locally-managed IPs are reflected into OVN while all other traffic
 // (destined for remote IPs) still falls through to MAC-tweak and exits to the
 // physical network normally.
-func HairpinFlow(cookie, ofport, ip string, ipv6 bool) string {
+func HairpinFlow(cookie, ofport, ip, bridgeMAC, routerMAC string, ipv6 bool) string {
 	if ipv6 {
-		return fmt.Sprintf("cookie=%s,priority=910,ipv6,in_port=%s,ipv6_dst=%s/128,actions=output:in_port",
-			cookie, ofport, ip)
+		return fmt.Sprintf("cookie=%s,priority=910,ipv6,in_port=%s,ipv6_dst=%s/128,actions=mod_dl_src:%s,mod_dl_dst:%s,output:in_port",
+			cookie, ofport, ip, bridgeMAC, routerMAC)
 	}
-	return fmt.Sprintf("cookie=%s,priority=910,ip,in_port=%s,ip_dst=%s/32,actions=output:in_port",
-		cookie, ofport, ip)
+	return fmt.Sprintf("cookie=%s,priority=910,ip,in_port=%s,ip_dst=%s/32,actions=mod_dl_src:%s,mod_dl_dst:%s,output:in_port",
+		cookie, ofport, ip, bridgeMAC, routerMAC)
 }
 
 // ReconcileOVSHairpinFlows installs per-IP hairpin flows on the bridge device.
@@ -116,14 +125,18 @@ func HairpinFlow(cookie, ofport, ip string, ipv6 bool) string {
 // From a different chassis the same traffic arrives via the physical network
 // and OVN processes it correctly — explaining the asymmetric failure.
 //
+// ipToRouterMAC maps each IP to the MAC of the router port that owns it.
+// The MAC is written into the flow as mod_dl_dst so that OVN's L2 lookup
+// delivers the reflected packet to the correct router port.
+//
 // EnsureOVSFlows must be called before this method so that cachedOfport is
 // populated. If cachedOfport is empty this method is a no-op.
 //
-// Pass nil or an empty slice to remove all hairpin flows (e.g. when no
+// Pass nil or an empty map to remove all hairpin flows (e.g. when no
 // locally-active routers remain).
-func (rm *RouteManager) ReconcileOVSHairpinFlows(localIPs []string) error {
+func (rm *RouteManager) ReconcileOVSHairpinFlows(ipToRouterMAC map[string]string) error {
 	if rm.dryRun {
-		slog.Info("[dry-run] would reconcile OVS hairpin flows", "count", len(localIPs))
+		slog.Info("[dry-run] would reconcile OVS hairpin flows", "count", len(ipToRouterMAC))
 		return nil
 	}
 	if rm.cachedOfport == "" {
@@ -140,19 +153,19 @@ func (rm *RouteManager) ReconcileOVSHairpinFlows(localIPs []string) error {
 		return fmt.Errorf("del hairpin OVS flows on %s: %w (output: %s)", rm.bridgeDev, err, strings.TrimSpace(string(out)))
 	}
 
-	for _, ip := range localIPs {
+	for ip, routerMAC := range ipToRouterMAC {
 		parsed := net.ParseIP(ip)
 		if parsed == nil {
 			return fmt.Errorf("invalid IP %q", ip)
 		}
 		isIPv6 := parsed.To4() == nil
-		flow := HairpinFlow(ovsCookieHairpin, rm.cachedOfport, ip, isIPv6)
+		flow := HairpinFlow(ovsCookieHairpin, rm.cachedOfport, ip, rm.cachedBridgeMAC, routerMAC, isIPv6)
 		if err := rm.addOVSFlow(flow); err != nil {
 			return fmt.Errorf("add hairpin flow for %s: %w", ip, err)
 		}
 	}
 
-	slog.Debug("OVS hairpin flows reconciled", "count", len(localIPs))
+	slog.Debug("OVS hairpin flows reconciled", "count", len(ipToRouterMAC))
 	return nil
 }
 
