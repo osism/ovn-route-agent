@@ -3,11 +3,15 @@ package main
 import (
 	"fmt"
 	"log/slog"
+	"net"
 	"os/exec"
 	"strings"
 )
 
-const ovsCookieMACTweak = "0x999"
+const (
+	ovsCookieMACTweak = "0x999"
+	ovsCookieHairpin  = "0x998"
+)
 
 // MACTweakFlow returns the OpenFlow rule string for a MAC-tweak flow.
 func MACTweakFlow(cookie, ofport, mac string, ipv6 bool) string {
@@ -84,6 +88,74 @@ func (rm *RouteManager) EnsureOVSFlows() error {
 	return nil
 }
 
+// HairpinFlow returns the OpenFlow rule string for a same-chassis hairpin flow.
+// The flow intercepts packets from OVN (via the patch port) destined for a
+// locally-managed IP and sends them back through the same patch port using
+// output:in_port. OVN then processes the packet as incoming on the external
+// logical switch, allowing correct DNAT/ICMP handling without leaving the host.
+//
+// Priority 910 ensures hairpin fires before the MAC-tweak flow (priority 900),
+// so locally-managed IPs are reflected into OVN while all other traffic
+// (destined for remote IPs) still falls through to MAC-tweak and exits to the
+// physical network normally.
+func HairpinFlow(cookie, ofport, ip string, ipv6 bool) string {
+	if ipv6 {
+		return fmt.Sprintf("cookie=%s,priority=910,ipv6,in_port=%s,ipv6_dst=%s/128,actions=output:in_port",
+			cookie, ofport, ip)
+	}
+	return fmt.Sprintf("cookie=%s,priority=910,ip,in_port=%s,ip_dst=%s/32,actions=output:in_port",
+		cookie, ofport, ip)
+}
+
+// ReconcileOVSHairpinFlows installs per-IP hairpin flows on the bridge device.
+//
+// Without these flows, same-chassis traffic between FIPs on different OVN
+// routers is mishandled: OVN sends it via the localnet port to br-ex, the
+// MAC-tweak flow delivers it to the kernel, but the kernel has no "local"
+// address for the destination FIP and either drops or loops the packet.
+// From a different chassis the same traffic arrives via the physical network
+// and OVN processes it correctly — explaining the asymmetric failure.
+//
+// EnsureOVSFlows must be called before this method so that cachedOfport is
+// populated. If cachedOfport is empty this method is a no-op.
+//
+// Pass nil or an empty slice to remove all hairpin flows (e.g. when no
+// locally-active routers remain).
+func (rm *RouteManager) ReconcileOVSHairpinFlows(localIPs []string) error {
+	if rm.dryRun {
+		slog.Info("[dry-run] would reconcile OVS hairpin flows", "count", len(localIPs))
+		return nil
+	}
+	if rm.cachedOfport == "" {
+		// Patch port not yet discovered; EnsureOVSFlows must run first.
+		slog.Warn("skipping OVS hairpin flow reconcile: patch port ofport not yet cached")
+		return nil
+	}
+
+	// Full replace: delete all current hairpin flows then reinstall.
+	// The replacement window is sub-millisecond and tolerable.
+	delCmd := rm.ovsCmd("ovs-ofctl", "del-flows", rm.bridgeDev,
+		fmt.Sprintf("cookie=%s/-1", ovsCookieHairpin))
+	if out, err := delCmd.CombinedOutput(); err != nil {
+		return fmt.Errorf("del hairpin OVS flows on %s: %w (output: %s)", rm.bridgeDev, err, strings.TrimSpace(string(out)))
+	}
+
+	for _, ip := range localIPs {
+		parsed := net.ParseIP(ip)
+		if parsed == nil {
+			return fmt.Errorf("invalid IP %q", ip)
+		}
+		isIPv6 := parsed.To4() == nil
+		flow := HairpinFlow(ovsCookieHairpin, rm.cachedOfport, ip, isIPv6)
+		if err := rm.addOVSFlow(flow); err != nil {
+			return fmt.Errorf("add hairpin flow for %s: %w", ip, err)
+		}
+	}
+
+	slog.Debug("OVS hairpin flows reconciled", "count", len(localIPs))
+	return nil
+}
+
 // RemoveOVSFlows removes all agent-managed OVS flows from the bridge device.
 func (rm *RouteManager) RemoveOVSFlows() error {
 	if rm.dryRun {
@@ -97,6 +169,14 @@ func (rm *RouteManager) RemoveOVSFlows() error {
 		return fmt.Errorf("del OVS flows on %s: %w (output: %s)", rm.bridgeDev, err, strings.TrimSpace(string(out)))
 	}
 	slog.Info("OVS MAC-tweak flows removed", "dev", rm.bridgeDev)
+
+	hairpinCmd := rm.ovsCmd("ovs-ofctl", "del-flows", rm.bridgeDev,
+		fmt.Sprintf("cookie=%s/-1", ovsCookieHairpin))
+	if hout, herr := hairpinCmd.CombinedOutput(); herr != nil {
+		return fmt.Errorf("del hairpin OVS flows on %s: %w (output: %s)", rm.bridgeDev, herr, strings.TrimSpace(string(hout)))
+	}
+	slog.Info("OVS hairpin flows removed", "dev", rm.bridgeDev)
+
 	return nil
 }
 

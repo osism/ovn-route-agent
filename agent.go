@@ -177,12 +177,14 @@ func (a *Agent) reconcile() {
 	// Compute effective network filters for this cycle.
 	a.effectiveFilters = a.computeEffectiveNetworks(state.DiscoveredNetworks)
 
-	// Combine FIPs and SNAT IPs, deduplicate
-	desiredIPs := uniqueIPs(append(state.FIPs, state.SNATIPs...))
+	// hairpinIPs = FIPs + SNATs only; port-forward VIPs are intentionally
+	// excluded because their DNAT is handled by nftables, not OVN.
+	hairpinIPs := uniqueIPs(append(state.FIPs, state.SNATIPs...))
 
-	// Add port forward VIPs to desired IPs — these need kernel routes on
-	// br-ex and FRR static routes for BGP announcement, independent of
-	// whether any OVN routers are locally active.
+	// desiredIPs extends hairpinIPs with port-forward VIPs — these need
+	// kernel routes on br-ex and FRR static routes for BGP announcement,
+	// independent of whether any OVN routers are locally active.
+	desiredIPs := hairpinIPs
 	for _, pf := range a.cfg.PortForwards {
 		desiredIPs = append(desiredIPs, pf.VIP)
 	}
@@ -203,6 +205,14 @@ func (a *Agent) reconcile() {
 		// Ensure OVS MAC-tweak flows are in place (only when active).
 		if err := a.routing.EnsureOVSFlows(); err != nil {
 			slog.Error("failed to ensure OVS flows", "error", err)
+		}
+
+		// Reconcile per-IP hairpin flows for same-chassis cross-router
+		// communication. These reflect FIP/SNAT-IP traffic from OVN back
+		// into OVN's external pipeline instead of sending it to the kernel,
+		// fixing the case where two routers share the same gateway chassis.
+		if err := a.routing.ReconcileOVSHairpinFlows(hairpinIPs); err != nil {
+			slog.Error("failed to reconcile OVS hairpin flows", "error", err)
 		}
 
 		// Ensure OVN default routes and static MAC bindings for local routers.
@@ -240,6 +250,9 @@ func (a *Agent) reconcile() {
 		}
 		if err := a.routing.ReconcileFRRPrefixList(nil); err != nil {
 			slog.Error("failed to clean FRR prefix-list", "error", err)
+		}
+		if err := a.routing.ReconcileOVSHairpinFlows(nil); err != nil {
+			slog.Error("failed to clean OVS hairpin flows", "error", err)
 		}
 	}
 
