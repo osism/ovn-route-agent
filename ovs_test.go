@@ -4,6 +4,52 @@ import (
 	"testing"
 )
 
+func TestHairpinFlow(t *testing.T) {
+	tests := []struct {
+		name   string
+		cookie string
+		ofport string
+		ip     string
+		ipv6   bool
+		want   string
+	}{
+		{
+			"basic IPv4 hairpin flow",
+			"0x998", "42", "5.182.234.199", false,
+			"cookie=0x998,priority=910,ip,in_port=42,ip_dst=5.182.234.199/32,actions=output:in_port",
+		},
+		{
+			"different IPv4 IP and ofport",
+			"0x998", "7", "192.0.2.1", false,
+			"cookie=0x998,priority=910,ip,in_port=7,ip_dst=192.0.2.1/32,actions=output:in_port",
+		},
+		{
+			"SNAT router external IP",
+			"0x998", "3", "5.182.234.128", false,
+			"cookie=0x998,priority=910,ip,in_port=3,ip_dst=5.182.234.128/32,actions=output:in_port",
+		},
+		{
+			"IPv6 FIP",
+			"0x998", "42", "2001:db8::1", true,
+			"cookie=0x998,priority=910,ipv6,in_port=42,ipv6_dst=2001:db8::1/128,actions=output:in_port",
+		},
+		{
+			"IPv6 SNAT",
+			"0x998", "5", "2001:db8:cafe::1", true,
+			"cookie=0x998,priority=910,ipv6,in_port=5,ipv6_dst=2001:db8:cafe::1/128,actions=output:in_port",
+		},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			got := HairpinFlow(tt.cookie, tt.ofport, tt.ip, tt.ipv6)
+			if got != tt.want {
+				t.Errorf("HairpinFlow() = %q, want %q", got, tt.want)
+			}
+		})
+	}
+}
+
 func TestMACTweakFlow(t *testing.T) {
 	tests := []struct {
 		name   string
