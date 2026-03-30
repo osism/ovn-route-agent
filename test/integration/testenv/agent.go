@@ -73,6 +73,7 @@ type PortForwardVIPFixture struct {
 	ManageVIP         bool                     `yaml:"manage_vip,omitempty"`
 	Masquerade        bool                     `yaml:"masquerade,omitempty"`
 	HairpinMasquerade bool                     `yaml:"hairpin_masquerade,omitempty"`
+	RouterMasquerade  bool                     `yaml:"router_masquerade,omitempty"`
 	Rules             []PortForwardRuleFixture `yaml:"rules"`
 }
 

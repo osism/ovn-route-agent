@@ -478,6 +478,65 @@ func TestScenario_PortForwardHairpinMasquerade(t *testing.T) {
 		30*time.Second, "hairpin masquerade rule for VIP "+vip+" with provider 198.51.100.0/24")
 }
 
+// TestScenario_PortForwardRouterMasquerade (PR #15).
+//
+// router_masquerade:true plus a router with a `snat`-type NAT entry should
+// produce a postrouting_snat rule of the form:
+//
+//	ip saddr <router-snat-ip> ct original daddr <vip> ct status dnat masquerade
+//
+// The agent's OVN reconcile populates state.SNATIPs from NB NAT rows of
+// type=snat on locally-active routers; that slice is then handed to
+// ReconcilePortForward, which buildNftRuleset turns into the literal-IP
+// masquerade rule. Unlike hairpin masquerade (provider-CIDR match) the source
+// match here is a single IP, so we assert with HasMatch rather than
+// HasMatchPrefix.
+func TestScenario_PortForwardRouterMasquerade(t *testing.T) {
+	ctx, cancel, nb, sb := startScenario(t)
+	defer cancel()
+	testenv.EnsureLoopback1(t)
+
+	// Local router with LRP in 198.51.100.0/24. The agent's network-filter
+	// fallback uses discovered LRP networks, so the SNAT external IP we add
+	// below must fall inside this prefix to survive the filter in
+	// ovn.go's NAT-collection step.
+	router := testenv.MakeLocalRouter(t, ctx, nb, sb, testenv.LocalRouterOpts{
+		Name:        "rmasqr",
+		LRPMAC:      "fa:16:3e:7a:00:01",
+		LRPNetworks: []string{"198.51.100.11/24"},
+	})
+
+	const (
+		vip     = "198.51.100.41"
+		snatIP  = "198.51.100.50"
+		snatNet = "10.0.0.0/24"
+	)
+	testenv.AddSNATEntry(t, ctx, nb, router, snatIP, snatNet)
+
+	cfg := pfDefaults(t)
+	cfg.PortForwards = []testenv.PortForwardVIPFixture{{
+		VIP:              vip,
+		RouterMasquerade: true,
+		Rules: []testenv.PortForwardRuleFixture{{
+			Proto: "tcp", Port: 80, DestAddr: "10.0.0.100",
+		}},
+	}}
+
+	a := readyAgent(t, cfg)
+	defer a.Stop(15 * time.Second)
+
+	// The rule only appears once OVN has reported at least one SNAT IP, so
+	// give reconcile time to run. saddr literal + masquerade uniquely
+	// identifies the router-masquerade rule — no other rule in
+	// postrouting_snat carries a literal-IP saddr match.
+	testenv.AssertNftRuleInChain(t, pfTable, "postrouting_snat",
+		func(r testenv.NftRule) bool {
+			return r.HasMatch("ip", "saddr", snatIP) &&
+				r.HasMasquerade()
+		},
+		30*time.Second, "router masquerade rule for VIP "+vip+" with SNAT IP "+snatIP)
+}
+
 // TestScenario_PortForwardL3mdevSysctls (#43 scenario 6).
 //
 // port_forward_l3mdev_accept:true must set udp_l3mdev_accept=1 and

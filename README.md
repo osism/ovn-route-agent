@@ -69,7 +69,7 @@ The agent monitors the OVN Southbound and Northbound databases and performs targ
    - Ensures `/32` **kernel routes** (with IP rules when using a dedicated routing table) and **FRR static routes** in the VRF for each FIP/SNAT IP
    - If configured, reconciles the **FRR prefix-list** with `permit <network> ge 32 le 32` entries for each discovered provider network
    - If no routers are locally active: removes all managed routes
-5. **Port forwarding (DNAT)** — optionally forwards traffic from anycast VIP addresses (on a loopback interface in the VRF) to internal backends. Supports multiple backends per rule with sticky source-IP hashing (`jhash`) for consistent client-to-backend mapping. Client IPs are preserved using connmark-based return routing through the veth pair. Backends on the same host are handled via dedicated OUTPUT chains (`output_ctzone`, `output_fwmark`) since locally-delivered traffic bypasses the FORWARD/POSTROUTING path. Per-rule `masquerade` control allows mixing local and remote backends on the same VIP. Hairpin masquerade (`hairpin_masquerade: true`) solves the hairpin NAT problem where FIPs on the same node try to connect to a port-forwarded VIP — only source-masquerades traffic from provider networks, leaving external clients unaffected. A `forward_veth_guard` nftables chain restricts the veth return path to legitimate traffic only. Requires `nft` binary and `veth_leak_enabled: true`.
+5. **Port forwarding (DNAT)** — optionally forwards traffic from anycast VIP addresses (on a loopback interface in the VRF) to internal backends. Supports multiple backends per rule with sticky source-IP hashing (`jhash`) for consistent client-to-backend mapping. Client IPs are preserved using connmark-based return routing through the veth pair. Backends on the same host are handled via dedicated OUTPUT chains (`output_ctzone`, `output_fwmark`) since locally-delivered traffic bypasses the FORWARD/POSTROUTING path. Per-rule `masquerade` control allows mixing local and remote backends on the same VIP. Two source-selective hairpin fixes are available: `hairpin_masquerade: true` covers FIPs on the same node (matches the provider CIDR), and `router_masquerade: true` covers instances behind a router without a FIP (matches the specific router SNAT IPs discovered from OVN). Both leave unrelated external clients unaffected and can be combined on the same VIP. A `forward_veth_guard` nftables chain restricts the veth return path to legitimate traffic only. Requires `nft` binary and `veth_leak_enabled: true`.
 6. **Reconciles** periodically as a safety net (default: every 60s)
 7. **Detects stale chassis** — when a node dies without graceful shutdown, surviving agents detect its chassis disappearing from the SB Chassis table and clean up its managed OVN NB entries (static routes and MAC bindings) after a configurable grace period (default: 5m, configurable via `stale_chassis_grace_period`, set to `0` to disable). Random jitter (0-30s) prevents multiple agents from cleaning up simultaneously.
 8. **Drains gateways** on shutdown (SIGINT/SIGTERM) — before cleanup, the agent lowers its `Gateway_Chassis` priority to 0 in OVN NB, causing `ovn-northd` to migrate chassisredirect ports to standby chassis (priority >= 1). On the next startup, drained entries are restored to priority 1 (standby level). The active chassis automatically maintains a minimum priority of 2 (above all possible standby peers) during reconciliation, preventing reverse failover even when a peer restores to priority 1. This eliminates the traffic disruption window between BGP route withdrawal and OVN BFD failover detection (see [Gateway drain mode](#gateway-drain-mode)). Enabled by default (`drain_on_shutdown: true`, `drain_timeout: 60s`).
@@ -471,6 +471,20 @@ ip saddr 5.182.234.0/24 ct original daddr 194.93.78.239 ct status dnat masquerad
 
 Unlike the VIP-level `masquerade: true` (which masquerades ALL traffic), hairpin masquerade is source-selective. It can be combined with per-rule `masquerade` on the same VIP — both rules coexist in `postrouting_snat`. The rules are only generated when provider networks are known; if the agent starts before OVN has delivered network discovery, they appear on the first reconciliation cycle.
 
+**9. Router masquerade (postrouting_snat, optional)** — When `router_masquerade: true` is set on a VIP, SNAT is applied **only to traffic whose source matches a known router SNAT external IP** (discovered dynamically from OVN NB `nat.type=snat` entries on locally-active routers). This solves the hairpin NAT problem for instances **behind a router that do not have a Floating IP**: the router applies SNAT before forwarding, so the source IP arriving at the VIP is the router's OVN-managed external address. Without masquerade, the backend's reply enters OVN's pipeline directly — bypassing this node's conntrack — and the reverse DNAT never fires, so the instance receives a packet from the backend IP instead of the VIP and the connection breaks.
+
+With a single known SNAT IP the rule is emitted as a literal address match; with multiple IPs nft's anonymous set syntax is used so all known router sources are covered by one rule:
+
+```
+# Single SNAT IP
+ip saddr 203.0.113.50 ct original daddr 194.93.78.239 ct status dnat masquerade
+
+# Multiple SNAT IPs
+ip saddr { 203.0.113.50, 203.0.113.51 } ct original daddr 194.93.78.239 ct status dnat masquerade
+```
+
+Unlike `hairpin_masquerade` (which uses the full provider CIDR and would also masquerade unrelated external clients that happen to live in the same subnet), `router_masquerade` is **more surgical**: only the specific router SNAT IPs are rewritten, leaving every other external client IP fully preserved end-to-end. `router_masquerade` and `hairpin_masquerade` can be set together on the same VIP — both rules coexist in `postrouting_snat`, covering FIP-sourced and router-SNAT'd traffic simultaneously. The rule is only emitted once OVN has reported at least one SNAT IP; on a cold start (before the first reconcile delivers SNAT data) the chain is omitted entirely to prevent accidental masquerade.
+
 ### Why conntrack-based fwmark instead of simpler alternatives?
 
 | Approach | Client IP preserved? | Problem |
@@ -480,8 +494,9 @@ Unlike the VIP-level `masquerade: true` (which masquerades ALL traffic), hairpin
 | Conntrack + fwmark | Yes | Only marks packets belonging to DNAT'd connections — surgical, no side effects |
 | Conntrack + fwmark + per-rule masquerade | Depends | Best of both: client IP preserved for local backends, masquerade only where needed (remote backends) |
 | Conntrack + fwmark + hairpin masquerade | Depends | Client IP preserved for external clients; source-selective SNAT fixes hairpin for FIPs on the same node |
+| Conntrack + fwmark + router masquerade | Depends | Client IP preserved for external clients; source-selective SNAT against known router SNAT IPs fixes hairpin for instances behind a router without a FIP |
 
-The conntrack-based approach selectively routes just the DNAT return traffic without affecting any other traffic from the backend. It uses `ct status dnat` and `ct direction` to identify packets belonging to DNAT'd connections and assigns direction-specific fwmarks for policy routing. Per-rule masquerade adds surgical SNAT only for remote backends that need it, while local backends (same host) use the OUTPUT chains for return routing with the original client IP preserved. Hairpin masquerade adds a further refinement: source-selective SNAT only for provider-network traffic, solving the asymmetric routing that occurs when a FIP on the same node connects to the VIP.
+The conntrack-based approach selectively routes just the DNAT return traffic without affecting any other traffic from the backend. It uses `ct status dnat` and `ct direction` to identify packets belonging to DNAT'd connections and assigns direction-specific fwmarks for policy routing. Per-rule masquerade adds surgical SNAT only for remote backends that need it, while local backends (same host) use the OUTPUT chains for return routing with the original client IP preserved. Hairpin masquerade adds a further refinement: source-selective SNAT only for provider-network traffic, solving the asymmetric routing that occurs when a FIP on the same node connects to the VIP. Router masquerade is the no-FIP companion: it targets the specific router SNAT IPs surfaced by OVN, so only those addresses are rewritten and every other external client remains untouched.
 
 ### The `forward_veth_guard` chain
 
@@ -680,6 +695,19 @@ port_forwards:
       - proto: tcp
         port: 443
         dest_addr: "10.0.0.100"
+
+  # VIP that must be reachable from both FIP-equipped VMs and instances
+  # behind a router without a FIP. hairpin_masquerade covers the former,
+  # router_masquerade the latter — both rules coexist in postrouting_snat
+  # and leave every other external client IP untouched.
+  - vip: "198.51.100.30"
+    manage_vip: true
+    hairpin_masquerade: true     # FIPs on the same node
+    router_masquerade: true      # instances behind a router (no FIP)
+    rules:
+      - proto: tcp
+        port: 443
+        dest_addr: "10.0.0.100"
 ```
 
 ### Sticky load balancing (multi-backend)
@@ -709,6 +737,10 @@ ip daddr 198.51.100.10 udp dport 53 dnat to jhash ip saddr mod 3 map { \
 
 ### Hairpin NAT
 
+Two flavors of source-selective masquerade are available to fix hairpin NAT, depending on how the local client reaches the VIP. They can be combined on the same VIP — the resulting rules coexist in `postrouting_snat`.
+
+#### Case 1: instance with a FIP on the same node (`hairpin_masquerade`)
+
 **The problem:** A VM with a Floating IP (FIP) in the provider network (e.g. `5.182.234.153`) tries to reach a port-forwarded VIP (e.g. `194.93.78.239`) on the same node. ICMP to the VIP succeeds because the VIP address is local (`loopback1`) and the kernel responds directly — DNAT is never involved. TCP connections time out because:
 
 1. The VM's packet is DNAT'd: `src=5.182.234.153 dst=194.93.78.239:80` → `dst=backend_ip:80`
@@ -731,6 +763,28 @@ External clients (source outside provider networks) are unaffected — their IPs
 **Difference from `masquerade: true`:** The VIP-level `masquerade` masquerades ALL traffic. Hairpin masquerade only masquerades source IPs within the provider networks, leaving external client IPs intact.
 
 **Note:** Hairpin masquerade rules require the provider networks to be known. On the very first startup (before OVN discovery completes), the rules are absent. They are installed automatically on the first reconciliation cycle once OVN reports the provider network CIDRs.
+
+#### Case 2: instance behind a router without a FIP (`router_masquerade`)
+
+**The problem:** An instance without its own FIP connects to a port-forwarded VIP through an OVN router. The router applies SNAT, so the packet that hits the VIP carries the **router's external IP** as source instead of the instance address. That external IP is OVN-managed — meaning the backend's reply enters OVN's pipeline directly, **bypassing this node's conntrack**. The reverse DNAT never fires, the instance receives a reply from the backend IP instead of the VIP, and the connection fails.
+
+`hairpin_masquerade` does not fix this cleanly: matching the full provider CIDR would also rewrite every unrelated external client living in the same subnet.
+
+**The fix:** Enable `router_masquerade: true` on the VIP. The agent dynamically discovers router SNAT external IPs from OVN NB (rows where `nat.type=snat` on locally-active routers) and emits a source-selective SNAT rule that targets **only those specific addresses**:
+
+```
+# Single SNAT IP
+ip saddr 203.0.113.50 ct original daddr 194.93.78.239 ct status dnat masquerade
+
+# Multiple SNAT IPs (anonymous set)
+ip saddr { 203.0.113.50, 203.0.113.51 } ct original daddr 194.93.78.239 ct status dnat masquerade
+```
+
+With this rule active the backend sees `src=<node-control-plane-IP>`, replies through this node, and conntrack reverses both SNAT and DNAT — the instance receives the reply from the VIP exactly as it expects.
+
+**Difference from `hairpin_masquerade`:** Hairpin masquerade matches a provider-CIDR prefix and therefore also rewrites unrelated external clients that share the subnet. Router masquerade matches the literal set of router SNAT IPs surfaced by OVN, leaving every other client untouched.
+
+**Note:** Router masquerade rules require at least one SNAT IP to be known. If the agent starts before OVN has reported any SNAT entry, the rule (and the entire `postrouting_snat` chain if it would otherwise be empty) is omitted to prevent accidental masquerade during startup. The rule is installed on the first reconciliation cycle that delivers SNAT IP data.
 
 ## Gateway drain mode
 

@@ -103,7 +103,8 @@ type PortForwardVIP struct {
 	VIP               string            `yaml:"vip"`                // anycast VIP address
 	ManageVIP         bool              `yaml:"manage_vip"`         // agent adds/removes VIP on port_forward_dev
 	Masquerade        bool              `yaml:"masquerade"`         // SNAT forwarded traffic with outgoing interface IP
-	HairpinMasquerade bool              `yaml:"hairpin_masquerade"` // SNAT only traffic from provider networks (fixes hairpin NAT)
+	HairpinMasquerade bool              `yaml:"hairpin_masquerade"` // SNAT only traffic from provider networks (fixes hairpin NAT for FIPs)
+	RouterMasquerade  bool              `yaml:"router_masquerade"`  // SNAT only traffic from known router SNAT IPs (fixes hairpin NAT for instances behind a router without FIP)
 	Rules             []PortForwardRule `yaml:"rules"`
 }
 
