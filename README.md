@@ -18,6 +18,7 @@ The agent monitors the OVN Southbound and Northbound databases and performs targ
 4. **Reacts** instantly to changes — for each router whose gateway is active on this chassis:
    - Ensures a **default route** (`0.0.0.0/0 via <virtual-gw>`) and **static MAC binding** in OVN NB so reply traffic exits the logical router correctly (see [Gatewayless provider networks](#gatewayless-provider-networks))
    - Installs **OVS MAC-tweak flows** on the provider bridge so the kernel accepts packets from OVN (rewrites destination MAC to `br-ex` MAC)
+   - Installs **OVS hairpin flows** (per FIP, priority 910) that reflect same-chassis cross-router traffic back into OVN via `output:in_port`, rewriting both source MAC (`br-ex` MAC) and destination MAC (owning router port MAC) — see [Hairpin OVS flows on br-ex](#hairpin-ovs-flows-on-br-ex)
    - Ensures `/32` **kernel routes** (with IP rules when using a dedicated routing table) and **FRR static routes** in the VRF for each FIP/SNAT IP
    - If configured, reconciles the **FRR prefix-list** with `permit <network> ge 32 le 32` entries for each discovered provider network
    - If no routers are locally active: removes all managed routes
@@ -307,6 +308,23 @@ cookie=0x999,priority=900,ip,in_port=<patch-port>,actions=mod_dl_dst:<br-ex-mac>
 ```
 
 This allows the kernel to accept and route the packets normally (via the `/32` kernel routes and policy rules into `vrf-provider` for BGP delivery).
+
+### Hairpin OVS flows on br-ex
+
+When two OVN logical routers are both active on the same chassis, a FIP on router-A trying to reach a FIP on router-B creates an asymmetric failure: OVN sends the packet out via the localnet port to `br-ex`, the MAC-tweak flow delivers it to the kernel, but the kernel has no local address for the destination FIP and either drops or loops the packet. The same traffic works fine from a *different* chassis because it arrives via the physical network and OVN processes it correctly.
+
+The agent installs per-IP **hairpin flows** (cookie `0x998`, priority 910) that intercept packets from OVN destined for a locally-managed FIP and **reflect them back through the same patch port** using `output:in_port`. OVN then processes the reflected packet as if it arrived from the external network, applying the correct DNAT/ICMP handling on the destination router.
+
+Both source and destination MACs are rewritten:
+
+- **`dl_src`** is set to the `br-ex` MAC so the reflected packet appears as external traffic to OVN, avoiding loop detection
+- **`dl_dst`** is set to the owning router port's MAC so OVN's L2 lookup on the external logical switch delivers the packet to the correct router (without this, the original destination MAC may be unresolved when OVN's ARP resolution between co-located routers has not completed)
+
+```
+cookie=0x998,priority=910,ip,in_port=<patch-port>,ip_dst=<fip>/32,actions=mod_dl_src:<br-ex-mac>,mod_dl_dst:<router-port-mac>,output:in_port
+```
+
+Priority 910 ensures hairpin fires **before** the MAC-tweak flow (priority 900), so locally-managed IPs are reflected into OVN while all other traffic still falls through to MAC-tweak and exits to the physical network normally. The hairpin flows are reconciled alongside the MAC-tweak flows and removed when no routers are locally active.
 
 ## Port forwarding (DNAT)
 
@@ -735,7 +753,7 @@ This inverts the shutdown order: OVN failover happens **first** (triggered by th
   │  ├─ Set priority to 1 (standby level)                 │
   │  │  (batched in a single OVSDB transaction)           │
   │  │                                                    │
-  │  Chassis rejoins HA group as standby                   │
+  │  Chassis rejoins HA group as standby                  │
   └───────────────────────┬───────────────────────────────┘
                           │
                           ▼
@@ -744,11 +762,11 @@ This inverts the shutdown order: OVN failover happens **first** (triggered by th
   │                                                       │
   │  If this chassis is the active gateway:               │
   │  ├─ Compare local priority with peers in HA group     │
-  │  ├─ If local priority <= max peer priority             │
+  │  ├─ If local priority <= max peer priority            │
   │  │  OR local priority < 2 (minimum active priority):  │
   │  │  boost to max(max peer + 1, 2)                     │
   │  │                                                    │
-  │  This ensures the active chassis always has            │
+  │  This ensures the active chassis always has           │
   │  priority >= 2, strictly above the restore level (1), │
   │  preventing reverse failover even when all peers      │
   │  are drained.                                         │
@@ -820,7 +838,7 @@ The agent monitors OVN databases and writes routing state into four subsystems. 
                               │                          │          │ MAC_Binding   │
                               ▼                          ▼          └───────────────┘
                   ┌──────────────────────────────────────────────┐
-                  │                 ovn-network-agent              │
+                  │                 ovn-network-agent            │
                   │                                              │
                   │  ┌────────────┐    ┌──────────────────────┐  │
                   │  │  OVSDB IDL │    │   Event Processing   │  │
@@ -848,7 +866,8 @@ The agent monitors OVN databases and writes routing state into four subsystems. 
                  │ Kernel (netlink)  │ │ OVS (ovs-ofctl)   │ │ FRR (vtysh)       │
                  │                   │ │                   │ │                   │
                  │ /32 routes +rules │ │ MAC-tweak flows   │ │ ip route in VRF   │
-                 │ proxy ARP on br-ex│ │ on br-ex          │ │ → BGP announce    │
+                 │ proxy ARP on br-ex│ │ Hairpin flows     │ │ → BGP announce    │
+                 │                   │ │ on br-ex          │ │                   │
                  └───────────────────┘ └───────────────────┘ └───────────────────┘
 ```
 
@@ -856,10 +875,11 @@ For each locally-active router the agent:
 
 1. Writes a **default route** (`0.0.0.0/0 via <virtual-gw>`) and **static MAC binding** into OVN NB — the [virtual gateway](#gatewayless-provider-networks) makes reply traffic exit the logical router without a real upstream gateway
 2. Installs **OVS MAC-tweak flows** on `br-ex` — rewrites the destination MAC on packets arriving from OVN's patch port so the kernel accepts them
-3. Creates `/32` **kernel routes** (with `ip rule` entries when using a dedicated routing table) on `br-ex` so the kernel can receive packets for each FIP
-4. Creates `/32` **FRR static routes** in `vrf-provider` so BGP announces each FIP to the external fabric
-5. Triggers a **BGP outbound soft-refresh** only when routes are removed (withdrawals) — additions rely on FRR's normal route redistribution to avoid disrupting existing BGP announcements
-6. **Verifies** all desired routes (FRR and kernel) after every route change and re-adds any that went missing as a safety net
+3. Installs **OVS hairpin flows** on `br-ex` — reflects same-chassis cross-router traffic back into OVN via `output:in_port` with rewritten MACs
+4. Creates `/32` **kernel routes** (with `ip rule` entries when using a dedicated routing table) on `br-ex` so the kernel can receive packets for each FIP
+5. Creates `/32` **FRR static routes** in `vrf-provider` so BGP announces each FIP to the external fabric
+6. Triggers a **BGP outbound soft-refresh** only when routes are removed (withdrawals) — additions rely on FRR's normal route redistribution to avoid disrupting existing BGP announcements
+7. **Verifies** all desired routes (FRR and kernel) after every route change and re-adds any that went missing as a safety net
 
 ### Data plane
 
@@ -878,7 +898,8 @@ This diagram shows the complete packet path on a gateway node. The upper half (d
  │  │   │  bridge IP 169.254.169.254│             │   DNAT: FIP → VM IP          │   │  │
  │  │   │  /32 route per FIP        │             │   SNAT: VM IP → FIP          │   │  │
  │  │   │  MAC-tweak flows (0x999)  │             │   default route → .254 ¹     │   │  │
- │  │   │                           │             │   MAC binding → br-ex MAC    │   │  │
+ │  │   │  Hairpin flows   (0x998)  │             │   MAC binding → br-ex MAC    │   │  │
+ │  │   │                           │             │                              │   │  │
  │  │   └─────────┬─────────────────┘             │                              │   │  │
  │  │        physical NIC                         │  ¹ virtual gateway (last     │   │  │
  │  │        (uplink)                             │    usable IP in subnet)      │   │  │
