@@ -3,6 +3,8 @@ package main
 import (
 	"fmt"
 	"net"
+	"slices"
+	"sort"
 	"strings"
 )
 
@@ -41,9 +43,13 @@ const (
 // the DNAT entry (wrong zone) and the reply is never policy-routed back
 // through the veth pair into the provider VRF.
 //
+// snatIPs contains the router SNAT external IPs discovered from OVN (type=snat
+// NAT entries). These are used by the router_masquerade feature to generate
+// targeted SNAT rules for traffic from instances behind a router without a FIP.
+//
 // Safety: all interpolated values (VIPs, protocols, dest addresses) must be
 // pre-validated by validateConfig before reaching this function.
-func buildNftRuleset(forwards []PortForwardVIP, providerNetworks []*net.IPNet, ctZone int) string {
+func buildNftRuleset(forwards []PortForwardVIP, providerNetworks []*net.IPNet, snatIPs []string, ctZone int) string {
 	// writeCTZoneRules emits conntrack zone assignment rules for both
 	// directions of DNAT'd flows. Used by prerouting_ctzone and
 	// output_ctzone to keep their rule sets in sync.
@@ -120,6 +126,23 @@ func buildNftRuleset(forwards []PortForwardVIP, providerNetworks []*net.IPNet, c
 	for _, pf := range forwards {
 		if pf.HairpinMasquerade {
 			hairpinVIPs = append(hairpinVIPs, pf.VIP)
+		}
+	}
+
+	// Collect VIPs with router_masquerade enabled. Router masquerade applies
+	// SNAT only to traffic whose source is a known router SNAT IP (discovered
+	// from OVN NB NAT entries of type "snat"). This solves the hairpin NAT
+	// problem for instances behind a router that have no Floating IP: the
+	// router SNAT'd source IP is an OVN-managed address, so without masquerade
+	// the backend's reply enters OVN's pipeline directly — bypassing this
+	// node's conntrack — and the reverse DNAT never fires.
+	// Unlike hairpin_masquerade (which uses the full provider CIDR), this is
+	// more surgical: only the specific known SNAT IPs are masqueraded, leaving
+	// all other external clients' IPs fully preserved.
+	var routerMasqVIPs []string
+	for _, pf := range forwards {
+		if pf.RouterMasquerade {
+			routerMasqVIPs = append(routerMasqVIPs, pf.VIP)
 		}
 	}
 
@@ -261,7 +284,7 @@ func buildNftRuleset(forwards []PortForwardVIP, providerNetworks []*net.IPNet, c
 		vethDefaultName, dnatReplyFwmark)
 	b.WriteString("    }\n")
 
-	// Chain: SNAT for two cases:
+	// Chain: SNAT for three cases:
 	//
 	// 1. Per-rule masquerade (masquerade: true on VIP or rule): matches on the
 	//    post-DNAT destination (backend address). Local backends must NOT be
@@ -276,8 +299,18 @@ func buildNftRuleset(forwards []PortForwardVIP, providerNetworks []*net.IPNet, c
 	//    and may route the reply asymmetrically (not back through this node).
 	//    By masquerading only provider-sourced traffic, non-hairpin clients are
 	//    unaffected.
+	//
+	// 3. Router masquerade (router_masquerade: true on VIP): matches on the
+	//    pre-DNAT source address being a known router SNAT IP. Solves the
+	//    hairpin NAT problem for instances without a FIP that reach the VIP
+	//    through a router: the router's external IP is OVN-managed, so the
+	//    backend's reply would normally enter OVN's pipeline directly (bypassing
+	//    this node's conntrack), preventing the reverse DNAT from firing.
+	//    More surgical than hairpin_masquerade: only specific SNAT IPs are
+	//    masqueraded, leaving external clients' IPs fully preserved.
 	hairpinNeeded := len(hairpinVIPs) > 0 && len(providerNetworks) > 0
-	if len(snatEntries) > 0 || hairpinNeeded {
+	routerMasqNeeded := len(routerMasqVIPs) > 0 && len(snatIPs) > 0
+	if len(snatEntries) > 0 || hairpinNeeded || routerMasqNeeded {
 		b.WriteString("    chain postrouting_snat {\n")
 		b.WriteString("        type nat hook postrouting priority srcnat; policy accept;\n")
 		for _, e := range snatEntries {
@@ -296,6 +329,21 @@ func buildNftRuleset(forwards []PortForwardVIP, providerNetworks []*net.IPNet, c
 				srcMatch = "{ " + strings.Join(nets, ", ") + " }"
 			}
 			for _, vip := range hairpinVIPs {
+				fmt.Fprintf(&b, "        ip saddr %s ct original daddr %s ct status dnat masquerade\n",
+					srcMatch, vip)
+			}
+		}
+		if routerMasqNeeded {
+			sortedSNATIPs := append([]string{}, snatIPs...)
+			sort.Strings(sortedSNATIPs)
+			sortedSNATIPs = slices.Compact(sortedSNATIPs)
+			var srcMatch string
+			if len(sortedSNATIPs) == 1 {
+				srcMatch = sortedSNATIPs[0]
+			} else {
+				srcMatch = "{ " + strings.Join(sortedSNATIPs, ", ") + " }"
+			}
+			for _, vip := range routerMasqVIPs {
 				fmt.Fprintf(&b, "        ip saddr %s ct original daddr %s ct status dnat masquerade\n",
 					srcMatch, vip)
 			}

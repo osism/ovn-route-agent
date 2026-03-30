@@ -44,8 +44,8 @@ func (rm *RouteManager) SetupPortForward() error {
 		return fmt.Errorf("manage VIP addresses: %w", err)
 	}
 
-	// 2. Apply nftables ruleset (initial, without provider networks for guard).
-	if err := rm.applyNftRuleset(nil); err != nil {
+	// 2. Apply nftables ruleset (initial, without provider networks or SNAT IPs).
+	if err := rm.applyNftRuleset(nil, nil); err != nil {
 		return fmt.Errorf("apply nftables ruleset: %w", err)
 	}
 
@@ -71,7 +71,9 @@ func (rm *RouteManager) SetupPortForward() error {
 // ReconcilePortForward ensures port forwarding state matches the desired config.
 // providerNetworks are needed for the forward_veth_guard chain (allow existing
 // veth leak return traffic in addition to DNAT return traffic).
-func (rm *RouteManager) ReconcilePortForward(providerNetworks []*net.IPNet) error {
+// snatIPs are the router SNAT external IPs from OVN state, used for
+// router_masquerade rules.
+func (rm *RouteManager) ReconcilePortForward(providerNetworks []*net.IPNet, snatIPs []string) error {
 	if !rm.portForwardEnabled {
 		return nil
 	}
@@ -83,7 +85,7 @@ func (rm *RouteManager) ReconcilePortForward(providerNetworks []*net.IPNet) erro
 	if err := rm.reconcilePortForwardVIPs(); err != nil {
 		return fmt.Errorf("reconcile VIP addresses: %w", err)
 	}
-	if err := rm.applyNftRuleset(providerNetworks); err != nil {
+	if err := rm.applyNftRuleset(providerNetworks, snatIPs); err != nil {
 		return fmt.Errorf("reconcile nftables ruleset: %w", err)
 	}
 	if err := rm.ensureDNATRouting(); err != nil {
@@ -284,8 +286,8 @@ func (rm *RouteManager) reconcilePortForwardVIPs() error {
 // applyNftRuleset atomically replaces the nftables table with the current config.
 // The delete + create is submitted as a single nft -f input to avoid a window
 // where no rules exist.
-func (rm *RouteManager) applyNftRuleset(providerNetworks []*net.IPNet) error {
-	ruleset := buildNftRuleset(rm.portForwards, providerNetworks, rm.portForwardCTZone)
+func (rm *RouteManager) applyNftRuleset(providerNetworks []*net.IPNet, snatIPs []string) error {
+	ruleset := buildNftRuleset(rm.portForwards, providerNetworks, snatIPs, rm.portForwardCTZone)
 
 	// Combine delete (if exists) and create into a single atomic nft load.
 	// The delete may fail on first run (table doesn't exist yet), so we

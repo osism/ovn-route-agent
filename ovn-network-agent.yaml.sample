@@ -176,3 +176,32 @@ ovn_nb_remote: "tcp:10.10.0.1:6641,tcp:10.10.0.2:6641,tcp:10.10.0.3:6641"
 #       - proto: tcp
 #         port: 443
 #         dest_addr: "10.0.0.100"
+#
+# Hairpin NAT options (per VIP):
+#
+#   hairpin_masquerade: true
+#     SNAT traffic from provider network CIDRs to the VIP. Fixes hairpin NAT
+#     for instances that have a Floating IP on the same network node: without
+#     this, the backend sees the FIP as source and may reply asymmetrically,
+#     bypassing this node's conntrack and breaking reverse DNAT.
+#     Uses the full provider CIDR (e.g. 203.0.113.0/24).
+#
+#   router_masquerade: true
+#     SNAT traffic from known router SNAT IPs to the VIP. Fixes hairpin NAT
+#     for instances behind a router that have no Floating IP: the router's
+#     external IP is OVN-managed, so the backend's reply would normally enter
+#     OVN's pipeline directly — bypassing this node's conntrack — and the
+#     reverse DNAT would never fire. Unlike hairpin_masquerade, this is more
+#     surgical: only the specific SNAT IPs (discovered dynamically from OVN NB
+#     NAT entries of type "snat") are masqueraded, leaving all other external
+#     clients' IPs fully preserved.
+#
+#   Example — VIP accessible from both FIPs and router-NAT'd instances:
+#   - vip: "198.51.100.30"
+#     manage_vip: true
+#     hairpin_masquerade: true  # covers FIPs on the same node
+#     router_masquerade: true   # covers instances behind a router (no FIP)
+#     rules:
+#       - proto: tcp
+#         port: 443
+#         dest_addr: "10.0.0.100"
