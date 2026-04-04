@@ -288,7 +288,7 @@ func (a *Agent) reconcile() {
 
 	// Port forwarding reconciliation runs regardless of local router
 	// presence — DNAT VIPs are managed independently of OVN gateway state.
-	if err := a.routing.ReconcilePortForward(a.effectiveFilters); err != nil {
+	if err := a.routing.ReconcilePortForward(a.effectiveFilters, state.SNATIPs); err != nil {
 		slog.Error("failed to reconcile port forwarding", "error", err)
 	}
 

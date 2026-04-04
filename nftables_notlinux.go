@@ -19,7 +19,7 @@ func (rm *RouteManager) SetupPortForward() error {
 	return fmt.Errorf("port forwarding is only supported on Linux")
 }
 
-func (rm *RouteManager) ReconcilePortForward(providerNetworks []*net.IPNet) error {
+func (rm *RouteManager) ReconcilePortForward(providerNetworks []*net.IPNet, snatIPs []string) error {
 	if !rm.portForwardEnabled {
 		return nil
 	}
