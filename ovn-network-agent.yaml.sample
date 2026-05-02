@@ -70,8 +70,9 @@ ovn_nb_remote: "tcp:10.10.0.1:6641,tcp:10.10.0.2:6641,tcp:10.10.0.3:6641"
 # When enabled, the agent lowers its Gateway_Chassis priority to 0 on shutdown,
 # causing OVN to migrate chassisredirect ports to standby chassis before cleanup.
 # This eliminates the traffic disruption window between BGP withdrawal and OVN failover.
-# Note: Priorities are NOT restored on shutdown. Neutron's L3 HA scheduler will
-# rebalance when the chassis returns.
+# Note: On the next startup the agent restores drained entries to priority 1
+# (standby level); the active chassis maintains a strict priority lead via
+# EnsureActivePriorityLead so reverse failover does not occur.
 # drain_on_shutdown: true
 
 # Maximum time to wait for gateway drain (default: 60s)
