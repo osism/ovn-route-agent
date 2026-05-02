@@ -1,5 +1,16 @@
 # /etc/default/ovn-network-agent — Environment configuration for ovn-network-agent.service
 #
+# Configuration priority (highest wins):
+#   CLI flags > environment variables > config file > defaults
+#
+# This file lists every env var consumed by the agent (see applyEnvConfig in
+# config.go). All values shown after "=" are the built-in defaults; uncomment
+# only the lines you need to override.
+
+# Path to a YAML config file. Equivalent to passing --config on the CLI.
+# Settings in this file are overridden by env vars below (and CLI flags).
+#OVN_NETWORK_CONFIG=/etc/ovn-network-agent/config.yaml
+
 # OVN Southbound DB connection (required)
 # The agent runs on network/gateway nodes and connects to the OVN databases
 # on the control nodes via TCP. Comma-separated for clustered setups (failover).
@@ -11,6 +22,10 @@ OVN_NETWORK_OVN_NB_REMOTE=tcp:10.10.0.1:6641,tcp:10.10.0.2:6641,tcp:10.10.0.3:66
 # Provider bridge device for kernel routes
 #OVN_NETWORK_BRIDGE_DEV=br-ex
 
+# Link-local IP added to the bridge device for kernel ARP resolution.
+# Not routable; can be identical on all nodes (br-ex has no physical NIC).
+#OVN_NETWORK_BRIDGE_IP=169.254.169.254
+
 # VRF name for FRR static routes
 #OVN_NETWORK_VRF_NAME=vrf-provider
 
@@ -18,12 +33,21 @@ OVN_NETWORK_OVN_NB_REMOTE=tcp:10.10.0.1:6641,tcp:10.10.0.2:6641,tcp:10.10.0.3:66
 #OVN_NETWORK_VETH_NEXTHOP=169.254.0.1
 
 # Filter FIPs by CIDRs (comma-separated, e.g. 192.0.2.0/24,198.51.100.0/24)
-# Leave empty to manage all NAT IPs without filtering
+# Leave empty to auto-discover networks from locally-active routers.
 #OVN_NETWORK_NETWORK_CIDR=
 
-# Logical port name for gateway chassis selection
-# Set when multiple gateway routers exist
+# Restrict the agent to a single chassisredirect port (e.g. cr-lrp-abc123).
+# Leave empty to track all locally-active routers (default, multi-router mode).
 #OVN_NETWORK_GATEWAY_PORT=
+
+# Dedicated routing table ID for FIP routes (0 = main table, 1-252 = dedicated).
+# A dedicated table avoids polluting the main routing table; ip rules are added
+# automatically to steer traffic.
+#OVN_NETWORK_ROUTE_TABLE_ID=0
+
+# Command prefix for ovs-vsctl/ovs-ofctl when OVS runs in a container
+# (e.g. "docker exec openvswitch_vswitchd"). Leave empty when ovs-vsctl is in PATH.
+#OVN_NETWORK_OVS_WRAPPER=
 
 # Full reconciliation interval (Go duration format)
 #OVN_NETWORK_RECONCILE_INTERVAL=60s
@@ -31,12 +55,38 @@ OVN_NETWORK_OVN_NB_REMOTE=tcp:10.10.0.1:6641,tcp:10.10.0.2:6641,tcp:10.10.0.3:66
 # Log level: debug, info, warn, error
 #OVN_NETWORK_LOG_LEVEL=info
 
+# Dry-run mode: connect and reconcile but only log what would be done.
+# Accepts "1" / "true" to enable.
+#OVN_NETWORK_DRY_RUN=false
+
 # Remove all managed routes on shutdown (default: true)
-# Set to false to keep routes in place when the agent stops
+# Set to "0" or "false" to keep routes in place when the agent stops.
 #OVN_NETWORK_CLEANUP_ON_SHUTDOWN=true
 
+# Drain HA gateways before shutdown (default: true)
+# When enabled, the agent lowers its Gateway_Chassis priority to 0 on shutdown,
+# causing OVN to migrate chassisredirect ports to standby chassis before cleanup.
+# Eliminates the disruption window between BGP withdrawal and OVN failover.
+# Priorities are NOT restored on shutdown; Neutron's L3 HA scheduler rebalances
+# when the chassis returns. Set to "0" or "false" to disable.
+#OVN_NETWORK_DRAIN_ON_SHUTDOWN=true
+
+# Maximum time to wait for gateway drain (Go duration format).
+# After this timeout, shutdown proceeds even if some gateways have not migrated.
+#OVN_NETWORK_DRAIN_TIMEOUT=60s
+
+# FRR prefix-list to manage dynamically. The agent adds/removes
+# "permit <network> ge 32 le 32" entries for each discovered provider network.
+# Set to empty string to disable prefix-list management.
+#OVN_NETWORK_FRR_PREFIX_LIST=ANNOUNCED-NETWORKS
+
+# Grace period before cleaning up OVN NB entries from chassis that have
+# disappeared from the SB Chassis table (Go duration format).
+# Set to "0" to disable stale chassis cleanup.
+#OVN_NETWORK_STALE_CHASSIS_GRACE_PERIOD=5m
+
 # Veth VRF route leaking (replaces contrib/veth-vrf-leak.sh)
-# Set to false to disable automatic veth pair setup for VRF route leaking
+# Set to "0" or "false" to disable automatic veth pair setup for VRF route leaking.
 #OVN_NETWORK_VETH_LEAK_ENABLED=true
 
 # IP of the veth-provider side (default: computed from VETH_NEXTHOP + 1)
@@ -47,3 +97,28 @@ OVN_NETWORK_OVN_NB_REMOTE=tcp:10.10.0.1:6641,tcp:10.10.0.2:6641,tcp:10.10.0.3:66
 
 # Policy rule priority for veth leak rules
 #OVN_NETWORK_VETH_LEAK_RULE_PRIORITY=2000
+
+# =============================================================================
+# Port forwarding (DNAT)
+# =============================================================================
+# Forward traffic arriving at anycast VIP addresses to internal backends.
+# Requires OVN_NETWORK_VETH_LEAK_ENABLED=true and the nft binary in PATH.
+# Individual VIPs and rules are configured via the YAML config file (port_forwards).
+
+# Loopback device that holds VIP addresses in the provider VRF.
+#OVN_NETWORK_PORT_FORWARD_DEV=loopback1
+
+# Dedicated routing table for DNAT return traffic (1-252).
+# Must differ from ROUTE_TABLE_ID and VETH_LEAK_TABLE_ID.
+#OVN_NETWORK_PORT_FORWARD_TABLE_ID=201
+
+# Conntrack zone for DNAT flows (1-65535).
+# Must not collide with OVN/OVS conntrack zones. OVN assigns zones per logical
+# datapath starting from low numbers; the high default avoids collisions.
+#OVN_NETWORK_PORT_FORWARD_CT_ZONE=64000
+
+# Enable udp/tcp_l3mdev_accept sysctl. Required when a DNAT backend runs on
+# the same host but in a different VRF than the VIP. This is a global sysctl
+# that affects ALL sockets — only enable when needed.
+# Accepts "1" / "true" to enable.
+#OVN_NETWORK_PORT_FORWARD_L3MDEV_ACCEPT=false
