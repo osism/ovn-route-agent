@@ -42,6 +42,7 @@ Event-driven network agent for OVN-based OpenStack environments. A real-time dae
   - [Priority semantics](#priority-semantics)
   - [Configuration](#configuration-1)
   - [When to disable drain](#when-to-disable-drain)
+- [Metrics](#metrics)
 - [Architecture](#architecture)
   - [Control plane](#control-plane)
   - [Data plane](#data-plane)
@@ -159,6 +160,7 @@ CLI flags take precedence over values in the config file.
 | `--drain-timeout` | `OVN_NETWORK_DRAIN_TIMEOUT` | `drain_timeout` | `60s` | Maximum time to wait for gateway drain before proceeding with shutdown |
 | `--frr-prefix-list` | `OVN_NETWORK_FRR_PREFIX_LIST` | `frr_prefix_list` | `ANNOUNCED-NETWORKS` | FRR prefix-list name to manage dynamically; adds `permit <network> ge 32 le 32` entries for each discovered provider network (set to empty string to disable) |
 | `--stale-chassis-grace-period` | `OVN_NETWORK_STALE_CHASSIS_GRACE_PERIOD` | `stale_chassis_grace_period` | `5m` | Grace period before cleaning up OVN NB entries from chassis that have disappeared from the SB Chassis table; set to `0` to disable |
+| `--metrics-listen` | `OVN_NETWORK_METRICS_LISTEN` | `metrics_listen` | *(empty = disabled)* | Bind address for the Prometheus `/metrics` endpoint (e.g. `127.0.0.1:9273`); see [Metrics](#metrics) |
 | `--veth-leak-enabled` | `OVN_NETWORK_VETH_LEAK_ENABLED` | `veth_leak_enabled` | `true` | Enable automatic veth VRF route leaking |
 | `--veth-provider-ip` | `OVN_NETWORK_VETH_PROVIDER_IP` | `veth_provider_ip` | *(nexthop+1)* | IP of the veth-provider side (auto-computed from `veth_nexthop` + 1) |
 | `--veth-leak-table-id` | `OVN_NETWORK_VETH_LEAK_TABLE_ID` | `veth_leak_table_id` | `200` | Routing table for the leak default route (1-252, must differ from `route_table_id`) |
@@ -867,6 +869,45 @@ OVN_NETWORK_DRAIN_TIMEOUT=120s                              # increase timeout
 - **Single-chassis deployments** — if there is no standby chassis, lowering the priority has no effect and the timeout just delays shutdown.
 - **Non-HA routers** — routers without multiple `Gateway_Chassis` entries cannot fail over; drain is a no-op (the agent detects this and skips immediately).
 - **Environments where Neutron manages priorities** — if an external system actively manages `Gateway_Chassis` priorities and would conflict with the agent's changes.
+
+## Metrics
+
+The agent can expose Prometheus-formatted metrics on an optional HTTP endpoint. Enable it by setting `--metrics-listen` (or `OVN_NETWORK_METRICS_LISTEN` / `metrics_listen`) to a `host:port` such as `127.0.0.1:9273`. The endpoint is **off by default**; bind to `127.0.0.1` for node-local scraping, or to `0.0.0.0` for a remote scraper.
+
+```bash
+ovn-network-agent --metrics-listen 127.0.0.1:9273
+curl -s http://127.0.0.1:9273/metrics
+```
+
+Two paths are served:
+
+- `/metrics` — Prometheus exposition format
+- `/healthz` — returns `200 ok` for liveness probes
+
+All metrics are prefixed with `ovn_network_agent_`:
+
+| Metric | Type | Labels | Description |
+|--------|------|--------|-------------|
+| `reconcile_total` | counter | `trigger`={`event`,`periodic`,`startup`} | Total reconcile cycles |
+| `reconcile_duration_seconds` | histogram | — | Per-cycle reconcile duration |
+| `reconcile_in_progress` | gauge | — | `1` while a reconcile is running |
+| `desired_ips` | gauge | — | Unique IPs the agent currently routes (FIPs + SNATs + port-forward VIPs) |
+| `local_routers` | gauge | — | Routers whose chassisredirect port is locally active |
+| `effective_networks` | gauge | — | Effective network filter count (manual or auto-discovered) |
+| `route_readds_total` | counter | `plane`={`kernel`,`frr`} | Routes re-added by post-change verification |
+| `consecutive_readds` | gauge | — | Consecutive cycles requiring re-adds (sustained non-zero indicates instability) |
+| `ovn_connection_state` | gauge | `database`={`sb`,`nb`} | `1` when the OVN client is connected, `0` otherwise |
+| `drain_duration_seconds` | histogram | — | Duration of gateway drain on shutdown |
+| `drain_total` | counter | `outcome`={`completed`,`timeout`,`error`,`noop`} | Drain operations |
+| `stale_chassis_cleanup_total` | counter | `outcome`={`success`,`error`} | Stale chassis cleanup events |
+| `missing_chassis` | gauge | — | Chassis currently tracked as missing from the SB Chassis table |
+
+### Suggested alerts
+
+- `consecutive_readds >= 3` — persistent route instability (FRR or kernel races).
+- `ovn_connection_state{database="nb"} == 0` for >2m — NB DB unreachable; agent cannot write OVN state.
+- `rate(route_readds_total[10m]) > 0` — flapping routes.
+- `histogram_quantile(0.95, rate(reconcile_duration_seconds_bucket[5m])) > 5` — slow reconciles.
 
 ## Architecture
 

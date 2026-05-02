@@ -267,6 +267,7 @@ func (o *OVNClient) Connect(ctx context.Context) error {
 		return fmt.Errorf("connect SB: %w", err)
 	}
 	slog.Info("connected to OVN SB", "remote", o.cfg.OVNSBRemote)
+	setOVNConnectionState("sb", true)
 
 	// Monitor SB tables
 	o.sbClient.Cache().AddEventHandler(&sbEventHandler{ovn: o})
@@ -303,6 +304,7 @@ func (o *OVNClient) Connect(ctx context.Context) error {
 		return fmt.Errorf("connect NB: %w", err)
 	}
 	slog.Info("connected to OVN NB", "remote", o.cfg.OVNNBRemote)
+	setOVNConnectionState("nb", true)
 
 	// Monitor NB tables
 	o.nbClient.Cache().AddEventHandler(&nbEventHandler{ovn: o})
@@ -359,10 +361,12 @@ func (o *OVNClient) closeClients() {
 	if o.sbClient != nil {
 		o.sbClient.Close()
 		o.sbClient = nil
+		setOVNConnectionState("sb", false)
 	}
 	if o.nbClient != nil {
 		o.nbClient.Close()
 		o.nbClient = nil
+		setOVNConnectionState("nb", false)
 	}
 }
 

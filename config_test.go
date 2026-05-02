@@ -1420,3 +1420,64 @@ func TestNextIPInSubnet(t *testing.T) {
 		})
 	}
 }
+
+func TestLoadConfigMetricsListenDefaultDisabled(t *testing.T) {
+	cfg, err := loadConfig(nil)
+	if err != nil {
+		t.Fatalf("loadConfig() error: %v", err)
+	}
+	if cfg.MetricsListen != "" {
+		t.Errorf("MetricsListen default = %q, want empty (disabled)", cfg.MetricsListen)
+	}
+}
+
+func TestLoadConfigMetricsListenViaCLI(t *testing.T) {
+	cfg, err := loadConfig([]string{"--metrics-listen", "127.0.0.1:9273"})
+	if err != nil {
+		t.Fatalf("loadConfig() error: %v", err)
+	}
+	if cfg.MetricsListen != "127.0.0.1:9273" {
+		t.Errorf("MetricsListen = %q, want %q", cfg.MetricsListen, "127.0.0.1:9273")
+	}
+}
+
+func TestApplyEnvConfigMetricsListen(t *testing.T) {
+	cfg := Config{}
+	t.Setenv("OVN_NETWORK_METRICS_LISTEN", "0.0.0.0:9273")
+	applyEnvConfig(&cfg)
+	if cfg.MetricsListen != "0.0.0.0:9273" {
+		t.Errorf("MetricsListen = %q, want %q", cfg.MetricsListen, "0.0.0.0:9273")
+	}
+}
+
+func TestApplyFileConfigMetricsListen(t *testing.T) {
+	cfg := Config{}
+	listen := "127.0.0.1:9273"
+	fc := configFile{MetricsListen: listen}
+	applyFileConfig(&cfg, &fc)
+	if cfg.MetricsListen != listen {
+		t.Errorf("MetricsListen = %q, want %q", cfg.MetricsListen, listen)
+	}
+}
+
+func TestLoadConfigMetricsListenInvalid(t *testing.T) {
+	_, err := loadConfig([]string{
+		"--ovn-sb-remote", "tcp:10.0.0.1:6642",
+		"--ovn-nb-remote", "tcp:10.0.0.1:6641",
+		"--metrics-listen", "no-port-here",
+	})
+	if err == nil {
+		t.Fatal("expected validation error for malformed metrics-listen")
+	}
+}
+
+func TestLoadConfigCLIOverridesEnvMetricsListen(t *testing.T) {
+	t.Setenv("OVN_NETWORK_METRICS_LISTEN", "127.0.0.1:9000")
+	cfg, err := loadConfig([]string{"--metrics-listen", "127.0.0.1:9273"})
+	if err != nil {
+		t.Fatalf("loadConfig() error: %v", err)
+	}
+	if cfg.MetricsListen != "127.0.0.1:9273" {
+		t.Errorf("MetricsListen = %q, want %q (CLI > env)", cfg.MetricsListen, "127.0.0.1:9273")
+	}
+}

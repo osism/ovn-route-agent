@@ -123,7 +123,7 @@ func (a *Agent) Run(ctx context.Context) error {
 	}
 
 	// Initial reconciliation
-	a.reconcile(ctx)
+	a.reconcile(ctx, "startup")
 
 	// Drain any reconcile signals queued during startup — the initial
 	// reconcile already handled the current state.
@@ -146,8 +146,17 @@ func (a *Agent) Run(ctx context.Context) error {
 			if a.cfg.DrainOnShutdown {
 				drainCtx, drainCancel := context.WithTimeout(context.Background(), a.cfg.DrainTimeout)
 				slog.Info("drain mode active, migrating gateways away", "timeout", a.cfg.DrainTimeout)
-				if err := a.ovn.DrainGateways(drainCtx, a.ovn.GetState().LocalChassisName); err != nil {
+				drainStart := time.Now()
+				err := a.ovn.DrainGateways(drainCtx, a.ovn.GetState().LocalChassisName)
+				drainElapsed := time.Since(drainStart)
+				switch {
+				case err != nil:
 					slog.Error("drain failed", "error", err)
+					recordDrain("error", drainElapsed)
+				case drainCtx.Err() != nil:
+					recordDrain("timeout", drainElapsed)
+				default:
+					recordDrain("completed", drainElapsed)
 				}
 				drainCancel()
 			}
@@ -161,17 +170,25 @@ func (a *Agent) Run(ctx context.Context) error {
 
 		case <-a.reconcileCh:
 			slog.Debug("event-triggered reconciliation")
-			a.reconcile(ctx)
+			a.reconcile(ctx, "event")
 
 		case <-ticker.C:
 			slog.Debug("periodic reconciliation")
-			a.reconcile(ctx)
+			a.reconcile(ctx, "periodic")
 		}
 	}
 }
 
 // reconcile ensures the local routing state matches the desired state from OVN.
-func (a *Agent) reconcile(ctx context.Context) {
+// The trigger label identifies why the cycle ran (event, periodic, startup).
+func (a *Agent) reconcile(ctx context.Context, trigger string) {
+	start := time.Now()
+	setReconcileInProgress(true)
+	defer func() {
+		setReconcileInProgress(false)
+		recordReconcile(trigger, time.Since(start))
+	}()
+
 	state := a.ovn.GetState()
 
 	// Compute effective network filters for this cycle.
@@ -219,6 +236,8 @@ func (a *Agent) reconcile(ctx context.Context) {
 		desiredIPs = append(desiredIPs, pf.VIP)
 	}
 	desiredIPs = uniqueIPs(desiredIPs)
+
+	setDesiredState(len(desiredIPs), len(state.LocalRouters), len(a.effectiveFilters))
 
 	slog.Info("reconciling",
 		"has_local_routers", state.HasLocalRouters,
@@ -348,6 +367,8 @@ func (a *Agent) cleanupStaleChassis(ctx context.Context, allChassis map[string]b
 		}
 	}
 
+	setMissingChassis(len(a.missingChassis))
+
 	// Find chassis that have exceeded the grace period.
 	staleChassis := make(map[string]bool)
 	for chassisName, firstSeen := range a.missingChassis {
@@ -366,12 +387,15 @@ func (a *Agent) cleanupStaleChassis(ctx context.Context, allChassis map[string]b
 
 	if err := a.ovn.CleanupStaleChassisManagedEntries(ctx, staleChassis); err != nil {
 		slog.Error("failed to clean up stale chassis entries", "error", err)
+		recordStaleChassisCleanup("error", len(staleChassis))
 		return
 	}
 
+	recordStaleChassisCleanup("success", len(staleChassis))
 	for chassisName := range staleChassis {
 		delete(a.missingChassis, chassisName)
 	}
+	setMissingChassis(len(a.missingChassis))
 }
 
 // computeEffectiveNetworks returns the network filters to use: manual config if set,
@@ -631,6 +655,7 @@ func (a *Agent) verifyRoutes(desiredIPs []string) int {
 	}
 
 	totalReAdds := len(reAddFRR) + reAddKernel
+	recordRouteReAdds(len(reAddFRR), reAddKernel)
 	if totalReAdds > 0 {
 		a.consecutiveReAdds++
 		if a.consecutiveReAdds >= consecutiveReAddThreshold {
@@ -642,6 +667,7 @@ func (a *Agent) verifyRoutes(desiredIPs []string) int {
 	} else {
 		a.consecutiveReAdds = 0
 	}
+	setConsecutiveReAdds(a.consecutiveReAdds)
 
 	return totalReAdds
 }
