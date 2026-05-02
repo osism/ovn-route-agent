@@ -41,7 +41,7 @@ jobs:
         run: |
           VERSION="${GITHUB_REF_NAME#v}"
           sed 's|/usr/local/bin/|/usr/bin/|' ovn-network-agent.service > ovn-network-agent.service.pkg
-          go install github.com/goreleaser/nfpm/v2/cmd/nfpm@latest
+          go install github.com/goreleaser/nfpm/v2/cmd/nfpm@v2.46.3
           GOARCH=${{ matrix.goarch }} VERSION="${VERSION}" nfpm package --packager deb --target .
 
       - uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7
