@@ -173,13 +173,19 @@ func buildNftRuleset(forwards []PortForwardVIP, providerNetworks []*net.IPNet, c
 			} else {
 				// jhash: consistent source-IP hashing distributes clients
 				// across backends. Same client IP → same backend (sticky).
+				//
+				// nft note: inside a verdict map for `dnat to`, the
+				// (addr, port) target must use the concat operator
+				// (`addr . port`), not the inline `addr:port` form. The
+				// inline form is only valid for a single non-mapped
+				// dnat target.
 				fmt.Fprintf(&b, "        ip daddr %s %s dport %d dnat to jhash ip saddr mod %d map { ",
 					pf.VIP, r.Proto, r.Port, len(addrs))
 				for i, addr := range addrs {
 					if i > 0 {
 						b.WriteString(", ")
 					}
-					fmt.Fprintf(&b, "%d : %s:%d", i, addr, destPort)
+					fmt.Fprintf(&b, "%d : %s . %d", i, addr, destPort)
 				}
 				b.WriteString(" }\n")
 			}
@@ -204,10 +210,15 @@ func buildNftRuleset(forwards []PortForwardVIP, providerNetworks []*net.IPNet, c
 		fmt.Fprintf(&b, "        ct direction reply ct status dnat ct original daddr %s meta mark set 0x%x\n",
 			allVIPs[0], dnatReplyFwmark)
 	} else {
+		// nft note: for a single bare-IP literal, `ct original daddr`
+		// can infer the address family. For an anonymous set with
+		// multiple values it cannot, and rejects with "specify either
+		// ip or ip6 for address matching". The explicit `ip daddr`
+		// pins the family so the set parses.
 		vipSet := strings.Join(allVIPs, ", ")
-		fmt.Fprintf(&b, "        ct direction original ct status dnat ct original daddr { %s } meta mark set 0x%x\n",
+		fmt.Fprintf(&b, "        ct direction original ct status dnat ct original ip daddr { %s } meta mark set 0x%x\n",
 			vipSet, dnatFwmark)
-		fmt.Fprintf(&b, "        ct direction reply ct status dnat ct original daddr { %s } meta mark set 0x%x\n",
+		fmt.Fprintf(&b, "        ct direction reply ct status dnat ct original ip daddr { %s } meta mark set 0x%x\n",
 			vipSet, dnatReplyFwmark)
 	}
 	b.WriteString("    }\n")
@@ -224,8 +235,11 @@ func buildNftRuleset(forwards []PortForwardVIP, providerNetworks []*net.IPNet, c
 		fmt.Fprintf(&b, "        ct direction reply ct status dnat ct original daddr %s meta mark set 0x%x\n",
 			allVIPs[0], dnatReplyFwmark)
 	} else {
+		// Same family-inference issue as prerouting_fwmark — see
+		// the comment there. The explicit `ip daddr` pins the family
+		// so the multi-element set parses.
 		vipSet := strings.Join(allVIPs, ", ")
-		fmt.Fprintf(&b, "        ct direction reply ct status dnat ct original daddr { %s } meta mark set 0x%x\n",
+		fmt.Fprintf(&b, "        ct direction reply ct status dnat ct original ip daddr { %s } meta mark set 0x%x\n",
 			vipSet, dnatReplyFwmark)
 	}
 	b.WriteString("    }\n")
