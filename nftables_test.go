@@ -131,10 +131,10 @@ func TestBuildNftRulesetMultipleVIPs(t *testing.T) {
 	}
 
 	// Verify fwmark chain uses set syntax for multiple VIPs (both directions)
-	if !strings.Contains(result, "ct direction original ct status dnat ct original daddr { 198.51.100.10, 198.51.100.20 } meta mark set 0x100") {
+	if !strings.Contains(result, "ct direction original ct status dnat ct original ip daddr { 198.51.100.10, 198.51.100.20 } meta mark set 0x100") {
 		t.Errorf("forward fwmark should use set syntax for multiple VIPs, got:\n%s", result)
 	}
-	if !strings.Contains(result, "ct direction reply ct status dnat ct original daddr { 198.51.100.10, 198.51.100.20 } meta mark set 0x200") {
+	if !strings.Contains(result, "ct direction reply ct status dnat ct original ip daddr { 198.51.100.10, 198.51.100.20 } meta mark set 0x200") {
 		t.Errorf("reply fwmark should use set syntax for multiple VIPs, got:\n%s", result)
 	}
 
@@ -144,7 +144,7 @@ func TestBuildNftRulesetMultipleVIPs(t *testing.T) {
 	}
 	// Extract output_fwmark chain content and verify set syntax
 	outputFwmark := extractChain(result, "output_fwmark")
-	if !strings.Contains(outputFwmark, "ct direction reply ct status dnat ct original daddr { 198.51.100.10, 198.51.100.20 } meta mark set 0x200") {
+	if !strings.Contains(outputFwmark, "ct direction reply ct status dnat ct original ip daddr { 198.51.100.10, 198.51.100.20 } meta mark set 0x200") {
 		t.Errorf("output_fwmark should use set syntax for multiple VIPs, got:\n%s", outputFwmark)
 	}
 
@@ -387,8 +387,10 @@ func TestBuildNftRulesetMultiBackend(t *testing.T) {
 
 	result := buildNftRuleset(forwards, nil, dnatCTZoneDefault)
 
-	// Verify jhash-based DNAT rule
-	expected := "ip daddr 198.51.100.10 udp dport 53 dnat to jhash ip saddr mod 3 map { 0 : 10.0.0.200:1053, 1 : 10.0.0.201:1053, 2 : 10.0.0.202:1053 }"
+	// Verify jhash-based DNAT rule. nft requires the concat operator
+	// (`addr . port`) inside a verdict map; the inline `addr:port` form
+	// is only valid for non-mapped dnat targets.
+	expected := "ip daddr 198.51.100.10 udp dport 53 dnat to jhash ip saddr mod 3 map { 0 : 10.0.0.200 . 1053, 1 : 10.0.0.201 . 1053, 2 : 10.0.0.202 . 1053 }"
 	if !strings.Contains(result, expected) {
 		t.Errorf("missing jhash DNAT rule.\nwant: %s\ngot:\n%s", expected, result)
 	}
@@ -414,8 +416,9 @@ func TestBuildNftRulesetMultiBackendTwoBackends(t *testing.T) {
 
 	result := buildNftRuleset(forwards, nil, dnatCTZoneDefault)
 
-	// With two backends, jhash mod 2
-	expected := "ip daddr 198.51.100.10 tcp dport 443 dnat to jhash ip saddr mod 2 map { 0 : 10.0.0.100:443, 1 : 10.0.0.101:443 }"
+	// With two backends, jhash mod 2. Map values use the concat operator
+	// (`addr . port`); see TestBuildNftRulesetMultiBackend for context.
+	expected := "ip daddr 198.51.100.10 tcp dport 443 dnat to jhash ip saddr mod 2 map { 0 : 10.0.0.100 . 443, 1 : 10.0.0.101 . 443 }"
 	if !strings.Contains(result, expected) {
 		t.Errorf("missing jhash DNAT rule for 2 backends.\nwant: %s\ngot:\n%s", expected, result)
 	}
