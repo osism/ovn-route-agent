@@ -266,4 +266,8 @@ func scrubLocalState(t *testing.T) {
 		_ = exec.Command("ovs-ofctl", "del-flows", DefaultBridgeDev,
 			fmt.Sprintf("cookie=%s/-1", cookie)).Run()
 	}
+
+	// Port-forward residue: managed VIPs on loopback1, fwmark ip rules,
+	// the port-forward reply table. Calls into portforward.go.
+	scrubPortForwardState(t)
 }

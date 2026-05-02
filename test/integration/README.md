@@ -14,8 +14,17 @@ test/integration/
   scenarios_helpers_test.go        — shared per-scenario boilerplate (startScenario, readyAgent)
   scenario_fip_test.go             — FIP add/remove, gatewayless gw, multi-router on one chassis
   scenario_failover_test.go        — failover, stale-chassis cleanup, drain & restore-drained
+  scenario_port_forward_test.go    — DNAT, sticky multi-backend, VIP mgmt, masquerade, hairpin
   testenv/                         — Setup, Teardown, RunAgent, MakeLocalRouter, Assert*, …
 ```
+
+Port-forward scenarios additionally rely on:
+
+- a `loopback1` dummy device enslaved to `vrf-provider` (created by setup.sh)
+- the `nft -j list ruleset` JSON output for stable, structured assertions
+  (parsers live in `testenv/nftjson.go`)
+- save/restore of the global `udp_l3mdev_accept` / `tcp_l3mdev_accept`
+  sysctls when a scenario sets `port_forward_l3mdev_accept: true`
 
 Scenario tests pause `ovn-northd` for the duration of each test (via
 `testenv.PauseOVNNorthd`) so the test driver can write SB Port_Binding rows
