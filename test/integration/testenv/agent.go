@@ -35,7 +35,9 @@ type AgentConfig struct {
 	DrainOnShutdown   *bool `yaml:"drain_on_shutdown,omitempty"`
 	VethLeakEnabled   *bool `yaml:"veth_leak_enabled,omitempty"`
 
-	ReconcileInterval string `yaml:"reconcile_interval,omitempty"`
+	ReconcileInterval       string `yaml:"reconcile_interval,omitempty"`
+	StaleChassisGracePeriod string `yaml:"stale_chassis_grace_period,omitempty"`
+	DrainTimeout            string `yaml:"drain_timeout,omitempty"`
 }
 
 // Defaults returns an AgentConfig wired for the local test stack:
@@ -239,6 +241,8 @@ func writeTempConfig(t *testing.T, cfg AgentConfig) string {
 	fmt.Fprintf(&b, "frr_prefix_list: %q\n", cfg.FRRPrefixList)
 	w("log_level", cfg.LogLevel)
 	w("reconcile_interval", cfg.ReconcileInterval)
+	w("stale_chassis_grace_period", cfg.StaleChassisGracePeriod)
+	w("drain_timeout", cfg.DrainTimeout)
 	wb("dry_run", cfg.DryRun)
 	wb("cleanup_on_shutdown", cfg.CleanupOnShutdown)
 	wb("drain_on_shutdown", cfg.DrainOnShutdown)

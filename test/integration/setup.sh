@@ -84,11 +84,18 @@ start_ovn_host() {
     log "configuring ovn-controller"
     local hostname
     hostname=$(hostname -s)
+    # Pin both system-id (becomes Chassis.name) AND external_ids:hostname
+    # (becomes Chassis.hostname). Without external_ids:hostname,
+    # ovn-controller falls back to gethostname(2), which on some runners
+    # returns the FQDN, breaking the agent's local-router detection
+    # (it compares Chassis.hostname against the short form of its own
+    # hostname).
     ovs-vsctl set Open_vSwitch . \
         external_ids:ovn-remote=tcp:127.0.0.1:6642 \
         external_ids:ovn-encap-type=geneve \
         external_ids:ovn-encap-ip=127.0.0.1 \
-        external_ids:system-id="${hostname}"
+        external_ids:system-id="${hostname}" \
+        external_ids:hostname="${hostname}"
     systemctl enable --now ovn-host
     for _ in $(seq 1 30); do
         if ovs-vsctl br-exists br-int 2>/dev/null; then
