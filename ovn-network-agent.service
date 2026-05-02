@@ -21,15 +21,21 @@ After=network-online.target
 After=kolla-openvswitch_vswitchd-container.service
 After=kolla-ovn_controller-container.service
 
+# Cap restart storms on persistent fatal errors (e.g. getHostname failure):
+# allow at most 10 restarts within 120s before systemd marks the unit failed.
+StartLimitIntervalSec=120
+StartLimitBurst=10
+
 [Service]
 Type=simple
 ExecStart=/usr/local/bin/ovn-network-agent --config /etc/ovn-network-agent/config.yaml
 Restart=always
 RestartSec=5
 
-# Allow enough time for drain (default 30s) + cleanup before SIGKILL.
+# Allow drain (default 60s, see DrainTimeout in config.go) + cleanup margin
+# (removeAllRoutes, RemoveOVSFlows, RemoveManagedNBEntries) before SIGKILL.
 # Must be longer than the configured drain timeout.
-TimeoutStopSec=60
+TimeoutStopSec=120
 
 # Environment overrides (optional, takes precedence over config file)
 EnvironmentFile=-/etc/default/ovn-network-agent
