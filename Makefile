@@ -3,7 +3,7 @@ VERSION   ?= $(shell git describe --tags --always --dirty 2>/dev/null || echo "d
 LDFLAGS   := -s -w -X main.version=$(VERSION)
 GOFLAGS   := -trimpath
 
-.PHONY: all build build-static clean fmt vet test install
+.PHONY: all build build-static clean fmt vet test test-integration install
 
 all: build
 
@@ -22,6 +22,12 @@ vet:
 
 test:
 	go test -v ./...
+
+# Integration tests exercise the agent against a real OVN/OVS/FRR/nftables
+# stack. They require Linux + root (CAP_NET_ADMIN). See test/integration/README.md
+# for local-run prerequisites.
+test-integration: build
+	OVN_AGENT_BINARY=$(CURDIR)/$(BINARY) go test -tags=integration -v -count=1 ./test/integration/...
 
 clean:
 	rm -f $(BINARY)
