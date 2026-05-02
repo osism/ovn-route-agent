@@ -9,6 +9,10 @@ import (
 	"strings"
 )
 
+// ovsExecFunc is the signature of an exec.Cmd runner. Tests inject a stub via
+// RouteManager.execOVSHook to capture OVS commands without running them.
+type ovsExecFunc func(*exec.Cmd) ([]byte, error)
+
 // Veth interface names shared between routing and nftables code.
 const (
 	vethDefaultName  = "veth-default"
@@ -46,6 +50,10 @@ type RouteManager struct {
 	cachedPatchPort string
 	cachedOfport    string
 	cachedBridgeMAC string
+
+	// execOVSHook, when non-nil, replaces the real exec.Cmd runner used by
+	// OVS helpers. Tests set this to capture commands without executing them.
+	execOVSHook ovsExecFunc
 }
 
 func NewRouteManager(cfg Config) *RouteManager {

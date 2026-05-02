@@ -34,6 +34,16 @@ func (rm *RouteManager) ovsCmd(binary string, args ...string) *exec.Cmd {
 	return exec.Command(binary, args...)
 }
 
+// runOVS builds and runs an OVS command. When execOVSHook is set (tests) the
+// command is dispatched through it instead of being executed.
+func (rm *RouteManager) runOVS(binary string, args ...string) ([]byte, error) {
+	cmd := rm.ovsCmd(binary, args...)
+	if rm.execOVSHook != nil {
+		return rm.execOVSHook(cmd)
+	}
+	return cmd.CombinedOutput()
+}
+
 // EnsureOVSFlows installs MAC-tweak flows on the bridge device.
 // These flows rewrite the destination MAC of packets arriving from OVN's
 // integration bridge (via the patch-provnet port) to the bridge device's own
@@ -67,9 +77,8 @@ func (rm *RouteManager) EnsureOVSFlows() error {
 	}
 
 	// Delete existing agent-managed flows (idempotent replace).
-	delCmd := rm.ovsCmd("ovs-ofctl", "del-flows", rm.bridgeDev,
-		fmt.Sprintf("cookie=%s/-1", ovsCookieMACTweak))
-	if out, err := delCmd.CombinedOutput(); err != nil {
+	if out, err := rm.runOVS("ovs-ofctl", "del-flows", rm.bridgeDev,
+		fmt.Sprintf("cookie=%s/-1", ovsCookieMACTweak)); err != nil {
 		slog.Warn("failed to delete old OVS flows", "error", err, "output", strings.TrimSpace(string(out)))
 	}
 
@@ -147,9 +156,8 @@ func (rm *RouteManager) ReconcileOVSHairpinFlows(ipToRouterMAC map[string]string
 
 	// Full replace: delete all current hairpin flows then reinstall.
 	// The replacement window is sub-millisecond and tolerable.
-	delCmd := rm.ovsCmd("ovs-ofctl", "del-flows", rm.bridgeDev,
-		fmt.Sprintf("cookie=%s/-1", ovsCookieHairpin))
-	if out, err := delCmd.CombinedOutput(); err != nil {
+	if out, err := rm.runOVS("ovs-ofctl", "del-flows", rm.bridgeDev,
+		fmt.Sprintf("cookie=%s/-1", ovsCookieHairpin)); err != nil {
 		return fmt.Errorf("del hairpin OVS flows on %s: %w (output: %s)", rm.bridgeDev, err, strings.TrimSpace(string(out)))
 	}
 
@@ -175,17 +183,16 @@ func (rm *RouteManager) RemoveOVSFlows() error {
 		slog.Info("[dry-run] would remove OVS MAC-tweak flows", "dev", rm.bridgeDev)
 		return nil
 	}
-	cmd := rm.ovsCmd("ovs-ofctl", "del-flows", rm.bridgeDev,
+	out, err := rm.runOVS("ovs-ofctl", "del-flows", rm.bridgeDev,
 		fmt.Sprintf("cookie=%s/-1", ovsCookieMACTweak))
-	out, err := cmd.CombinedOutput()
 	if err != nil {
 		return fmt.Errorf("del OVS flows on %s: %w (output: %s)", rm.bridgeDev, err, strings.TrimSpace(string(out)))
 	}
 	slog.Info("OVS MAC-tweak flows removed", "dev", rm.bridgeDev)
 
-	hairpinCmd := rm.ovsCmd("ovs-ofctl", "del-flows", rm.bridgeDev,
+	hout, herr := rm.runOVS("ovs-ofctl", "del-flows", rm.bridgeDev,
 		fmt.Sprintf("cookie=%s/-1", ovsCookieHairpin))
-	if hout, herr := hairpinCmd.CombinedOutput(); herr != nil {
+	if herr != nil {
 		return fmt.Errorf("del hairpin OVS flows on %s: %w (output: %s)", rm.bridgeDev, herr, strings.TrimSpace(string(hout)))
 	}
 	slog.Info("OVS hairpin flows removed", "dev", rm.bridgeDev)
@@ -196,16 +203,14 @@ func (rm *RouteManager) RemoveOVSFlows() error {
 // discoverPatchPort finds the patch-type port on the bridge device that
 // connects to OVN's integration bridge.
 func (rm *RouteManager) discoverPatchPort() (string, error) {
-	listCmd := rm.ovsCmd("ovs-vsctl", "list-ports", rm.bridgeDev)
-	out, err := listCmd.CombinedOutput()
+	out, err := rm.runOVS("ovs-vsctl", "list-ports", rm.bridgeDev)
 	if err != nil {
 		return "", fmt.Errorf("list-ports %s: %w (output: %s)", rm.bridgeDev, err, strings.TrimSpace(string(out)))
 	}
 
 	ports := strings.Fields(strings.TrimSpace(string(out)))
 	for _, port := range ports {
-		typeCmd := rm.ovsCmd("ovs-vsctl", "--if-exists", "get", "Interface", port, "type")
-		typeOut, err := typeCmd.CombinedOutput()
+		typeOut, err := rm.runOVS("ovs-vsctl", "--if-exists", "get", "Interface", port, "type")
 		if err != nil {
 			continue
 		}
@@ -219,8 +224,7 @@ func (rm *RouteManager) discoverPatchPort() (string, error) {
 
 // getOFPort returns the OpenFlow port number for an OVS port.
 func (rm *RouteManager) getOFPort(port string) (string, error) {
-	cmd := rm.ovsCmd("ovs-vsctl", "get", "Interface", port, "ofport")
-	out, err := cmd.CombinedOutput()
+	out, err := rm.runOVS("ovs-vsctl", "get", "Interface", port, "ofport")
 	if err != nil {
 		return "", fmt.Errorf("get ofport for %s: %w (output: %s)", port, err, strings.TrimSpace(string(out)))
 	}
@@ -232,8 +236,7 @@ func (rm *RouteManager) getOFPort(port string) (string, error) {
 }
 
 func (rm *RouteManager) addOVSFlow(flow string) error {
-	cmd := rm.ovsCmd("ovs-ofctl", "add-flow", rm.bridgeDev, flow)
-	out, err := cmd.CombinedOutput()
+	out, err := rm.runOVS("ovs-ofctl", "add-flow", rm.bridgeDev, flow)
 	if err != nil {
 		return fmt.Errorf("ovs-ofctl add-flow %s %q: %w (output: %s)", rm.bridgeDev, flow, err, strings.TrimSpace(string(out)))
 	}
