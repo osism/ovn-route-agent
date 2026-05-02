@@ -176,6 +176,20 @@ ensure_nftables() {
     # The agent creates its own table; we don't need to pre-populate anything.
 }
 
+create_loopback1() {
+    # The agent's port-forward feature attaches managed VIP /32 addresses to a
+    # loopback device inside the provider VRF. Production hosts provision
+    # `loopback1` via systemd-networkd or similar; the agent never creates it.
+    # The integration harness needs the same surface, so we materialise it as
+    # a dummy device enslaved to vrf-provider.
+    log "creating loopback1 dummy device in vrf-provider"
+    if ! ip link show loopback1 >/dev/null 2>&1; then
+        ip link add loopback1 type dummy
+    fi
+    ip link set loopback1 master vrf-provider
+    ip link set loopback1 up
+}
+
 main() {
     require_root
     apt_install
@@ -184,6 +198,7 @@ main() {
     start_ovn_host
     create_bridges
     configure_frr
+    create_loopback1
     ensure_nftables
     log "setup complete"
 }

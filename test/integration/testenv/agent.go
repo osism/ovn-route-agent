@@ -15,6 +15,8 @@ import (
 	"syscall"
 	"testing"
 	"time"
+
+	"gopkg.in/yaml.v3"
 )
 
 // AgentConfig captures the config-file fields the integration harness uses
@@ -38,6 +40,37 @@ type AgentConfig struct {
 	ReconcileInterval       string `yaml:"reconcile_interval,omitempty"`
 	StaleChassisGracePeriod string `yaml:"stale_chassis_grace_period,omitempty"`
 	DrainTimeout            string `yaml:"drain_timeout,omitempty"`
+
+	// Port forwarding (DNAT). PortForwards is the list of VIPs and rules; the
+	// agent infers PortForwardEnabled from len > 0. PortForwardL3mdevAccept
+	// flips a *global* sysctl when true — scenario tests that set it must use
+	// SaveSysctl/RestoreSysctl to avoid leaking state.
+	PortForwardDev          string                  `yaml:"port_forward_dev,omitempty"`
+	PortForwardL3mdevAccept *bool                   `yaml:"port_forward_l3mdev_accept,omitempty"`
+	PortForwardCTZone       *int                    `yaml:"port_forward_ct_zone,omitempty"`
+	PortForwards            []PortForwardVIPFixture `yaml:"port_forwards,omitempty"`
+}
+
+// PortForwardVIPFixture mirrors the agent's PortForwardVIP for scenario
+// fixtures. It cannot import from main, so the YAML keys must stay in lock
+// step with config.go's PortForwardVIP / PortForwardRule.
+type PortForwardVIPFixture struct {
+	VIP               string                   `yaml:"vip"`
+	ManageVIP         bool                     `yaml:"manage_vip,omitempty"`
+	Masquerade        bool                     `yaml:"masquerade,omitempty"`
+	HairpinMasquerade bool                     `yaml:"hairpin_masquerade,omitempty"`
+	Rules             []PortForwardRuleFixture `yaml:"rules"`
+}
+
+// PortForwardRuleFixture mirrors the agent's PortForwardRule. Masquerade is a
+// pointer to distinguish "inherit from VIP" (nil) from explicit true/false.
+type PortForwardRuleFixture struct {
+	Proto      string   `yaml:"proto"`
+	Port       int      `yaml:"port"`
+	DestAddr   string   `yaml:"dest_addr,omitempty"`
+	DestAddrs  []string `yaml:"dest_addrs,omitempty"`
+	DestPort   int      `yaml:"dest_port,omitempty"`
+	Masquerade *bool    `yaml:"masquerade,omitempty"`
 }
 
 // Defaults returns an AgentConfig wired for the local test stack:
@@ -213,42 +246,62 @@ func (p *AgentProc) LogTail(n int) string {
 	return strings.Join(lines[len(lines)-n:], "\n")
 }
 
-// writeTempConfig serialises cfg to a temp YAML file in t.TempDir().
-// Pointer fields are emitted only when set, so the agent's own defaults
-// apply for everything else.
+// writeTempConfig serialises cfg to a temp YAML file in t.TempDir(). It uses
+// yaml.v3 with explicit handling for fields whose semantics differ between
+// "unset" and "empty string". In particular, frr_prefix_list always emits a
+// quoted value (the agent treats an absent key as "use the default
+// ANNOUNCED-NETWORKS prefix list", but tests usually want to disable it
+// outright by passing an empty string).
 func writeTempConfig(t *testing.T, cfg AgentConfig) string {
 	t.Helper()
 	dir := t.TempDir()
 	path := filepath.Join(dir, "agent.yaml")
 
-	var b strings.Builder
-	w := func(k, v string) {
+	doc := map[string]any{}
+	put := func(k, v string) {
 		if v != "" {
-			fmt.Fprintf(&b, "%s: %q\n", k, v)
+			doc[k] = v
 		}
 	}
-	wb := func(k string, v *bool) {
+	putBool := func(k string, v *bool) {
 		if v != nil {
-			fmt.Fprintf(&b, "%s: %t\n", k, *v)
+			doc[k] = *v
 		}
 	}
-	w("ovn_nb_remote", cfg.OVNNBRemote)
-	w("ovn_sb_remote", cfg.OVNSBRemote)
-	w("bridge_dev", cfg.BridgeDev)
-	w("vrf_name", cfg.VRFName)
-	w("veth_nexthop", cfg.VethNexthop)
-	// frr_prefix_list intentionally allows empty string to disable.
-	fmt.Fprintf(&b, "frr_prefix_list: %q\n", cfg.FRRPrefixList)
-	w("log_level", cfg.LogLevel)
-	w("reconcile_interval", cfg.ReconcileInterval)
-	w("stale_chassis_grace_period", cfg.StaleChassisGracePeriod)
-	w("drain_timeout", cfg.DrainTimeout)
-	wb("dry_run", cfg.DryRun)
-	wb("cleanup_on_shutdown", cfg.CleanupOnShutdown)
-	wb("drain_on_shutdown", cfg.DrainOnShutdown)
-	wb("veth_leak_enabled", cfg.VethLeakEnabled)
+	putInt := func(k string, v *int) {
+		if v != nil {
+			doc[k] = *v
+		}
+	}
 
-	if err := os.WriteFile(path, []byte(b.String()), 0o600); err != nil {
+	put("ovn_nb_remote", cfg.OVNNBRemote)
+	put("ovn_sb_remote", cfg.OVNSBRemote)
+	put("bridge_dev", cfg.BridgeDev)
+	put("vrf_name", cfg.VRFName)
+	put("veth_nexthop", cfg.VethNexthop)
+	// frr_prefix_list intentionally always emits, allowing "" to disable.
+	doc["frr_prefix_list"] = cfg.FRRPrefixList
+	put("log_level", cfg.LogLevel)
+	put("reconcile_interval", cfg.ReconcileInterval)
+	put("stale_chassis_grace_period", cfg.StaleChassisGracePeriod)
+	put("drain_timeout", cfg.DrainTimeout)
+	putBool("dry_run", cfg.DryRun)
+	putBool("cleanup_on_shutdown", cfg.CleanupOnShutdown)
+	putBool("drain_on_shutdown", cfg.DrainOnShutdown)
+	putBool("veth_leak_enabled", cfg.VethLeakEnabled)
+
+	put("port_forward_dev", cfg.PortForwardDev)
+	putBool("port_forward_l3mdev_accept", cfg.PortForwardL3mdevAccept)
+	putInt("port_forward_ct_zone", cfg.PortForwardCTZone)
+	if len(cfg.PortForwards) > 0 {
+		doc["port_forwards"] = cfg.PortForwards
+	}
+
+	out, err := yaml.Marshal(doc)
+	if err != nil {
+		t.Fatalf("marshal config: %v", err)
+	}
+	if err := os.WriteFile(path, out, 0o600); err != nil {
 		t.Fatalf("write config: %v", err)
 	}
 	return path

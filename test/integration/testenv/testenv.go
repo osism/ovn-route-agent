@@ -120,6 +120,12 @@ func Teardown(t *testing.T) {
 			}
 		}
 	}
+
+	// Port-forward residue: managed VIPs on loopback1, fwmark ip rules at
+	// priorities 150/151, and the port-forward reply table (default 201).
+	// Idempotent — port-forward scenarios that did not run pay only the
+	// cost of a few quick "no such process" exits.
+	scrubPortForwardState(t)
 }
 
 // frrStaticRoutes returns the /32 static routes currently present in the
