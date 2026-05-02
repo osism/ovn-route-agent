@@ -223,6 +223,16 @@ func (o *OVNClient) Connect(ctx context.Context) error {
 
 	slog.Info("connecting to OVN databases", "hostname", hostname)
 
+	// On any error path, close partially-initialised clients so a retry
+	// (agent.go retry loop) does not leak the previous connection by
+	// overwriting o.sbClient / o.nbClient with a fresh one.
+	success := false
+	defer func() {
+		if !success {
+			o.closeClients()
+		}
+	}()
+
 	reconnectBackoff := backoff.NewExponentialBackOff()
 
 	// Connect to Southbound DB
@@ -310,17 +320,25 @@ func (o *OVNClient) Connect(ctx context.Context) error {
 	// only cause redundant reconciliations.
 	o.cancelPendingTimers()
 
+	success = true
 	return nil
 }
 
 func (o *OVNClient) Close() {
 	o.cancelPendingTimers()
+	o.closeClients()
+}
 
+// closeClients closes both OVSDB clients (if set) and clears the references
+// so a subsequent Connect() retry starts from a clean slate.
+func (o *OVNClient) closeClients() {
 	if o.sbClient != nil {
 		o.sbClient.Close()
+		o.sbClient = nil
 	}
 	if o.nbClient != nil {
 		o.nbClient.Close()
+		o.nbClient = nil
 	}
 }
 

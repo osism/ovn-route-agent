@@ -244,6 +244,76 @@ func TestParseNatAddressIPs(t *testing.T) {
 	}
 }
 
+// closeCountingClient is a minimal ovsdbClient that counts Close() calls.
+// Used to verify that Connect()'s failure path actually closes partial
+// clients instead of leaking them across retries (issue #26).
+type closeCountingClient struct {
+	*fakeOVSDBClient
+	closes int
+}
+
+func (c *closeCountingClient) Close() { c.closes++ }
+
+func TestCloseClients_ClosesAndClearsBoth(t *testing.T) {
+	c, nb, sb := newOVNClientWithFakes(t, "host-a")
+	sbCounter := &closeCountingClient{fakeOVSDBClient: sb}
+	nbCounter := &closeCountingClient{fakeOVSDBClient: nb}
+	c.sbClient = sbCounter
+	c.nbClient = nbCounter
+
+	c.closeClients()
+
+	if sbCounter.closes != 1 {
+		t.Errorf("sbClient.Close() called %d times, want 1", sbCounter.closes)
+	}
+	if nbCounter.closes != 1 {
+		t.Errorf("nbClient.Close() called %d times, want 1", nbCounter.closes)
+	}
+	if c.sbClient != nil {
+		t.Error("sbClient should be nil after closeClients()")
+	}
+	if c.nbClient != nil {
+		t.Error("nbClient should be nil after closeClients()")
+	}
+}
+
+func TestCloseClients_OnlySBSet(t *testing.T) {
+	// Simulates the partial-failure case where SB was created but NB
+	// creation failed before assignment. closeClients() must not panic.
+	c := NewOVNClient(Config{}, nil)
+	sb := &closeCountingClient{}
+	c.sbClient = sb
+
+	c.closeClients()
+
+	if sb.closes != 1 {
+		t.Errorf("sbClient.Close() called %d times, want 1", sb.closes)
+	}
+	if c.sbClient != nil {
+		t.Error("sbClient should be nil after closeClients()")
+	}
+}
+
+func TestCloseClients_Idempotent(t *testing.T) {
+	// Both Connect()'s defer and a later explicit Close() can run on the
+	// same OVNClient. Calling closeClients() twice must be safe.
+	c, nb, sb := newOVNClientWithFakes(t, "host-a")
+	sbCounter := &closeCountingClient{fakeOVSDBClient: sb}
+	nbCounter := &closeCountingClient{fakeOVSDBClient: nb}
+	c.sbClient = sbCounter
+	c.nbClient = nbCounter
+
+	c.closeClients()
+	c.closeClients()
+
+	if sbCounter.closes != 1 {
+		t.Errorf("sbClient.Close() called %d times, want 1", sbCounter.closes)
+	}
+	if nbCounter.closes != 1 {
+		t.Errorf("nbClient.Close() called %d times, want 1", nbCounter.closes)
+	}
+}
+
 func TestSBDatabaseModel(t *testing.T) {
 	m, err := sbDatabaseModel()
 	if err != nil {
