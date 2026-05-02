@@ -14,7 +14,8 @@ import (
 
 // transactOps executes OVSDB operations and checks both the transport-level
 // error and the per-operation results for OVSDB errors (constraint violations, etc.).
-// libovsdb v0.7.0's Transact does NOT check OperationResult errors itself.
+// libovsdb's Transact does not surface per-operation OVSDB errors itself,
+// so callers must inspect OperationResult to detect constraint violations.
 func (o *OVNClient) transactOps(ctx context.Context, ops []ovsdb.Operation) error {
 	results, err := o.nbClient.Transact(ctx, ops...)
 	if err != nil {
