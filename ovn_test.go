@@ -347,7 +347,7 @@ func TestImmediateStateRefreshCoalesces(t *testing.T) {
 	ctx, cancel := context.WithCancel(context.Background())
 	defer cancel()
 	c.ctx = ctx
-	c.ready = true
+	c.ready.Store(true)
 
 	var refreshCount atomic.Int64
 	c.onChange = func() { refreshCount.Add(1) }
@@ -417,7 +417,7 @@ func TestImmediateStateRefreshFollowUpRuns(t *testing.T) {
 	ctx, cancel := context.WithCancel(context.Background())
 	defer cancel()
 	c.ctx = ctx
-	c.ready = true
+	c.ready.Store(true)
 
 	var refreshCount atomic.Int64
 	c.onChange = func() { refreshCount.Add(1) }

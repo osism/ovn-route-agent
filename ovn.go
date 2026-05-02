@@ -9,6 +9,7 @@ import (
 	"sort"
 	"strings"
 	"sync"
+	"sync/atomic"
 	"time"
 
 	backoff "github.com/cenkalti/backoff/v4"
@@ -193,8 +194,10 @@ type OVNClient struct {
 
 	// ready is set to true after Connect() completes initial setup.
 	// Event handlers check this to avoid calling refreshState before
-	// both databases are connected and monitored.
-	ready bool
+	// both databases are connected and monitored. Atomic because cache
+	// event handlers can read it from other goroutines while Connect()
+	// is still completing setup.
+	ready atomic.Bool
 
 	// Debounce timers for event-triggered refreshes
 	debounceMu     sync.Mutex
@@ -319,7 +322,7 @@ func (o *OVNClient) Connect(ctx context.Context) error {
 	}
 
 	// Mark as ready so event handlers can now trigger refreshes.
-	o.ready = true
+	o.ready.Store(true)
 
 	// Initial state refresh
 	o.refreshState(ctx)
@@ -621,7 +624,7 @@ func (o *OVNClient) refreshState(ctx context.Context) {
 // Unlike a resetting debounce, this does not extend the delay when new events
 // arrive — it fires at most eventDebounceInterval after the first event.
 func (o *OVNClient) debounceStateRefresh() {
-	if !o.ready {
+	if !o.ready.Load() {
 		return // not fully connected yet
 	}
 	o.debounceMu.Lock()
@@ -645,7 +648,7 @@ func (o *OVNClient) debounceStateRefresh() {
 // to minimise failover reaction time. Concurrent invocations are coalesced
 // so at most one refresh runs at a time and at most one follow-up is queued.
 func (o *OVNClient) immediateStateRefresh() {
-	if !o.ready {
+	if !o.ready.Load() {
 		return // not fully connected yet
 	}
 	o.debounceMu.Lock()
