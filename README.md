@@ -2,6 +2,52 @@
 
 Event-driven network agent for OVN-based OpenStack environments. A real-time daemon that watches OVN databases directly via the OVSDB protocol to synchronize Floating IP routes and optionally forward traffic from anycast VIPs to internal backends.
 
+## Table of contents
+
+- [How it works](#how-it-works)
+- [Building](#building)
+- [Configuration](#configuration)
+  - [Config file (YAML)](#config-file-yaml)
+  - [Example](#example)
+  - [Reference](#reference)
+- [Installation](#installation)
+  - [Debian package](#debian-package)
+  - [Binary](#binary)
+  - [From source](#from-source)
+  - [Check status](#check-status)
+- [Prerequisites](#prerequisites)
+- [Multi-router support](#multi-router-support)
+- [Gatewayless provider networks](#gatewayless-provider-networks)
+  - [Background: the problem](#background-the-problem)
+  - [Solution: the virtual gateway ("magic gateway")](#solution-the-virtual-gateway-magic-gateway)
+  - [Creating a gatewayless provider network](#creating-a-gatewayless-provider-network)
+  - [Failover behavior](#failover-behavior)
+  - [MAC-tweak flows on br-ex](#mac-tweak-flows-on-br-ex)
+  - [Hairpin OVS flows on br-ex](#hairpin-ovs-flows-on-br-ex)
+- [Port forwarding (DNAT)](#port-forwarding-dnat)
+  - [Background: the problem](#background-the-problem-1)
+  - [Solution: connmark-based return routing](#solution-connmark-based-return-routing)
+  - [Why conntrack-based fwmark instead of simpler alternatives?](#why-conntrack-based-fwmark-instead-of-simpler-alternatives)
+  - [The `forward_veth_guard` chain](#the-forward_veth_guard-chain)
+  - [VIP address management](#vip-address-management)
+  - [Packet flow: DNAT forward and return path](#packet-flow-dnat-forward-and-return-path)
+  - [Prerequisites](#prerequisites-1)
+  - [Example configuration](#example-configuration)
+  - [Sticky load balancing (multi-backend)](#sticky-load-balancing-multi-backend)
+  - [Hairpin NAT](#hairpin-nat)
+- [Gateway drain mode](#gateway-drain-mode)
+  - [Background: the problem](#background-the-problem-2)
+  - [Solution: pre-shutdown priority drain](#solution-pre-shutdown-priority-drain)
+  - [Shutdown sequence](#shutdown-sequence)
+  - [Priority semantics](#priority-semantics)
+  - [Configuration](#configuration-1)
+  - [When to disable drain](#when-to-disable-drain)
+- [Architecture](#architecture)
+  - [Control plane](#control-plane)
+  - [Data plane](#data-plane)
+- [Origin](#origin)
+- [License](#license)
+
 ## How it works
 
 The agent monitors the OVN Southbound and Northbound databases and performs targeted writes to both OVN NB (default routes, static MAC bindings) and the local system (kernel routes, IP rules, FRR static routes, OVS flows on the provider bridge).
@@ -30,7 +76,7 @@ The agent monitors the OVN Southbound and Northbound databases and performs targ
 
 ## Building
 
-Requires Go 1.22+.
+Requires Go 1.25+ (see `go.mod` for the exact minimum).
 
 ```bash
 # Standard build (linux)
