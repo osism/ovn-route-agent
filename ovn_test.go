@@ -338,6 +338,36 @@ func TestNBDatabaseModel(t *testing.T) {
 	}
 }
 
+// startRefreshLoop spawns the OVNClient refresh loop for tests. The returned
+// done channel is closed when the loop exits, so callers can cancel ctx and
+// wait for a clean shutdown.
+func startRefreshLoop(c *OVNClient, ctx context.Context) <-chan struct{} {
+	done := make(chan struct{})
+	go func() {
+		defer close(done)
+		c.refreshLoop(ctx)
+	}()
+	return done
+}
+
+// waitRefreshSettled polls until refreshCount has been stable for two
+// consecutive samples and the immediate signal channel is empty, indicating
+// no further refresh is queued or in flight.
+func waitRefreshSettled(t *testing.T, c *OVNClient, refreshCount *atomic.Int64) {
+	t.Helper()
+	deadline := time.Now().Add(2 * time.Second)
+	var prev int64 = -1
+	for time.Now().Before(deadline) {
+		time.Sleep(50 * time.Millisecond)
+		cur := refreshCount.Load()
+		if cur == prev && len(c.immediateCh) == 0 {
+			return
+		}
+		prev = cur
+	}
+	t.Fatalf("refresh did not settle in time")
+}
+
 // TestImmediateStateRefreshCoalesces verifies that a storm of concurrent
 // chassisredirect events does not spawn one goroutine per event. Instead,
 // at most one refresh runs at a time and at most one follow-up is queued,
@@ -346,7 +376,6 @@ func TestImmediateStateRefreshCoalesces(t *testing.T) {
 	c, _, sb := newOVNClientWithFakes(t, "node1")
 	ctx, cancel := context.WithCancel(context.Background())
 	defer cancel()
-	c.ctx = ctx
 	c.ready.Store(true)
 
 	var refreshCount atomic.Int64
@@ -363,6 +392,8 @@ func TestImmediateStateRefreshCoalesces(t *testing.T) {
 			<-release
 		})
 	}
+
+	loopDone := startRefreshLoop(c, ctx)
 
 	const events = 50
 	var wg sync.WaitGroup
@@ -382,26 +413,17 @@ func TestImmediateStateRefreshCoalesces(t *testing.T) {
 	case <-time.After(2 * time.Second):
 		close(release)
 		wg.Wait()
+		cancel()
+		<-loopDone
 		t.Fatal("first refresh never started")
 	}
 	time.Sleep(50 * time.Millisecond)
 	close(release)
 	wg.Wait()
 
-	// Drain any in-flight refresh.
-	deadline := time.Now().Add(2 * time.Second)
-	for {
-		c.refreshMu.Lock()
-		active := c.refreshActive
-		c.refreshMu.Unlock()
-		if !active {
-			break
-		}
-		if time.Now().After(deadline) {
-			t.Fatalf("refresh did not drain in time")
-		}
-		time.Sleep(10 * time.Millisecond)
-	}
+	waitRefreshSettled(t, c, &refreshCount)
+	cancel()
+	<-loopDone
 
 	n := refreshCount.Load()
 	if n < 1 || n > 2 {
@@ -416,7 +438,6 @@ func TestImmediateStateRefreshFollowUpRuns(t *testing.T) {
 	c, _, sb := newOVNClientWithFakes(t, "node1")
 	ctx, cancel := context.WithCancel(context.Background())
 	defer cancel()
-	c.ctx = ctx
 	c.ready.Store(true)
 
 	var refreshCount atomic.Int64
@@ -432,38 +453,29 @@ func TestImmediateStateRefreshFollowUpRuns(t *testing.T) {
 		})
 	}
 
+	loopDone := startRefreshLoop(c, ctx)
+
 	c.immediateStateRefresh()
 	select {
 	case <-started:
 	case <-time.After(2 * time.Second):
 		close(release)
+		cancel()
+		<-loopDone
 		t.Fatal("first refresh never started")
 	}
 
-	// Second request while first is in-flight: must be queued.
+	// Second request while first is in-flight: must be queued in immediateCh.
 	c.immediateStateRefresh()
-	c.refreshMu.Lock()
-	pending := c.refreshPending
-	c.refreshMu.Unlock()
-	if !pending {
-		t.Error("second call should have been queued as pending")
+	if got := len(c.immediateCh); got != 1 {
+		t.Errorf("second call should be queued, immediateCh len = %d, want 1", got)
 	}
 
 	close(release)
 
-	deadline := time.Now().Add(2 * time.Second)
-	for {
-		c.refreshMu.Lock()
-		active := c.refreshActive
-		c.refreshMu.Unlock()
-		if !active {
-			break
-		}
-		if time.Now().After(deadline) {
-			t.Fatalf("refresh did not drain in time")
-		}
-		time.Sleep(10 * time.Millisecond)
-	}
+	waitRefreshSettled(t, c, &refreshCount)
+	cancel()
+	<-loopDone
 
 	if got := refreshCount.Load(); got != 2 {
 		t.Errorf("expected exactly 2 refresh passes (in-flight + follow-up), got %d", got)

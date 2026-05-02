@@ -123,7 +123,7 @@ func (a *Agent) Run(ctx context.Context) error {
 	}
 
 	// Initial reconciliation
-	a.reconcile()
+	a.reconcile(ctx)
 
 	// Drain any reconcile signals queued during startup — the initial
 	// reconcile already handled the current state.
@@ -161,17 +161,17 @@ func (a *Agent) Run(ctx context.Context) error {
 
 		case <-a.reconcileCh:
 			slog.Debug("event-triggered reconciliation")
-			a.reconcile()
+			a.reconcile(ctx)
 
 		case <-ticker.C:
 			slog.Debug("periodic reconciliation")
-			a.reconcile()
+			a.reconcile(ctx)
 		}
 	}
 }
 
 // reconcile ensures the local routing state matches the desired state from OVN.
-func (a *Agent) reconcile() {
+func (a *Agent) reconcile(ctx context.Context) {
 	state := a.ovn.GetState()
 
 	// Compute effective network filters for this cycle.
@@ -253,14 +253,14 @@ func (a *Agent) reconcile() {
 			}
 		}
 		if bridgeMAC != "" {
-			if err := a.ovn.EnsureGatewayRouting(a.ovn.ctx, state.LocalRouters, bridgeMAC); err != nil {
+			if err := a.ovn.EnsureGatewayRouting(ctx, state.LocalRouters, bridgeMAC); err != nil {
 				slog.Error("failed to ensure gateway routing", "error", err)
 			}
 		}
 
 		// Ensure the active chassis has a strictly higher priority than
 		// standby peers, preventing reverse failover after drain/restore.
-		if err := a.ovn.EnsureActivePriorityLead(a.ovn.ctx, state.LocalRouters, state.LocalChassisName); err != nil {
+		if err := a.ovn.EnsureActivePriorityLead(ctx, state.LocalRouters, state.LocalChassisName); err != nil {
 			slog.Error("failed to ensure active priority lead", "error", err)
 		}
 
@@ -304,18 +304,18 @@ func (a *Agent) reconcile() {
 	// Check for stale chassis entries from dead nodes (runs on every agent).
 	// This runs after gateway routing reconciliation so that a surviving agent
 	// creates its own routes before removing entries from dead chassis.
-	a.cleanupStaleChassis(state.AllChassisNames)
+	a.cleanupStaleChassis(ctx, state.AllChassisNames)
 }
 
 // cleanupStaleChassis detects chassis that have disappeared from the SB Chassis
 // table and, after a configurable grace period (plus random jitter), removes
 // their managed NB entries. Any surviving agent can perform this cleanup.
-func (a *Agent) cleanupStaleChassis(allChassis map[string]bool) {
+func (a *Agent) cleanupStaleChassis(ctx context.Context, allChassis map[string]bool) {
 	if a.cfg.StaleChassisGracePeriod <= 0 {
 		return
 	}
 
-	referencedChassis := a.ovn.ListManagedRouteChassis(a.ovn.ctx)
+	referencedChassis := a.ovn.ListManagedRouteChassis(ctx)
 	if referencedChassis == nil {
 		return
 	}
@@ -364,7 +364,7 @@ func (a *Agent) cleanupStaleChassis(allChassis map[string]bool) {
 		return
 	}
 
-	if err := a.ovn.CleanupStaleChassisManagedEntries(a.ovn.ctx, staleChassis); err != nil {
+	if err := a.ovn.CleanupStaleChassisManagedEntries(ctx, staleChassis); err != nil {
 		slog.Error("failed to clean up stale chassis entries", "error", err)
 		return
 	}

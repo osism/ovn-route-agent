@@ -188,43 +188,41 @@ type OVNClient struct {
 	nbClient ovsdbClient
 	state    *OVNState
 	cfg      Config
-	ctx      context.Context
 
 	onChange func() // callback when state changes
 
 	// ready is set to true after Connect() completes initial setup.
-	// Event handlers check this to avoid calling refreshState before
+	// Event handlers check this to avoid signalling refreshes before
 	// both databases are connected and monitored. Atomic because cache
 	// event handlers can read it from other goroutines while Connect()
 	// is still completing setup.
 	ready atomic.Bool
 
-	// Debounce timers for event-triggered refreshes
-	debounceMu     sync.Mutex
-	stateTimer     *time.Timer
-	reconcileTimer *time.Timer
+	// debounceCh receives signals from cache event handlers for tables that
+	// should trigger a debounced state refresh. immediateCh receives signals
+	// for chassisredirect changes that bypass debouncing for fast HA
+	// failover. Both are buffered with capacity 1 so a storm of events
+	// coalesces: at most one signal is queued, so the refresh loop runs at
+	// most one in-flight pass plus one follow-up.
+	debounceCh  chan struct{}
+	immediateCh chan struct{}
 
-	// Coalescing for immediateStateRefresh. During HA failover storms each
-	// chassisredirect Port_Binding event would otherwise spawn its own
-	// goroutine, racing several full-table OVSDB List passes whose state
-	// writes can land out of order. Instead, allow one refresh in-flight
-	// and queue at most one follow-up.
-	refreshMu      sync.Mutex
-	refreshActive  bool
-	refreshPending bool
+	// loopDone is closed when refreshLoop exits. Set by Connect() before
+	// starting the loop; nil before Connect() succeeds.
+	loopDone chan struct{}
 }
 
 func NewOVNClient(cfg Config, onChange func()) *OVNClient {
 	return &OVNClient{
-		cfg:      cfg,
-		state:    &OVNState{},
-		onChange: onChange,
+		cfg:         cfg,
+		state:       &OVNState{},
+		onChange:    onChange,
+		debounceCh:  make(chan struct{}, 1),
+		immediateCh: make(chan struct{}, 1),
 	}
 }
 
 func (o *OVNClient) Connect(ctx context.Context) error {
-	o.ctx = ctx
-
 	hostname, err := getHostname()
 	if err != nil {
 		return fmt.Errorf("get hostname: %w", err)
@@ -321,23 +319,37 @@ func (o *OVNClient) Connect(ctx context.Context) error {
 		return fmt.Errorf("monitor NB: %w", err)
 	}
 
-	// Mark as ready so event handlers can now trigger refreshes.
+	// Mark as ready so event handlers can now signal refreshes.
 	o.ready.Store(true)
 
-	// Initial state refresh
+	// Initial state refresh.
 	o.refreshState(ctx)
 
-	// Cancel debounce timers started by initial monitor events —
-	// refreshState already captured the current state, so these would
-	// only cause redundant reconciliations.
-	o.cancelPendingTimers()
+	// Drain any signals queued by initial monitor events — refreshState
+	// already captured the current state, so they would only cause
+	// redundant work.
+	o.drainSignals()
+
+	// Start the refresh loop. It captures ctx via closure and exits when
+	// ctx is cancelled. Close() waits for loopDone before tearing down
+	// the OVSDB clients.
+	o.loopDone = make(chan struct{})
+	go func() {
+		defer close(o.loopDone)
+		o.refreshLoop(ctx)
+	}()
 
 	success = true
 	return nil
 }
 
 func (o *OVNClient) Close() {
-	o.cancelPendingTimers()
+	// Stop new event handlers from signalling so closeClients can run
+	// without further channel sends from cache callbacks.
+	o.ready.Store(false)
+	if o.loopDone != nil {
+		<-o.loopDone
+	}
 	o.closeClients()
 }
 
@@ -354,17 +366,15 @@ func (o *OVNClient) closeClients() {
 	}
 }
 
-// cancelPendingTimers stops all pending debounce and reconcile timers.
-func (o *OVNClient) cancelPendingTimers() {
-	o.debounceMu.Lock()
-	defer o.debounceMu.Unlock()
-	if o.stateTimer != nil {
-		o.stateTimer.Stop()
-		o.stateTimer = nil
+// drainSignals empties both signal channels.
+func (o *OVNClient) drainSignals() {
+	select {
+	case <-o.debounceCh:
+	default:
 	}
-	if o.reconcileTimer != nil {
-		o.reconcileTimer.Stop()
-		o.reconcileTimer = nil
+	select {
+	case <-o.immediateCh:
+	default:
 	}
 }
 
@@ -620,101 +630,103 @@ func (o *OVNClient) refreshState(ctx context.Context) {
 	}
 }
 
-// debounceStateRefresh schedules a coalescing state refresh.
-// Unlike a resetting debounce, this does not extend the delay when new events
-// arrive — it fires at most eventDebounceInterval after the first event.
+// refreshLoop is the OVN client's event loop. It receives signals from cache
+// event handlers and runs state refreshes with appropriate debouncing.
+// Started by Connect() and runs until ctx is cancelled.
+//
+//   - debounceCh signals coalesce into one refresh per eventDebounceInterval,
+//     followed by an onChange callback debounced by reconcileDebounceInterval.
+//   - immediateCh signals bypass debouncing and trigger an immediate refresh +
+//     onChange. A pending debounce timer is cancelled because the immediate
+//     refresh supersedes it.
+//
+// Signal channels have capacity 1, and the loop processes signals
+// sequentially, so a storm of events produces at most one in-flight pass
+// plus one queued follow-up.
+func (o *OVNClient) refreshLoop(ctx context.Context) {
+	var (
+		debounceTimer  *time.Timer
+		debounceFire   <-chan time.Time
+		reconcileTimer *time.Timer
+		reconcileFire  <-chan time.Time
+	)
+
+	for {
+		select {
+		case <-ctx.Done():
+			if debounceTimer != nil {
+				debounceTimer.Stop()
+			}
+			if reconcileTimer != nil {
+				reconcileTimer.Stop()
+			}
+			return
+
+		case <-o.debounceCh:
+			if debounceTimer == nil {
+				debounceTimer = time.NewTimer(eventDebounceInterval)
+				debounceFire = debounceTimer.C
+			}
+
+		case <-debounceFire:
+			debounceTimer = nil
+			debounceFire = nil
+			o.refreshState(ctx)
+			if reconcileTimer == nil && o.onChange != nil {
+				reconcileTimer = time.NewTimer(reconcileDebounceInterval)
+				reconcileFire = reconcileTimer.C
+			}
+
+		case <-reconcileFire:
+			reconcileTimer = nil
+			reconcileFire = nil
+			if o.onChange != nil {
+				o.onChange()
+			}
+
+		case <-o.immediateCh:
+			// Immediate supersedes any pending debounce: refresh now and
+			// invoke onChange directly to bypass reconcile debouncing.
+			if debounceTimer != nil {
+				debounceTimer.Stop()
+				debounceTimer = nil
+				debounceFire = nil
+			}
+			o.refreshState(ctx)
+			if o.onChange != nil {
+				o.onChange()
+			}
+		}
+	}
+}
+
+// debounceStateRefresh signals the refresh loop to schedule a debounced state
+// refresh. Concurrent calls coalesce: at most one signal is queued.
 func (o *OVNClient) debounceStateRefresh() {
 	if !o.ready.Load() {
 		return // not fully connected yet
 	}
-	o.debounceMu.Lock()
-	defer o.debounceMu.Unlock()
-	if o.stateTimer != nil {
-		return // timer already pending, coalesce
+	select {
+	case o.debounceCh <- struct{}{}:
+	default:
+		// already queued
 	}
-	o.stateTimer = time.AfterFunc(eventDebounceInterval, func() {
-		o.debounceMu.Lock()
-		o.stateTimer = nil
-		o.debounceMu.Unlock()
-		if o.ctx.Err() != nil {
-			return
-		}
-		o.refreshState(o.ctx)
-		o.scheduleReconcile()
-	})
 }
 
-// immediateStateRefresh bypasses debouncing for chassisredirect changes
-// to minimise failover reaction time. Concurrent invocations are coalesced
-// so at most one refresh runs at a time and at most one follow-up is queued.
+// immediateStateRefresh signals the refresh loop to run a state refresh
+// immediately, bypassing debouncing. Used for chassisredirect changes to
+// minimise HA failover reaction time. Concurrent calls coalesce: at most
+// one signal is queued, so a burst of events results in at most one
+// in-flight pass plus one queued follow-up.
 func (o *OVNClient) immediateStateRefresh() {
 	if !o.ready.Load() {
 		return // not fully connected yet
 	}
-	o.debounceMu.Lock()
-	if o.stateTimer != nil {
-		o.stateTimer.Stop()
-		o.stateTimer = nil
+	select {
+	case o.immediateCh <- struct{}{}:
+	default:
+		// already queued
 	}
-	o.debounceMu.Unlock()
-
-	o.refreshMu.Lock()
-	if o.refreshActive {
-		o.refreshPending = true
-		o.refreshMu.Unlock()
-		return
-	}
-	o.refreshActive = true
-	o.refreshMu.Unlock()
-
-	go o.runImmediateRefresh()
-}
-
-// runImmediateRefresh executes refresh+onChange passes until no follow-up
-// has been queued. Holding refreshMu across the active/pending decision
-// prevents a racing immediateStateRefresh caller from setting refreshPending
-// after we've already decided to release the slot.
-func (o *OVNClient) runImmediateRefresh() {
-	for {
-		if o.ctx.Err() != nil {
-			o.refreshMu.Lock()
-			o.refreshActive = false
-			o.refreshPending = false
-			o.refreshMu.Unlock()
-			return
-		}
-		o.refreshState(o.ctx)
-		// Bypass reconcile debounce for fast failover.
-		if o.onChange != nil {
-			o.onChange()
-		}
-		o.refreshMu.Lock()
-		if !o.refreshPending {
-			o.refreshActive = false
-			o.refreshMu.Unlock()
-			return
-		}
-		o.refreshPending = false
-		o.refreshMu.Unlock()
-	}
-}
-
-// scheduleReconcile coalesces reconciliation triggers from state refreshes
-// into a single onChange callback.
-func (o *OVNClient) scheduleReconcile() {
-	o.debounceMu.Lock()
-	defer o.debounceMu.Unlock()
-	if o.reconcileTimer != nil {
-		return // already scheduled
-	}
-	o.reconcileTimer = time.AfterFunc(reconcileDebounceInterval, func() {
-		o.debounceMu.Lock()
-		o.reconcileTimer = nil
-		o.debounceMu.Unlock()
-		if o.onChange != nil {
-			o.onChange()
-		}
-	})
 }
 
 // =============================================================================

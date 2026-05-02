@@ -1,6 +1,7 @@
 package main
 
 import (
+	"context"
 	"net"
 	"reflect"
 	"testing"
@@ -234,7 +235,7 @@ func TestCleanupStaleChassisDisabledWhenZero(t *testing.T) {
 	}
 
 	// Should return immediately without touching missingChassis.
-	a.cleanupStaleChassis(map[string]bool{"node-1": true})
+	a.cleanupStaleChassis(context.Background(), map[string]bool{"node-1": true})
 
 	if len(a.missingChassis) != 0 {
 		t.Errorf("expected empty missingChassis when grace period is 0, got %v", a.missingChassis)
