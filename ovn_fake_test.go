@@ -35,6 +35,11 @@ type fakeOVSDBClient struct {
 	// op has been recorded). Used by drain tests to mutate rows mid-poll so
 	// countLocalCRPorts can converge.
 	onTransact func()
+
+	// onList is invoked synchronously at the start of every List call,
+	// outside the row lock so the hook may block other List operations.
+	// Used by coalescing tests to hold a refresh in-flight.
+	onList func()
 }
 
 func newFakeOVSDBClient(dbm model.ClientDBModel) *fakeOVSDBClient {
@@ -110,6 +115,12 @@ func (f *fakeOVSDBClient) Monitor(context.Context, *client.Monitor) (client.Moni
 func (f *fakeOVSDBClient) List(_ context.Context, result interface{}) error {
 	if f.listErr != nil {
 		return f.listErr
+	}
+	f.mu.Lock()
+	hook := f.onList
+	f.mu.Unlock()
+	if hook != nil {
+		hook()
 	}
 	f.mu.Lock()
 	defer f.mu.Unlock()

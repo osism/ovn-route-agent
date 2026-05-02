@@ -200,6 +200,15 @@ type OVNClient struct {
 	debounceMu     sync.Mutex
 	stateTimer     *time.Timer
 	reconcileTimer *time.Timer
+
+	// Coalescing for immediateStateRefresh. During HA failover storms each
+	// chassisredirect Port_Binding event would otherwise spawn its own
+	// goroutine, racing several full-table OVSDB List passes whose state
+	// writes can land out of order. Instead, allow one refresh in-flight
+	// and queue at most one follow-up.
+	refreshMu      sync.Mutex
+	refreshActive  bool
+	refreshPending bool
 }
 
 func NewOVNClient(cfg Config, onChange func()) *OVNClient {
@@ -633,7 +642,8 @@ func (o *OVNClient) debounceStateRefresh() {
 }
 
 // immediateStateRefresh bypasses debouncing for chassisredirect changes
-// to minimise failover reaction time.
+// to minimise failover reaction time. Concurrent invocations are coalesced
+// so at most one refresh runs at a time and at most one follow-up is queued.
 func (o *OVNClient) immediateStateRefresh() {
 	if !o.ready {
 		return // not fully connected yet
@@ -645,8 +655,29 @@ func (o *OVNClient) immediateStateRefresh() {
 	}
 	o.debounceMu.Unlock()
 
-	go func() {
+	o.refreshMu.Lock()
+	if o.refreshActive {
+		o.refreshPending = true
+		o.refreshMu.Unlock()
+		return
+	}
+	o.refreshActive = true
+	o.refreshMu.Unlock()
+
+	go o.runImmediateRefresh()
+}
+
+// runImmediateRefresh executes refresh+onChange passes until no follow-up
+// has been queued. Holding refreshMu across the active/pending decision
+// prevents a racing immediateStateRefresh caller from setting refreshPending
+// after we've already decided to release the slot.
+func (o *OVNClient) runImmediateRefresh() {
+	for {
 		if o.ctx.Err() != nil {
+			o.refreshMu.Lock()
+			o.refreshActive = false
+			o.refreshPending = false
+			o.refreshMu.Unlock()
 			return
 		}
 		o.refreshState(o.ctx)
@@ -654,7 +685,15 @@ func (o *OVNClient) immediateStateRefresh() {
 		if o.onChange != nil {
 			o.onChange()
 		}
-	}()
+		o.refreshMu.Lock()
+		if !o.refreshPending {
+			o.refreshActive = false
+			o.refreshMu.Unlock()
+			return
+		}
+		o.refreshPending = false
+		o.refreshMu.Unlock()
+	}
 }
 
 // scheduleReconcile coalesces reconciliation triggers from state refreshes
