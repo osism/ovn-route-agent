@@ -891,8 +891,8 @@ stale_chassis_grace_period: "7m"
 
 func TestValidateConfigStaleChassisGracePeriodNegative(t *testing.T) {
 	cfg := Config{
-		VethNexthop: "169.254.0.1",
-		VRFName:     "vrf-provider",
+		VethNexthop:             "169.254.0.1",
+		VRFName:                 "vrf-provider",
 		StaleChassisGracePeriod: -1 * time.Minute,
 	}
 	err := validateConfig(&cfg)

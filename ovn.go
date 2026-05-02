@@ -98,12 +98,12 @@ type NBLogicalRouterPort struct {
 }
 
 type NBLogicalRouterStaticRoute struct {
-	UUID       string            `ovsdb:"_uuid"`
-	IPPrefix   string            `ovsdb:"ip_prefix"`
-	Nexthop    string            `ovsdb:"nexthop"`
-	OutputPort *string           `ovsdb:"output_port"`
-	Policy     *string           `ovsdb:"policy"`
-	Options    map[string]string `ovsdb:"options"`
+	UUID        string            `ovsdb:"_uuid"`
+	IPPrefix    string            `ovsdb:"ip_prefix"`
+	Nexthop     string            `ovsdb:"nexthop"`
+	OutputPort  *string           `ovsdb:"output_port"`
+	Policy      *string           `ovsdb:"policy"`
+	Options     map[string]string `ovsdb:"options"`
 	ExternalIDs map[string]string `ovsdb:"external_ids"`
 }
 
@@ -748,12 +748,12 @@ func sbDatabaseModel() (model.ClientDBModel, error) {
 
 func nbDatabaseModel() (model.ClientDBModel, error) {
 	return model.NewClientDBModel("OVN_Northbound", map[string]model.Model{
-		"NAT":                          &NBNAT{},
-		"Logical_Router":               &NBLogicalRouter{},
-		"Logical_Router_Port":          &NBLogicalRouterPort{},
-		"Logical_Router_Static_Route":  &NBLogicalRouterStaticRoute{},
-		"Static_MAC_Binding":           &NBStaticMACBinding{},
-		"Gateway_Chassis":              &NBGatewayChassis{},
+		"NAT":                         &NBNAT{},
+		"Logical_Router":              &NBLogicalRouter{},
+		"Logical_Router_Port":         &NBLogicalRouterPort{},
+		"Logical_Router_Static_Route": &NBLogicalRouterStaticRoute{},
+		"Static_MAC_Binding":          &NBStaticMACBinding{},
+		"Gateway_Chassis":             &NBGatewayChassis{},
 	})
 }
 

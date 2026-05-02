@@ -600,4 +600,3 @@ func extractChain(ruleset, name string) string {
 	}
 	return ""
 }
-

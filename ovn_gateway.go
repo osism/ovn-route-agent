@@ -734,4 +734,3 @@ func (o *OVNClient) countLocalCRPorts(ctx context.Context, localChassisName stri
 	}
 	return count, nil
 }
-
