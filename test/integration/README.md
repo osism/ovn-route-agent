@@ -8,11 +8,19 @@ default `go test ./...` run does not pick them up.
 
 ```
 test/integration/
-  README.md          — this file
-  setup.sh           — apt + service bootstrap (run once per host)
-  smoke_test.go      — connect / initial-reconcile / clean-shutdown smoke test
-  testenv/           — Setup, Teardown, RunAgent, AssertKernelRoute, …
+  README.md                        — this file
+  setup.sh                         — apt + service bootstrap (run once per host)
+  smoke_test.go                    — connect / initial-reconcile / clean-shutdown smoke test
+  scenarios_helpers_test.go        — shared per-scenario boilerplate (startScenario, readyAgent)
+  scenario_fip_test.go             — FIP add/remove, gatewayless gw, multi-router on one chassis
+  scenario_failover_test.go        — failover, stale-chassis cleanup, drain & restore-drained
+  testenv/                         — Setup, Teardown, RunAgent, MakeLocalRouter, Assert*, …
 ```
+
+Scenario tests pause `ovn-northd` for the duration of each test (via
+`testenv.PauseOVNNorthd`) so the test driver can write SB Port_Binding rows
+directly without northd garbage-collecting them. `ovn-controller` keeps
+running. `setup.sh` is unchanged from the harness foundation.
 
 ## Local prerequisites
 
