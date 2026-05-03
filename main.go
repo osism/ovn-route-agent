@@ -61,6 +61,7 @@ func main() {
 		"frr_prefix_list", cfg.FRRPrefixList,
 		"stale_chassis_grace_period", cfg.StaleChassisGracePeriod,
 		"port_forwards", len(cfg.PortForwards),
+		"metrics_listen", cfg.MetricsListen,
 	)
 
 	if cfg.DryRun {
@@ -72,6 +73,13 @@ func main() {
 
 	sigCh := make(chan os.Signal, 1)
 	signal.Notify(sigCh, syscall.SIGINT, syscall.SIGTERM)
+
+	if cfg.MetricsListen != "" {
+		if err := startMetricsServer(ctx, cfg.MetricsListen, initMetrics()); err != nil {
+			slog.Error("failed to start metrics endpoint", "addr", cfg.MetricsListen, "error", err)
+			os.Exit(1)
+		}
+	}
 
 	agent, err := NewAgent(cfg)
 	if err != nil {

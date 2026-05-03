@@ -133,6 +133,10 @@ type Config struct {
 	// 0 = disabled.
 	StaleChassisGracePeriod time.Duration
 
+	// MetricsListen is the address the Prometheus /metrics endpoint binds
+	// to (e.g. "127.0.0.1:9273"). Empty = disabled.
+	MetricsListen string
+
 	// Veth VRF leak settings
 	VethLeakEnabled      bool
 	VethProviderIP       string // IP of the veth-provider side (default: computed from VethNexthop + 1)
@@ -170,6 +174,8 @@ type configFile struct {
 	FRRPrefixList string `yaml:"frr_prefix_list"`
 
 	StaleChassisGracePeriod string `yaml:"stale_chassis_grace_period"`
+
+	MetricsListen string `yaml:"metrics_listen"`
 
 	VethLeakEnabled      *bool  `yaml:"veth_leak_enabled"`
 	VethProviderIP       string `yaml:"veth_provider_ip"`
@@ -214,6 +220,8 @@ func loadConfig(args []string) (Config, error) {
 		fVethProviderIP       = fs.String("veth-provider-ip", "", "IP of the veth-provider side (default: veth-nexthop + 1)")
 		fVethLeakTableID      = fs.Int("veth-leak-table-id", 200, "Routing table ID for veth leak default route (1-252)")
 		fVethLeakRulePriority = fs.Int("veth-leak-rule-priority", 2000, "Policy rule priority for veth leak rules")
+
+		fMetricsListen = fs.String("metrics-listen", "", "Address for the Prometheus /metrics endpoint (e.g. 127.0.0.1:9273); empty = disabled")
 
 		fPortForwardDev          = fs.String("port-forward-dev", "", "Loopback device for VIP addresses in VRF (default: loopback1)")
 		fPortForwardTableID      = fs.Int("port-forward-table-id", 201, "Routing table ID for DNAT return traffic (1-252)")
@@ -309,6 +317,8 @@ func loadConfig(args []string) (Config, error) {
 			} else {
 				slog.Warn("ignoring invalid stale-chassis-grace-period flag value", "value", *fStaleGrace, "error", err)
 			}
+		case "metrics-listen":
+			cfg.MetricsListen = *fMetricsListen
 		case "veth-leak-enabled":
 			cfg.VethLeakEnabled = *fVethLeakEnabled
 		case "veth-provider-ip":
@@ -371,6 +381,12 @@ func validateConfig(cfg *Config) error {
 
 	if cfg.StaleChassisGracePeriod < 0 {
 		return fmt.Errorf("invalid stale-chassis-grace-period: must be non-negative")
+	}
+
+	if cfg.MetricsListen != "" {
+		if _, _, err := net.SplitHostPort(cfg.MetricsListen); err != nil {
+			return fmt.Errorf("invalid metrics-listen %q: %w", cfg.MetricsListen, err)
+		}
 	}
 
 	// Veth leak validation
@@ -586,6 +602,9 @@ func applyFileConfig(cfg *Config, fc *configFile) {
 			slog.Warn("ignoring invalid stale_chassis_grace_period in config file", "value", fc.StaleChassisGracePeriod, "error", err)
 		}
 	}
+	if fc.MetricsListen != "" {
+		cfg.MetricsListen = fc.MetricsListen
+	}
 	if fc.VethLeakEnabled != nil {
 		cfg.VethLeakEnabled = *fc.VethLeakEnabled
 	}
@@ -682,6 +701,9 @@ func applyEnvConfig(cfg *Config) {
 		} else {
 			slog.Warn("ignoring invalid OVN_NETWORK_STALE_CHASSIS_GRACE_PERIOD env var", "value", v, "error", err)
 		}
+	}
+	if v := os.Getenv("OVN_NETWORK_METRICS_LISTEN"); v != "" {
+		cfg.MetricsListen = v
 	}
 	if v := os.Getenv("OVN_NETWORK_VETH_LEAK_ENABLED"); v == "0" || v == "false" {
 		cfg.VethLeakEnabled = false
