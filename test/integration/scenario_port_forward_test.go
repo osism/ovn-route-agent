@@ -60,6 +60,12 @@ func startPFScenario(t *testing.T) testenv.AgentConfig {
 	// agent up. The Setup-registered Teardown handles the trailing edge.
 	testenv.ScrubPortForwardResidue(t)
 
+	// On failure, dump host-side state for postmortem diagnosis. PF
+	// scenarios that also call startScenario already register the OVN
+	// dump via that helper; calling RegisterFailureDump here covers PF
+	// scenarios that drive only nft/loopback state without OVN clients.
+	testenv.RegisterFailureDump(t)
+
 	return pfDefaults(t)
 }
 

@@ -8,6 +8,32 @@
 // ovn-controller, FRR, nftables, br-ex) has already been provisioned by
 // test/integration/setup.sh. Setup verifies the prerequisites and records
 // initial state; Teardown best-effort restores it.
+//
+// # Lifecycle of a scenario test
+//
+// Every test should follow this shape so cleanup is reliable even when the
+// test fails:
+//
+//  1. Call testenv.Setup(t) first. It performs prerequisite checks (Linux,
+//     root, br-ex, required binaries) and registers a t.Cleanup that runs
+//     Teardown. Tests that need OVN should also call PauseOVNNorthd /
+//     PauseOVNController via the higher-level startScenario helper in the
+//     test package.
+//  2. Drive desired state — write to NB/SB via the libovsdb clients, configure
+//     the agent via AgentConfig, run it via RunAgent or WithAgent.
+//  3. Assert outcomes via the Assert* helpers (AssertKernelRoute,
+//     AssertOVSFlow, AssertFRRRoute, AssertNftRuleInChain). Prefer the
+//     polling forms — these tests race against an event-driven daemon.
+//  4. On exit, the Teardown registered in step 1 runs scrubLocalState +
+//     scrubPortForwardState, undoing whatever the agent installed. The
+//     dump-on-fail hook in startScenario logs the surviving state if the
+//     test failed, so the failure log is self-contained.
+//
+// All cleanup is best-effort and idempotent: between tests the harness flushes
+// the agent's nft table, kernel /32 routes on br-ex, FRR static routes in the
+// VRF, OVS flows tagged with the agent's cookies, and port-forward residue
+// (loopback addresses, fwmark ip rules, the reply table). One failing test
+// must not poison the next.
 package testenv
 
 import (
