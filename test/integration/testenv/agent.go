@@ -91,6 +91,16 @@ func Defaults() AgentConfig {
 	}
 }
 
+// FastDefaults is Defaults() with a tightened reconcile interval. Use it for
+// scenarios that need to observe drift recovery, stale-chassis cleanup, or
+// any other periodic behaviour without paying the full 5s production tick.
+// Tests that must mirror production timing should keep using Defaults().
+func FastDefaults() AgentConfig {
+	cfg := Defaults()
+	cfg.ReconcileInterval = "2s"
+	return cfg
+}
+
 // AgentProc is a handle to a running agent subprocess.
 type AgentProc struct {
 	t       *testing.T
@@ -159,6 +169,35 @@ func RunAgent(t *testing.T, cfg AgentConfig) *AgentProc {
 	})
 
 	return p
+}
+
+// WithAgent is the convenience composition of RunAgent + WaitReady + a
+// deferred Stop registered via t.Cleanup. It is the right helper for the
+// common shape of "spin up an agent against this config, run a scenario,
+// let SIGTERM-on-exit do the cleanup".
+//
+// Tests that need to assert on Stop() ordering or timing (drain-on-shutdown,
+// SIGTERM cleanup verification) should keep using RunAgent + manual Stop —
+// WithAgent's cleanup runs after t returns, which is too late for those
+// assertions. The cleanup tolerates a prior manual Stop because AgentProc
+// dedupes on its `stopped` flag.
+func WithAgent(t *testing.T, cfg AgentConfig) *AgentProc {
+	t.Helper()
+	a := RunAgent(t, cfg)
+
+	readyCtx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
+	defer cancel()
+	if err := a.WaitReady(readyCtx); err != nil {
+		t.Fatalf("agent did not become ready: %v", err)
+	}
+
+	t.Cleanup(func() {
+		if err := a.Stop(15 * time.Second); err != nil {
+			t.Errorf("agent stop in WithAgent cleanup: %v", err)
+		}
+	})
+
+	return a
 }
 
 // scanStderr forwards agent stderr to t.Log, buffers it for diagnostics,

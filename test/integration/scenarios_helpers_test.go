@@ -60,6 +60,17 @@ func startScenario(t *testing.T) (context.Context, context.CancelFunc, client.Cl
 	testenv.ResetOVNState(t, ctx, nb, sb)
 	t.Cleanup(func() { testenv.ResetOVNState(t, context.Background(), nb, sb) })
 
+	// On failure, dump enough state for postmortem diagnosis without an
+	// operator having to ssh in and re-run commands. ctx may be cancelled
+	// by the time cleanup runs (the scenario context has a 90s ceiling),
+	// so use a fresh background context for the OVN dump.
+	t.Cleanup(func() {
+		if t.Failed() {
+			dumpOVNState(t, context.Background(), nb, sb)
+			testenv.DumpHostState(t)
+		}
+	})
+
 	return ctx, cancel, nb, sb
 }
 
