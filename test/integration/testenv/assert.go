@@ -304,4 +304,10 @@ func scrubLocalState(t *testing.T) {
 	// Port-forward residue: managed VIPs on loopback1, fwmark ip rules,
 	// the port-forward reply table. Calls into portforward.go.
 	scrubPortForwardState(t)
+
+	// Veth-leak residue: per-network policy rules at the agent's priority,
+	// the leak table, and the veth pair itself. SIGKILL'd agents (the test
+	// crashed before WithAgent's Stop ran) skip the agent's TeardownVethLeak,
+	// so without this scrub the next scenario inherits an enslaved veth pair.
+	scrubVethLeakState(t)
 }

@@ -152,6 +152,13 @@ func Teardown(t *testing.T) {
 	// Idempotent — port-forward scenarios that did not run pay only the
 	// cost of a few quick "no such process" exits.
 	scrubPortForwardState(t)
+
+	// Veth-leak residue: per-network policy rules at the agent's priority,
+	// leak-table routes, and the veth pair itself. The agent recreates the
+	// pair on every startup, so smoke-style tests that don't go through
+	// startScenario / ResetOVNState still rely on this safety net to keep
+	// the next run from inheriting an enslaved veth pair.
+	scrubVethLeakState(t)
 }
 
 // frrStaticRoutes returns the /32 static routes currently present in the
