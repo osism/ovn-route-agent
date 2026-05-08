@@ -112,6 +112,40 @@ func AssertNoOVSFlow(t *testing.T, cookie string, timeout time.Duration) {
 	}
 }
 
+// AssertNoOVSFlowMatches polls dump-flows for the cookie and fails if any
+// line still satisfies match past timeout. Mirrors AssertOVSFlowMatches for
+// the negative case: useful when several flows share a cookie (e.g. v4 and
+// v6 hairpin flows under 0x998) and the test wants to verify cleanup of one
+// specific entry without disturbing the others.
+func AssertNoOVSFlowMatches(t *testing.T, cookie string, match func(line string) bool, timeout time.Duration, msg string) {
+	t.Helper()
+	deadline := time.Now().Add(timeout)
+	for {
+		out, err := exec.Command("ovs-ofctl", "dump-flows", DefaultBridgeDev,
+			fmt.Sprintf("cookie=%s/-1", cookie)).CombinedOutput()
+		if err == nil {
+			matched := false
+			for _, line := range strings.Split(string(out), "\n") {
+				if !strings.Contains(line, "cookie=") {
+					continue
+				}
+				if match(line) {
+					matched = true
+					break
+				}
+			}
+			if !matched {
+				return
+			}
+		}
+		if time.Now().After(deadline) {
+			t.Fatalf("OVS flow with cookie %s matching %s still present after %s (last output: %q)",
+				cookie, msg, timeout, strings.TrimSpace(string(out)))
+		}
+		time.Sleep(100 * time.Millisecond)
+	}
+}
+
 // AssertOVSFlowMatches polls dump-flows for the cookie and runs match against
 // each line containing "cookie=". Useful when several flows share a cookie
 // (e.g. hairpin flows for several IPs) and the test wants to check a specific
