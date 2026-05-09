@@ -623,7 +623,23 @@ func (rm *RouteManager) ReconcileVethLeakNetworks(desired []*net.IPNet) error {
 		desiredSet[n.String()] = n
 	}
 
-	// Add missing per-network routes and rules.
+	// Discover current per-network policy rules. Tracked separately from
+	// routes because rules and routes can drift independently — an operator
+	// running `ip rule del ...` removes the rule while the route remains,
+	// and the next reconcile must observe and reinstall just the rule.
+	allRules, ruleListErr := netlink.RuleList(netlink.FAMILY_V4)
+	if ruleListErr != nil {
+		slog.Warn("failed to list policy rules", "error", ruleListErr)
+	}
+	currentRules := make(map[string]bool, len(allRules))
+	for _, r := range allRules {
+		if r.Table != rm.vethLeakTableID || r.Priority != rm.vethLeakRulePriority || r.Src == nil {
+			continue
+		}
+		currentRules[r.Src.String()] = true
+	}
+
+	// Add missing per-network routes.
 	for key, network := range desiredSet {
 		if currentNets[key] {
 			continue
@@ -637,7 +653,16 @@ func (rm *RouteManager) ReconcileVethLeakNetworks(desired []*net.IPNet) error {
 		}); err != nil {
 			return fmt.Errorf("add VRF route for %s: %w", network, err)
 		}
+		slog.Info("veth leak network route added", "network", network)
+	}
 
+	// Add missing per-network policy rules. Decoupled from the route loop
+	// above — when only the rule was deleted, the route already exists and
+	// the route loop is a no-op, but the rule still needs to be re-added.
+	for key, network := range desiredSet {
+		if currentRules[key] {
+			continue
+		}
 		rule := netlink.NewRule()
 		rule.Src = network
 		rule.Table = rm.vethLeakTableID
@@ -647,7 +672,7 @@ func (rm *RouteManager) ReconcileVethLeakNetworks(desired []*net.IPNet) error {
 				return fmt.Errorf("add policy rule for %s: %w", network, err)
 			}
 		}
-		slog.Info("veth leak network added", "network", network)
+		slog.Info("veth leak network rule added", "network", network)
 	}
 
 	// Remove stale per-network routes and rules.

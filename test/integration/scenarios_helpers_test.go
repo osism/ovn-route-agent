@@ -74,6 +74,22 @@ func startScenario(t *testing.T) (context.Context, context.CancelFunc, client.Cl
 	return ctx, cancel, nb, sb
 }
 
+// deleteRouter removes a Logical_Router by UUID. OVSDB referential integrity
+// cascades to the LRP, NAT, Gateway_Chassis, and static_route children the
+// router owned, which is what the agent's local-router detection observes
+// when LRPs disappear from NB. Any SB chassisredirect Port_Binding /
+// Datapath_Binding seeded by MakeLocalRouter is left in place — it now
+// points at a non-existent LRP, so localLRPUUIDs[portUUID] in ovn.go no
+// longer includes it. End-of-test ResetOVNState scrubs the SB residue.
+func deleteRouter(t *testing.T, ctx context.Context, nb client.Client, routerUUID string) {
+	t.Helper()
+	ops, err := nb.Where(&testenv.NBLogicalRouter{UUID: routerUUID}).Delete()
+	if err != nil {
+		t.Fatalf("delete router op: %v", err)
+	}
+	testenv.Transact(t, ctx, nb, ops)
+}
+
 // readyAgent starts an agent with cfg and waits for the "agent running" log
 // line. The agent is stopped at test cleanup if the test forgot to do so.
 func readyAgent(t *testing.T, cfg testenv.AgentConfig) *testenv.AgentProc {
