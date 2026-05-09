@@ -14,6 +14,7 @@ test/integration/
   scenarios_helpers_test.go        — shared per-scenario boilerplate (startScenario, readyAgent)
   scenario_fip_test.go             — FIP add/remove, gatewayless gw, multi-router on one chassis
   scenario_failover_test.go        — failover, stale-chassis cleanup, drain & restore-drained
+  scenario_network_cidrs_test.go   — manual network_cidr override vs. auto-discovery, empty-filter sweep
   scenario_port_forward_test.go    — DNAT, sticky multi-backend, VIP mgmt, masquerade, hairpin
   testenv/                         — Setup, Teardown, RunAgent, MakeLocalRouter, Assert*, …
 ```
