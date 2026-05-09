@@ -61,3 +61,24 @@ func RegisterFailureDump(t *testing.T) {
 		}
 	})
 }
+
+// DumpFRRPrefixList logs `vtysh -c "show ip prefix-list <name>"` to the test
+// log. Used by scenario tests that exercise FRRPrefixList reconcile so a
+// failure message includes the FRR-side state without an operator having to
+// ssh in. Best-effort: silently no-ops if vtysh is missing.
+func DumpFRRPrefixList(t *testing.T, name string) {
+	t.Helper()
+	if _, err := exec.LookPath("vtysh"); err != nil {
+		return
+	}
+	out, err := exec.Command("vtysh", "-c", "show ip prefix-list "+name).CombinedOutput()
+	text := strings.TrimRight(string(out), "\n")
+	switch {
+	case err != nil:
+		t.Logf("--- vtysh show ip prefix-list %s --- (err: %v)\n%s", name, err, text)
+	case strings.TrimSpace(text) == "":
+		t.Logf("--- vtysh show ip prefix-list %s --- (empty)", name)
+	default:
+		t.Logf("--- vtysh show ip prefix-list %s ---\n%s", name, text)
+	}
+}
