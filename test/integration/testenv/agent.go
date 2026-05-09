@@ -23,13 +23,14 @@ import (
 // to run the agent. Zero-valued fields fall back to AgentConfig defaults
 // applied by Defaults().
 type AgentConfig struct {
-	OVNNBRemote   string `yaml:"ovn_nb_remote"`
-	OVNSBRemote   string `yaml:"ovn_sb_remote"`
-	BridgeDev     string `yaml:"bridge_dev"`
-	VRFName       string `yaml:"vrf_name"`
-	VethNexthop   string `yaml:"veth_nexthop"`
-	FRRPrefixList string `yaml:"frr_prefix_list"`
-	LogLevel      string `yaml:"log_level"`
+	OVNNBRemote   string   `yaml:"ovn_nb_remote"`
+	OVNSBRemote   string   `yaml:"ovn_sb_remote"`
+	BridgeDev     string   `yaml:"bridge_dev"`
+	VRFName       string   `yaml:"vrf_name"`
+	VethNexthop   string   `yaml:"veth_nexthop"`
+	NetworkCIDRs  []string `yaml:"network_cidrs"`
+	FRRPrefixList string   `yaml:"frr_prefix_list"`
+	LogLevel      string   `yaml:"log_level"`
 
 	// Pointers so we can distinguish "unset" from "explicit false".
 	DryRun            *bool `yaml:"dry_run,omitempty"`
@@ -318,6 +319,14 @@ func writeTempConfig(t *testing.T, cfg AgentConfig) string {
 	put("bridge_dev", cfg.BridgeDev)
 	put("vrf_name", cfg.VRFName)
 	put("veth_nexthop", cfg.VethNexthop)
+	// Manual NetworkCIDRs override auto-discovery from Logical_Router_Port.networks
+	// and become the operator's only knob for opting some networks out of BGP
+	// announcement: an external IP outside this set MUST NOT install kernel/FRR
+	// routes. The agent's YAML key is `network_cidr` (StringOrSlice), so emit
+	// that even though the testenv struct tag is the more readable plural form.
+	if len(cfg.NetworkCIDRs) > 0 {
+		doc["network_cidr"] = cfg.NetworkCIDRs
+	}
 	// frr_prefix_list intentionally always emits, allowing "" to disable.
 	doc["frr_prefix_list"] = cfg.FRRPrefixList
 	put("log_level", cfg.LogLevel)
