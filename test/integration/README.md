@@ -17,7 +17,8 @@ test/integration/
   scenario_drain_edges_test.go     — drain edge cases (timeout, no local routers, cleanup_on_shutdown=false)
   scenario_network_cidrs_test.go   — manual network_cidr override vs. auto-discovery, empty-filter sweep
   scenario_port_forward_test.go    — DNAT, sticky multi-backend, VIP mgmt, masquerade, hairpin
-  testenv/                         — Setup, Teardown, RunAgent, MakeLocalRouter, Assert*, …
+  scenario_metrics_test.go         — Prometheus /metrics scrapes (reconcile counter, drain outcome, stale-chassis, desired-state gauges)
+  testenv/                         — Setup, Teardown, RunAgent, MakeLocalRouter, Assert*, ScrapeMetrics, …
 ```
 
 Port-forward scenarios additionally rely on:
