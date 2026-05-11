@@ -42,6 +42,12 @@ type AgentConfig struct {
 	StaleChassisGracePeriod string `yaml:"stale_chassis_grace_period,omitempty"`
 	DrainTimeout            string `yaml:"drain_timeout,omitempty"`
 
+	// MetricsListen is the address the agent's Prometheus /metrics endpoint
+	// binds to. Empty disables the endpoint (the agent's default). Scenario
+	// tests should pick a free loopback port with FreeLoopbackAddr so parallel
+	// runs do not collide.
+	MetricsListen string `yaml:"metrics_listen,omitempty"`
+
 	// Port forwarding (DNAT). PortForwards is the list of VIPs and rules; the
 	// agent infers PortForwardEnabled from len > 0. PortForwardL3mdevAccept
 	// flips a *global* sysctl when true — scenario tests that set it must use
@@ -333,6 +339,7 @@ func writeTempConfig(t *testing.T, cfg AgentConfig) string {
 	put("reconcile_interval", cfg.ReconcileInterval)
 	put("stale_chassis_grace_period", cfg.StaleChassisGracePeriod)
 	put("drain_timeout", cfg.DrainTimeout)
+	put("metrics_listen", cfg.MetricsListen)
 	putBool("dry_run", cfg.DryRun)
 	putBool("cleanup_on_shutdown", cfg.CleanupOnShutdown)
 	putBool("drain_on_shutdown", cfg.DrainOnShutdown)
