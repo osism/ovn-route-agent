@@ -32,6 +32,12 @@ type AgentConfig struct {
 	FRRPrefixList string   `yaml:"frr_prefix_list"`
 	LogLevel      string   `yaml:"log_level"`
 
+	// GatewayPort opts the agent into single-port mode: only the named
+	// chassisredirect Port_Binding is tracked, all others are ignored. Used
+	// by legacy single-router deployments. Empty value (the default) enables
+	// the agent's multi-router mode.
+	GatewayPort string `yaml:"gateway_port,omitempty"`
+
 	// Pointers so we can distinguish "unset" from "explicit false".
 	DryRun            *bool `yaml:"dry_run,omitempty"`
 	CleanupOnShutdown *bool `yaml:"cleanup_on_shutdown,omitempty"`
@@ -336,6 +342,7 @@ func writeTempConfig(t *testing.T, cfg AgentConfig) string {
 	// frr_prefix_list intentionally always emits, allowing "" to disable.
 	doc["frr_prefix_list"] = cfg.FRRPrefixList
 	put("log_level", cfg.LogLevel)
+	put("gateway_port", cfg.GatewayPort)
 	put("reconcile_interval", cfg.ReconcileInterval)
 	put("stale_chassis_grace_period", cfg.StaleChassisGracePeriod)
 	put("drain_timeout", cfg.DrainTimeout)
