@@ -1133,6 +1133,31 @@ func TestPortForwardValidation(t *testing.T) {
 			t.Errorf("same port with different proto should be valid: %v", err)
 		}
 	})
+
+	// 0 and 254 are both kernel aliases for the "main" routing table, but the
+	// validator does not collapse them. Whatever the resolution, it must not
+	// silently let the pair through and end up with two different agent
+	// subsystems writing into the same on-disk table.
+	t.Run("route_table_id_0_collides_with_port_forward_main_alias", func(t *testing.T) {
+		cfg := base()
+		cfg.RouteTableID = 0       // main table (alias)
+		cfg.PortForwardTableID = 254 // main table (canonical id)
+		if err := validateConfig(&cfg); err == nil {
+			t.Error("expected error: port_forward_table_id 254 (main) must not coexist with route_table_id 0 (main alias)")
+		}
+	})
+
+	t.Run("route_table_id_0_collides_with_veth_leak_main_alias", func(t *testing.T) {
+		cfg := base()
+		cfg.RouteTableID = 0      // main table (alias)
+		cfg.VethLeakTableID = 254 // main table (canonical id)
+		// Use the matching port-forward range so the test fails specifically
+		// on the route/leak collision, not on an unrelated range check.
+		cfg.PortForwardTableID = 201
+		if err := validateConfig(&cfg); err == nil {
+			t.Error("expected error: veth_leak_table_id 254 (main) must not coexist with route_table_id 0 (main alias)")
+		}
+	})
 }
 
 func TestApplyEnvConfigPortForward(t *testing.T) {
