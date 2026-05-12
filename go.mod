@@ -4,6 +4,7 @@ go 1.25.0
 
 require (
 	github.com/cenkalti/backoff/v4 v4.3.0
+	github.com/cenkalti/backoff/v5 v5.0.3
 	github.com/ovn-kubernetes/libovsdb v0.8.1
 	github.com/prometheus/client_golang v1.23.2
 	github.com/vishvananda/netlink v1.3.1
