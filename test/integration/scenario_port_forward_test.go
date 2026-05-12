@@ -3,6 +3,7 @@
 package integration
 
 import (
+	"strconv"
 	"testing"
 	"time"
 
@@ -142,11 +143,11 @@ func TestScenario_PortForwardMatrix(t *testing.T) {
 					},
 					10*time.Second, "ctzone reply-direction rule for backend "+backend)
 				testenv.AssertNftRuleInChain(t, pfTable, "prerouting_fwmark",
-					func(r testenv.NftRule) bool { return r.HasMarkSet(0x100) },
-					10*time.Second, "prerouting_fwmark sets 0x100 on original direction")
+					func(r testenv.NftRule) bool { return r.HasMarkSet(testenv.DefaultDnatFwmark) },
+					10*time.Second, "prerouting_fwmark sets original-direction mark")
 				testenv.AssertNftRuleInChain(t, pfTable, "prerouting_fwmark",
-					func(r testenv.NftRule) bool { return r.HasMarkSet(0x200) },
-					10*time.Second, "prerouting_fwmark sets 0x200 on reply direction")
+					func(r testenv.NftRule) bool { return r.HasMarkSet(testenv.DefaultDnatReplyFwmark) },
+					10*time.Second, "prerouting_fwmark sets reply-direction mark")
 			},
 		},
 		// udp_single_backend (#61 scenario 1).
@@ -550,11 +551,11 @@ func TestScenario_PortForwardOutputChains(t *testing.T) {
 		},
 		10*time.Second, "output_ctzone mirrors backend saddr rule")
 
-	// output_fwmark exists and sets 0x200 on the reply direction.
+	// output_fwmark exists and sets the reply-direction mark.
 	testenv.AssertNftChainExists(t, pfTable, "output_fwmark", 15*time.Second)
 	testenv.AssertNftRuleInChain(t, pfTable, "output_fwmark",
-		func(r testenv.NftRule) bool { return r.HasMarkSet(0x200) },
-		10*time.Second, "output_fwmark sets 0x200 on locally-generated reply")
+		func(r testenv.NftRule) bool { return r.HasMarkSet(testenv.DefaultDnatReplyFwmark) },
+		10*time.Second, "output_fwmark sets reply-direction mark on locally-generated reply")
 
 	// Verify the chain header is `type route` (not `type filter`) — the
 	// route hook is required to trigger routing re-evaluation when the
@@ -615,16 +616,16 @@ func TestScenario_PortForwardCleanupOnSIGTERM(t *testing.T) {
 // With any single-backend rule installed, the agent's ensureDNATRouting must
 // produce two ip rules and a route in the configured port-forward table:
 //
-//   - priority 150: fwmark 0x100 → lookup main (forward direction)
-//   - priority 151: fwmark 0x200 → lookup <pf-table> (reply direction)
-//   - <pf-table>:   default via <veth-default> (return-path egress device)
+//   - DefaultDnatFwmarkPriority: DefaultDnatFwmark → lookup main (forward)
+//   - DefaultDnatReplyPriority:  DefaultDnatReplyFwmark → lookup <pf-table>
+//   - <pf-table>:                default via <veth-default> (return path)
 //
 // We assert all three using the JSON-parsed helpers added in this commit so
 // the test is robust against iproute2 version drift.
 //
-// The default port_forward_table_id is 201 — we use the default here so
-// scrubPortForwardState (which flushes table 201) reaches the route on
-// teardown.
+// The default port_forward_table_id is DefaultPortForwardTableID — we use
+// the default here so scrubPortForwardState (which flushes that table)
+// reaches the route on teardown.
 func TestScenario_PortForwardFwmarkPolicyRoutes(t *testing.T) {
 	cfg := startPFScenario(t)
 
@@ -642,19 +643,28 @@ func TestScenario_PortForwardFwmarkPolicyRoutes(t *testing.T) {
 	a := readyAgent(t, cfg)
 	defer a.Stop(15 * time.Second)
 
-	// Forward rule: priority 150, fwmark 0x100, lookup main. iproute2 emits
+	// Forward rule: forward-direction fwmark → lookup main. iproute2 emits
 	// the main table by name, not number.
-	testenv.AssertIPRulePriority(t, 150, 0x100, "main", 15*time.Second)
+	testenv.AssertIPRulePriority(t,
+		testenv.DefaultDnatFwmarkPriority,
+		testenv.DefaultDnatFwmark,
+		"main", 15*time.Second)
 
-	// Reply rule: priority 151, fwmark 0x200, lookup the PF table (default 201).
-	testenv.AssertIPRulePriority(t, 151, 0x200, "201", 15*time.Second)
+	// Reply rule: reply-direction fwmark → lookup the PF table.
+	testenv.AssertIPRulePriority(t,
+		testenv.DefaultDnatReplyPriority,
+		testenv.DefaultDnatReplyFwmark,
+		strconv.Itoa(testenv.DefaultPortForwardTableID),
+		15*time.Second)
 
 	// Reply table route: agent installs `default via <vethProviderIP> dev
 	// veth-default`. The issue references "loopback1 (or whatever the agent
 	// emits as its return path)" — the production return path is the veth
 	// pair so we assert on veth-default. We do not pin the gateway IP so
 	// the test stays robust against operators reconfiguring veth-nexthop.
-	testenv.AssertRouteInTable(t, "201", "default", "veth-default", 15*time.Second)
+	testenv.AssertRouteInTable(t,
+		strconv.Itoa(testenv.DefaultPortForwardTableID),
+		"default", "veth-default", 15*time.Second)
 }
 
 // TestScenario_PortForwardHairpinPlusPerRuleMasquerade (#61 scenario 4).

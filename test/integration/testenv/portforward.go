@@ -7,6 +7,7 @@ import (
 	"net"
 	"os"
 	"os/exec"
+	"strconv"
 	"strings"
 	"testing"
 	"time"
@@ -22,6 +23,43 @@ const PortForwardLoopbackDev = "loopback1"
 const (
 	SysctlUDPL3mdevAccept = "/proc/sys/net/ipv4/udp_l3mdev_accept"
 	SysctlTCPL3mdevAccept = "/proc/sys/net/ipv4/tcp_l3mdev_accept"
+)
+
+// Port-forward fwmark / priority / table constants mirrored from the agent's
+// nftables.go (dnatFwmark, dnatReplyFwmark, dnatFwmarkPriority,
+// dnatReplyPriority) and config.go (PortForwardTableID default of 201).
+//
+// The duplication is deliberate: the integration package builds with
+// `//go:build integration` and cannot import from `main`, so any test that
+// wants to assert on the agent's policy-route plumbing has to know these
+// values out-of-band. Keep them in lock step with the agent's source — a
+// change to either side without the other will silently break scenario
+// tests' policy-route / fwmark assertions.
+const (
+	// DefaultDnatFwmark is the fwmark the agent stamps on original-direction
+	// DNAT'd packets. Steered to the main table via the ip rule at
+	// DefaultDnatFwmarkPriority.
+	DefaultDnatFwmark = 0x100
+
+	// DefaultDnatReplyFwmark is the fwmark the agent stamps on
+	// reply-direction DNAT'd packets. Steered to the port-forward routing
+	// table (DefaultPortForwardTableID) via the ip rule at
+	// DefaultDnatReplyPriority.
+	DefaultDnatReplyFwmark = 0x200
+
+	// DefaultDnatFwmarkPriority is the priority of the ip rule that matches
+	// DefaultDnatFwmark and looks up the main table. Must be < 1000 to win
+	// against the l3mdev VRF rule.
+	DefaultDnatFwmarkPriority = 150
+
+	// DefaultDnatReplyPriority is the priority of the ip rule that matches
+	// DefaultDnatReplyFwmark and looks up the port-forward routing table.
+	DefaultDnatReplyPriority = 151
+
+	// DefaultPortForwardTableID is the routing table the agent uses for
+	// DNAT reply traffic by default. Matches config.PortForwardTableID's
+	// default of 201.
+	DefaultPortForwardTableID = 201
 )
 
 // BridgeProxyARPPath returns the per-device proxy_arp sysctl path the agent
@@ -169,9 +207,9 @@ func ScrubPortForwardResidue(t *testing.T) {
 
 // scrubPortForwardState removes all per-test residue of the agent's
 // port-forward feature: managed addresses on loopback1, fwmark ip rules at
-// priorities 150/151, the entire port-forward routing table (default 201),
-// and the agent's nft table. Best-effort — used between scenarios so a
-// failed test does not poison the next.
+// the default DNAT priorities, the entire port-forward routing table
+// (default DefaultPortForwardTableID), and the agent's nft table. Best-effort
+// — used between scenarios so a failed test does not poison the next.
 func scrubPortForwardState(t *testing.T) {
 	t.Helper()
 
@@ -184,14 +222,15 @@ func scrubPortForwardState(t *testing.T) {
 	// Remove DNAT fwmark policy rules. RuleDel via netlink would require
 	// importing the agent's package; the `ip rule del` form by priority is
 	// idempotent enough for cleanup.
-	for _, prio := range []string{"150", "151"} {
-		_ = exec.Command("ip", "rule", "del", "priority", prio).Run()
+	for _, prio := range []int{DefaultDnatFwmarkPriority, DefaultDnatReplyPriority} {
+		_ = exec.Command("ip", "rule", "del", "priority", strconv.Itoa(prio)).Run()
 	}
 
-	// Flush the port-forward reply table (default 201). If the test used a
-	// non-default table we don't know it here — but the default-table flush
-	// is the safe path for the harness's typical Defaults() config.
-	_ = exec.Command("ip", "route", "flush", "table", "201").Run()
+	// Flush the port-forward reply table (default DefaultPortForwardTableID).
+	// If the test used a non-default table we don't know it here — but the
+	// default-table flush is the safe path for the harness's typical
+	// Defaults() config.
+	_ = exec.Command("ip", "route", "flush", "table", strconv.Itoa(DefaultPortForwardTableID)).Run()
 
 	// Drop the agent's nft table. Already covered by scrubLocalState, but
 	// repeating it here makes scrubPortForwardState self-contained for
