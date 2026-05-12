@@ -26,6 +26,7 @@ type AgentConfig struct {
 	OVNNBRemote   string   `yaml:"ovn_nb_remote"`
 	OVNSBRemote   string   `yaml:"ovn_sb_remote"`
 	BridgeDev     string   `yaml:"bridge_dev"`
+	BridgeIP      string   `yaml:"bridge_ip,omitempty"`
 	VRFName       string   `yaml:"vrf_name"`
 	VethNexthop   string   `yaml:"veth_nexthop"`
 	NetworkCIDRs  []string `yaml:"network_cidrs"`
@@ -329,6 +330,7 @@ func writeTempConfig(t *testing.T, cfg AgentConfig) string {
 	put("ovn_nb_remote", cfg.OVNNBRemote)
 	put("ovn_sb_remote", cfg.OVNSBRemote)
 	put("bridge_dev", cfg.BridgeDev)
+	put("bridge_ip", cfg.BridgeIP)
 	put("vrf_name", cfg.VRFName)
 	put("veth_nexthop", cfg.VethNexthop)
 	// Manual NetworkCIDRs override auto-discovery from Logical_Router_Port.networks

@@ -119,20 +119,17 @@ func AssertNoBridgeAddress(t *testing.T, bridge, cidr string, timeout time.Durat
 
 // parseCIDRForBridge splits "<ip>/<prefix>" into the canonical IP form and
 // integer prefix length. Rejects bare IPs so callers cannot accidentally
-// match a /24 entry when they meant /32.
+// match a /24 entry when they meant /32, and rejects IPv6 because the
+// callers only assert against `ip -j -4 addr show`.
 func parseCIDRForBridge(cidr string) (string, int, error) {
-	ipStr, prefixStr, ok := strings.Cut(cidr, "/")
-	if !ok {
-		return "", 0, fmt.Errorf("invalid CIDR %q: expected form ip/prefix", cidr)
+	ip, ipnet, err := net.ParseCIDR(cidr)
+	if err != nil {
+		return "", 0, fmt.Errorf("invalid CIDR %q: %w", cidr, err)
 	}
-	ip := net.ParseIP(ipStr)
-	if ip == nil {
-		return "", 0, fmt.Errorf("invalid CIDR %q: bad IP", cidr)
+	if ip.To4() == nil {
+		return "", 0, fmt.Errorf("invalid CIDR %q: IPv4 required", cidr)
 	}
-	var prefix int
-	if _, err := fmt.Sscanf(prefixStr, "%d", &prefix); err != nil || prefix < 0 || prefix > 32 {
-		return "", 0, fmt.Errorf("invalid CIDR %q: bad prefix", cidr)
-	}
+	prefix, _ := ipnet.Mask.Size()
 	return ip.String(), prefix, nil
 }
 
