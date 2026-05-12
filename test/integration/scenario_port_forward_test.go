@@ -430,3 +430,296 @@ func TestScenario_PortForwardCleanupOnSIGTERM(t *testing.T) {
 	testenv.AssertNftTableAbsent(t, pfTable, 10*time.Second)
 	testenv.AssertVIPNotOnLoopback(t, vip, 10*time.Second)
 }
+
+// =============================================================================
+// Scenarios from #61 — additional port-forward coverage.
+//
+// The eight scenarios from #43 nail down the structural shape but several
+// operationally important variations remained unchecked: UDP, port
+// translation, the fwmark / policy-routing plumbing, and how hairpin
+// masquerade interacts with per-rule masquerade overrides. The tests below
+// fill those gaps.
+// =============================================================================
+
+// TestScenario_PortForwardUDPSingleBackendDNAT (#61 scenario 1).
+//
+// Mirror of TestScenario_PortForwardSingleBackendDNAT but for proto: udp on
+// port 53 (DNS). Pins the DNAT statement and the conntrack-zone rules in
+// both directions so a regression that drops `udp` from the protocol switch
+// in the rule builder cannot pass.
+func TestScenario_PortForwardUDPSingleBackendDNAT(t *testing.T) {
+	cfg := startPFScenario(t)
+
+	const (
+		vip     = "198.51.100.12"
+		backend = "10.0.0.110"
+	)
+	cfg.PortForwards = []testenv.PortForwardVIPFixture{{
+		VIP: vip,
+		Rules: []testenv.PortForwardRuleFixture{{
+			Proto: "udp", Port: 53, DestAddr: backend,
+		}},
+	}}
+
+	a := readyAgent(t, cfg)
+	defer a.Stop(15 * time.Second)
+
+	// DNAT rule (UDP).
+	testenv.AssertNftRuleInChain(t, pfTable, "prerouting_dnat",
+		func(r testenv.NftRule) bool {
+			return r.HasMatch("ip", "daddr", vip) &&
+				r.HasMatch("udp", "dport", 53) &&
+				r.HasDNATTo(backend, 53)
+		},
+		15*time.Second, "single-backend UDP DNAT rule for "+vip+":53")
+
+	// Conntrack zone: original direction (VIP daddr).
+	testenv.AssertNftRuleInChain(t, pfTable, "prerouting_ctzone",
+		func(r testenv.NftRule) bool {
+			return r.HasMatch("ip", "daddr", vip) &&
+				r.HasMatch("udp", "dport", 53) &&
+				r.HasCTZoneSet(*cfg.PortForwardCTZone)
+		},
+		10*time.Second, "ctzone original-direction UDP rule for "+vip)
+
+	// Conntrack zone: reply direction (backend saddr).
+	testenv.AssertNftRuleInChain(t, pfTable, "prerouting_ctzone",
+		func(r testenv.NftRule) bool {
+			return r.HasMatch("ip", "saddr", backend) &&
+				r.HasMatch("udp", "sport", 53) &&
+				r.HasCTZoneSet(*cfg.PortForwardCTZone)
+		},
+		10*time.Second, "ctzone reply-direction UDP rule for backend "+backend)
+}
+
+// TestScenario_PortForwardPortTranslation (#61 scenario 2).
+//
+// A rule with port=80 and dest_port=8080 should DNAT the listening port (80)
+// to the backend port (8080). The fixture schema has carried dest_port from
+// day one but no test asserted the translation actually happens — a typo in
+// the rule builder that emitted `dnat to <backend>:80` would have slipped
+// through.
+func TestScenario_PortForwardPortTranslation(t *testing.T) {
+	cfg := startPFScenario(t)
+
+	const (
+		vip     = "198.51.100.13"
+		backend = "10.0.0.120"
+	)
+	cfg.PortForwards = []testenv.PortForwardVIPFixture{{
+		VIP: vip,
+		Rules: []testenv.PortForwardRuleFixture{{
+			Proto: "tcp", Port: 80, DestAddr: backend, DestPort: 8080,
+		}},
+	}}
+
+	a := readyAgent(t, cfg)
+	defer a.Stop(15 * time.Second)
+
+	// Match on listening port 80 but DNAT to backend port 8080.
+	testenv.AssertNftRuleInChain(t, pfTable, "prerouting_dnat",
+		func(r testenv.NftRule) bool {
+			return r.HasMatch("ip", "daddr", vip) &&
+				r.HasMatch("tcp", "dport", 80) &&
+				r.HasDNATTo(backend, 8080)
+		},
+		15*time.Second, "DNAT must translate port 80 → "+backend+":8080")
+
+	// And the reply-zone rule must mirror the *backend* port (8080), not the
+	// listening port — otherwise conntrack would not find the original entry
+	// when the SYN-ACK comes back.
+	testenv.AssertNftRuleInChain(t, pfTable, "prerouting_ctzone",
+		func(r testenv.NftRule) bool {
+			return r.HasMatch("ip", "saddr", backend) &&
+				r.HasMatch("tcp", "sport", 8080) &&
+				r.HasCTZoneSet(*cfg.PortForwardCTZone)
+		},
+		10*time.Second, "reply-zone rule must use translated backend port 8080")
+}
+
+// TestScenario_PortForwardFwmarkPolicyRoutes (#61 scenario 3).
+//
+// With any single-backend rule installed, the agent's ensureDNATRouting must
+// produce two ip rules and a route in the configured port-forward table:
+//
+//   - priority 150: fwmark 0x100 → lookup main (forward direction)
+//   - priority 151: fwmark 0x200 → lookup <pf-table> (reply direction)
+//   - <pf-table>:   default via <veth-default> (return-path egress device)
+//
+// We assert all three using the JSON-parsed helpers added in this commit so
+// the test is robust against iproute2 version drift.
+//
+// The default port_forward_table_id is 201 — we use the default here so
+// scrubPortForwardState (which flushes table 201) reaches the route on
+// teardown.
+func TestScenario_PortForwardFwmarkPolicyRoutes(t *testing.T) {
+	cfg := startPFScenario(t)
+
+	const (
+		vip     = "198.51.100.14"
+		backend = "10.0.0.130"
+	)
+	cfg.PortForwards = []testenv.PortForwardVIPFixture{{
+		VIP: vip,
+		Rules: []testenv.PortForwardRuleFixture{{
+			Proto: "tcp", Port: 80, DestAddr: backend,
+		}},
+	}}
+
+	a := readyAgent(t, cfg)
+	defer a.Stop(15 * time.Second)
+
+	// Forward rule: priority 150, fwmark 0x100, lookup main. iproute2 emits
+	// the main table by name, not number.
+	testenv.AssertIPRulePriority(t, 150, 0x100, "main", 15*time.Second)
+
+	// Reply rule: priority 151, fwmark 0x200, lookup the PF table (default 201).
+	testenv.AssertIPRulePriority(t, 151, 0x200, "201", 15*time.Second)
+
+	// Reply table route: agent installs `default via <vethProviderIP> dev
+	// veth-default`. The issue references "loopback1 (or whatever the agent
+	// emits as its return path)" — the production return path is the veth
+	// pair so we assert on veth-default. We do not pin the gateway IP so
+	// the test stays robust against operators reconfiguring veth-nexthop.
+	testenv.AssertRouteInTable(t, "201", "default", "veth-default", 15*time.Second)
+}
+
+// TestScenario_PortForwardHairpinPlusPerRuleMasquerade (#61 scenario 4).
+//
+// A VIP with hairpin_masquerade:true and one rule overridden to
+// masquerade:false should produce the hairpin rule (ip saddr <provider-cidr>
+// masquerade) but NOT a per-backend SNAT entry for the overridden rule.
+//
+// Why this matrix matters: hairpin_masquerade and per-rule masquerade live
+// in two different code paths inside buildNftRuleset. Overriding the rule
+// to masquerade:false should suppress the backend-targeted SNAT without
+// disturbing the provider-CIDR hairpin rule. Without this test a refactor
+// that conflated the two flags could silently break either case.
+func TestScenario_PortForwardHairpinPlusPerRuleMasquerade(t *testing.T) {
+	ctx, cancel, nb, sb := startScenario(t)
+	defer cancel()
+	testenv.EnsureLoopback1(t)
+
+	// Provider network 198.51.100.0/24 — the LRP network the agent will
+	// discover and pass into the hairpin rule, mirroring the existing
+	// TestScenario_PortForwardHairpinMasquerade setup.
+	_ = testenv.MakeLocalRouter(t, ctx, nb, sb, testenv.LocalRouterOpts{
+		Name:        "hpoverrider",
+		LRPNetworks: []string{"198.51.100.11/24"},
+	})
+
+	const (
+		vip             = "198.51.100.41"
+		overrideBackend = "10.0.0.140"
+	)
+	cfg := pfDefaults(t)
+	cfg.PortForwards = []testenv.PortForwardVIPFixture{{
+		VIP:               vip,
+		HairpinMasquerade: true,
+		Rules: []testenv.PortForwardRuleFixture{{
+			Proto: "tcp", Port: 80, DestAddr: overrideBackend,
+			Masquerade: boolPtr(false),
+		}},
+	}}
+
+	a := readyAgent(t, cfg)
+	defer a.Stop(15 * time.Second)
+
+	// Hairpin rule must still appear.
+	testenv.AssertNftRuleInChain(t, pfTable, "postrouting_snat",
+		func(r testenv.NftRule) bool {
+			return r.HasMatchPrefix("ip", "saddr", "198.51.100.0/24") &&
+				r.HasMasquerade()
+		},
+		30*time.Second, "hairpin masquerade rule for "+vip+" with provider 198.51.100.0/24")
+
+	// Per-rule override (masquerade:false) must NOT add a backend-targeted
+	// SNAT. Read the dump once — by this point the hairpin assertion has
+	// already converged.
+	dump := testenv.DumpNftRuleset(t)
+	for _, r := range dump.RulesIn(pfTable, "postrouting_snat") {
+		if r.HasMatch("ip", "daddr", overrideBackend) {
+			t.Errorf("override backend %s should not be masqueraded but appears in postrouting_snat: %s",
+				overrideBackend, string(r.Raw))
+		}
+	}
+}
+
+// TestScenario_PortForwardMultiVIPSeparation (#61 scenario 5).
+//
+// Two VIPs, each with their own backend, must produce two independent sets
+// of DNAT and ctzone rules — no cross-pollination. A regression that keyed
+// rules on backend alone (rather than VIP+backend) would cause VIP A's
+// dport-N rule to also accept VIP B's traffic; this test catches that by
+// asserting each VIP's rule references its own backend, and neither rule
+// matches the other backend.
+func TestScenario_PortForwardMultiVIPSeparation(t *testing.T) {
+	cfg := startPFScenario(t)
+
+	const (
+		vipA     = "198.51.100.15"
+		backendA = "10.0.0.150"
+		vipB     = "198.51.100.16"
+		backendB = "10.0.0.160"
+	)
+	cfg.PortForwards = []testenv.PortForwardVIPFixture{
+		{
+			VIP: vipA,
+			Rules: []testenv.PortForwardRuleFixture{{
+				Proto: "tcp", Port: 80, DestAddr: backendA,
+			}},
+		},
+		{
+			VIP: vipB,
+			Rules: []testenv.PortForwardRuleFixture{{
+				Proto: "tcp", Port: 80, DestAddr: backendB,
+			}},
+		},
+	}
+
+	a := readyAgent(t, cfg)
+	defer a.Stop(15 * time.Second)
+
+	// VIP A's DNAT rule must point at backendA.
+	testenv.AssertNftRuleInChain(t, pfTable, "prerouting_dnat",
+		func(r testenv.NftRule) bool {
+			return r.HasMatch("ip", "daddr", vipA) &&
+				r.HasMatch("tcp", "dport", 80) &&
+				r.HasDNATTo(backendA, 80)
+		},
+		15*time.Second, "VIP A DNAT must target "+backendA)
+
+	// VIP B's DNAT rule must point at backendB.
+	testenv.AssertNftRuleInChain(t, pfTable, "prerouting_dnat",
+		func(r testenv.NftRule) bool {
+			return r.HasMatch("ip", "daddr", vipB) &&
+				r.HasMatch("tcp", "dport", 80) &&
+				r.HasDNATTo(backendB, 80)
+		},
+		15*time.Second, "VIP B DNAT must target "+backendB)
+
+	// Cross-check: neither VIP's rule may target the other's backend. By
+	// this point the chain has converged, so we can read once and walk it.
+	dump := testenv.DumpNftRuleset(t)
+	for _, r := range dump.RulesIn(pfTable, "prerouting_dnat") {
+		switch {
+		case r.HasMatch("ip", "daddr", vipA) && r.HasDNATTo(backendB, 80):
+			t.Errorf("VIP A rule must not DNAT to VIP B's backend: %s", string(r.Raw))
+		case r.HasMatch("ip", "daddr", vipB) && r.HasDNATTo(backendA, 80):
+			t.Errorf("VIP B rule must not DNAT to VIP A's backend: %s", string(r.Raw))
+		}
+	}
+
+	// Reply-direction ctzone entries are also per-backend: each backend must
+	// have its own (saddr, sport) zone rule. Missing one would break NAT
+	// reverse-translation for that VIP's reply traffic.
+	for _, backend := range []string{backendA, backendB} {
+		testenv.AssertNftRuleInChain(t, pfTable, "prerouting_ctzone",
+			func(r testenv.NftRule) bool {
+				return r.HasMatch("ip", "saddr", backend) &&
+					r.HasMatch("tcp", "sport", 80) &&
+					r.HasCTZoneSet(*cfg.PortForwardCTZone)
+			},
+			10*time.Second, "ctzone reply rule for backend "+backend)
+	}
+}
