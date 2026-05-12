@@ -104,6 +104,131 @@ func TestScenario_StaleChassisCleanup(t *testing.T) {
 		"surviving agent must delete managed route tagged for missing chassis")
 }
 
+// TestScenario_MultipleStaleChassisCleanup (#64 scenario 3):
+//
+// TestScenario_StaleChassisCleanup covers exactly one ghost chassis. The
+// cleanup path walks a map of stale chassis and applies a single jitter value
+// per agent, so covering N>1 protects against hidden per-iteration state
+// (e.g. metric labels, jitter reuse) that a one-chassis fixture cannot see.
+//
+// Seed two peer chassis (ghost-a, ghost-b) and one managed route tagged for
+// each. Delete both at once. After grace + jitter + a reconcile tick, both
+// routes must be gone.
+func TestScenario_MultipleStaleChassisCleanup(t *testing.T) {
+	ctx, cancel, nb, sb := startScenario(t)
+	defer cancel()
+
+	router := testenv.MakeLocalRouter(t, ctx, nb, sb, testenv.LocalRouterOpts{
+		Name:        "multistale",
+		LRPNetworks: []string{"198.51.100.11/24"},
+	})
+
+	const (
+		peerAName = "ghost-a"
+		peerBName = "ghost-b"
+	)
+	peerAUUID := testenv.MakeChassis(t, ctx, sb, peerAName)
+	peerBUUID := testenv.MakeChassis(t, ctx, sb, peerBName)
+	testenv.SeedManagedRoute(t, ctx, nb, router, "203.0.113.97/32", "169.254.0.1", peerAName)
+	testenv.SeedManagedRoute(t, ctx, nb, router, "203.0.113.98/32", "169.254.0.1", peerBName)
+
+	if got := testenv.CountManagedRoutes(t, ctx, nb, peerAName); got != 1 {
+		t.Fatalf("seeded ghost-a route missing (count=%d)", got)
+	}
+	if got := testenv.CountManagedRoutes(t, ctx, nb, peerBName); got != 1 {
+		t.Fatalf("seeded ghost-b route missing (count=%d)", got)
+	}
+
+	cfg := testenv.Defaults()
+	cfg.StaleChassisGracePeriod = "2s"
+	cfg.ReconcileInterval = "2s"
+	a := readyAgent(t, cfg)
+	defer a.Stop(15 * time.Second)
+
+	// While both chassis are alive, neither route may be removed.
+	time.Sleep(3 * time.Second)
+	if got := testenv.CountManagedRoutes(t, ctx, nb, peerAName); got != 1 {
+		t.Fatalf("agent removed ghost-a route while chassis alive (count=%d)", got)
+	}
+	if got := testenv.CountManagedRoutes(t, ctx, nb, peerBName); got != 1 {
+		t.Fatalf("agent removed ghost-b route while chassis alive (count=%d)", got)
+	}
+
+	// Delete both peer chassis simultaneously. After grace + jitter, both
+	// managed routes must be cleaned up in the same agent. Same worst-case
+	// budget as TestScenario_StaleChassisCleanup (2s grace + 30s jitter +
+	// reconcile interval + safety = ~60s).
+	testenv.DeleteChassis(t, ctx, sb, peerAUUID)
+	testenv.DeleteChassis(t, ctx, sb, peerBUUID)
+
+	testenv.Eventually(t, func() bool {
+		return testenv.CountManagedRoutes(t, ctx, nb, peerAName) == 0 &&
+			testenv.CountManagedRoutes(t, ctx, nb, peerBName) == 0
+	}, 60*time.Second, 500*time.Millisecond,
+		"surviving agent must delete both managed routes in a single cleanup sweep")
+}
+
+// TestScenario_OneStaleOneReturning (#64 scenario 4):
+//
+// With two ghost chassis tagged in NB, deleting only one of them must clean
+// up only that one's route; the other route stays in place. After the
+// returning chassis re-appears, the agent must NOT recreate the deleted
+// chassis's route (managed-route revival is not a feature) but the
+// missing-chassis tracker must clear once the chassis row returns.
+func TestScenario_OneStaleOneReturning(t *testing.T) {
+	ctx, cancel, nb, sb := startScenario(t)
+	defer cancel()
+
+	router := testenv.MakeLocalRouter(t, ctx, nb, sb, testenv.LocalRouterOpts{
+		Name:        "mixedstale",
+		LRPNetworks: []string{"198.51.100.11/24"},
+	})
+
+	const (
+		peerAName = "ghost-a"
+		peerBName = "ghost-b"
+	)
+	peerAUUID := testenv.MakeChassis(t, ctx, sb, peerAName)
+	_ = testenv.MakeChassis(t, ctx, sb, peerBName) // peerBUUID intentionally unused — never deleted
+	testenv.SeedManagedRoute(t, ctx, nb, router, "203.0.113.97/32", "169.254.0.1", peerAName)
+	testenv.SeedManagedRoute(t, ctx, nb, router, "203.0.113.98/32", "169.254.0.1", peerBName)
+
+	cfg := testenv.Defaults()
+	cfg.StaleChassisGracePeriod = "2s"
+	cfg.ReconcileInterval = "2s"
+	a := readyAgent(t, cfg)
+	defer a.Stop(15 * time.Second)
+
+	// Delete only ghost-a; ghost-b stays alive.
+	testenv.DeleteChassis(t, ctx, sb, peerAUUID)
+
+	// Only ghost-a's route should be removed; ghost-b's must remain.
+	testenv.Eventually(t, func() bool {
+		return testenv.CountManagedRoutes(t, ctx, nb, peerAName) == 0
+	}, 60*time.Second, 500*time.Millisecond,
+		"agent must delete only the route tagged for the missing chassis")
+
+	if got := testenv.CountManagedRoutes(t, ctx, nb, peerBName); got != 1 {
+		t.Fatalf("agent removed ghost-b route while chassis alive (count=%d)", got)
+	}
+
+	// Re-create ghost-a's chassis. The agent must NOT re-add the deleted
+	// route — managed-route revival is intentionally not a feature; the
+	// route was an artefact of the deleted chassis's prior lifetime.
+	testenv.MakeChassis(t, ctx, sb, peerAName)
+
+	// Give the agent at least one reconcile tick + a small safety margin to
+	// react to the new chassis. The contract is that the route stays absent
+	// across the next reconcile cycle.
+	time.Sleep(5 * time.Second)
+	if got := testenv.CountManagedRoutes(t, ctx, nb, peerAName); got != 0 {
+		t.Fatalf("agent revived deleted route after chassis returned (count=%d) — managed-route revival is not a feature", got)
+	}
+	if got := testenv.CountManagedRoutes(t, ctx, nb, peerBName); got != 1 {
+		t.Fatalf("agent removed ghost-b route after ghost-a returned (count=%d)", got)
+	}
+}
+
 // TestScenario_DrainOnShutdown (#42 scenario 6):
 //
 // SIGTERM with drain_on_shutdown=true must lower this chassis's
