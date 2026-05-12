@@ -129,6 +129,47 @@ func TestApplyNftRulesetReissuesIdenticalRulesetAfterFailure(t *testing.T) {
 	}
 }
 
+// ensureVethForwarding writes 1 to /proc/sys/net/ipv4/conf/<dev>/forwarding
+// for both veth ends. On a test process the veth interfaces are not created,
+// so the sysctl files do not exist and os.WriteFile fails with ENOENT.
+// Verify that the error is surfaced (wrapped, naming the device) rather than
+// silently swallowed — silent degradation here would mean live nodes serve
+// DNAT traffic with forwarding off, which black-holes return packets.
+func TestEnsureVethForwardingSurfacesSysctlError(t *testing.T) {
+	// Use a veth name that is guaranteed not to be a real interface so
+	// /proc/sys/net/ipv4/conf/<dev>/forwarding does not exist. We can't
+	// override the constant vethDefaultName from the test, so we rely on
+	// the agent never being run in a sandbox where it actually exists.
+	if _, err := os.Stat("/proc/sys/net/ipv4/conf/" + vethDefaultName + "/forwarding"); err == nil {
+		t.Skipf("veth %q exists in this test environment; cannot exercise the sysctl-failure path", vethDefaultName)
+	}
+
+	t.Run("base_forwarding_only", func(t *testing.T) {
+		rm := &RouteManager{}
+		err := rm.ensureVethForwarding()
+		if err == nil {
+			t.Fatal("expected error when veth sysctl path is missing, got nil")
+		}
+		if !strings.Contains(err.Error(), "enable forwarding on "+vethDefaultName) {
+			t.Errorf("error %q does not name the failing device wrapper", err)
+		}
+	})
+
+	t.Run("port_forward_accept_local", func(t *testing.T) {
+		rm := &RouteManager{portForwardEnabled: true}
+		err := rm.ensureVethForwarding()
+		if err == nil {
+			t.Fatal("expected error when veth sysctl path is missing, got nil")
+		}
+		// The base forwarding loop fails first, so we never reach the
+		// accept_local branch — but the test still pins the contract that
+		// errors propagate before any "best effort" silent skip.
+		if !strings.Contains(err.Error(), "forwarding") {
+			t.Errorf("error %q does not reference the forwarding sysctl path", err)
+		}
+	})
+}
+
 func atoiOrFail(t *testing.T, s string) int {
 	t.Helper()
 	n := 0
