@@ -1472,6 +1472,29 @@ port_forwards:
 	}
 }
 
+// VethProviderIP is auto-computed as nextIPInSubnet(VethNexthop). With
+// VethNexthop=255.255.255.255 the helper wraps to 0.0.0.0 (see
+// TestNextIPInSubnet) and the subsequent net.ParseIP check accepts it — so
+// the validator ends up with a wrap-around address it would normally reject
+// from explicit config. Document the current "wrap + accept" behaviour so
+// any caller-side validation added later (e.g. rejecting an unspecified
+// VethProviderIP) trips this test instead of silently changing the contract.
+func TestVethProviderIPAutoComputeWrapsAt255_255_255_255(t *testing.T) {
+	cfg := Config{
+		VethNexthop:     "255.255.255.255",
+		VethLeakEnabled: true,
+		VethLeakTableID: 200,
+		// VethProviderIP intentionally unset — triggers auto-compute.
+	}
+
+	if err := validateConfig(&cfg); err != nil {
+		t.Fatalf("validateConfig() error: %v", err)
+	}
+	if cfg.VethProviderIP != "0.0.0.0" {
+		t.Errorf("VethProviderIP auto-compute at 255.255.255.255 = %q, want 0.0.0.0 (wrap)", cfg.VethProviderIP)
+	}
+}
+
 func TestNextIPInSubnet(t *testing.T) {
 	tests := []struct {
 		input string
