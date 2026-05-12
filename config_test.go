@@ -1188,7 +1188,7 @@ func TestPortForwardValidation(t *testing.T) {
 	// subsystems writing into the same on-disk table.
 	t.Run("route_table_id_0_collides_with_port_forward_main_alias", func(t *testing.T) {
 		cfg := base()
-		cfg.RouteTableID = 0       // main table (alias)
+		cfg.RouteTableID = 0         // main table (alias)
 		cfg.PortForwardTableID = 254 // main table (canonical id)
 		if err := validateConfig(&cfg); err == nil {
 			t.Error("expected error: port_forward_table_id 254 (main) must not coexist with route_table_id 0 (main alias)")
