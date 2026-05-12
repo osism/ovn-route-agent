@@ -397,6 +397,22 @@ func TestEnsureActivePriorityLead(t *testing.T) {
 			localRouters: []LocalRouterInfo{{LRPName: "lrp-a"}, {LRPName: "lrp-b"}},
 			wantBoosts:   map[string]int{"lrp-a": 5, "lrp-b": 8},
 		},
+		// LRP names with underscores hit the TrimSuffix derivation in
+		// EnsureActivePriorityLead: the Gateway_Chassis row name is
+		// {lrp_name}_{chassis_name}, so a router named `tenant_a_router` on
+		// chassis `host-a` produces `tenant_a_router_host-a`, and the
+		// suffix-trim must yield `tenant_a_router` — not a confused prefix
+		// like `tenant_a` that would silently drop the chassis-priority
+		// boost on multi-tenant deployments with snake_cased LRP names.
+		{
+			name: "LRP name with underscores still resolves under TrimSuffix",
+			entries: []*NBGatewayChassis{
+				{UUID: "g1", Name: "tenant_a_router_host-a", ChassisName: "host-a", Priority: 1},
+				{UUID: "g2", Name: "tenant_a_router_host-b", ChassisName: "host-b", Priority: 5},
+			},
+			localRouters: []LocalRouterInfo{{LRPName: "tenant_a_router"}},
+			wantBoosts:   map[string]int{"tenant_a_router": 6},
+		},
 	}
 
 	for _, tt := range tests {
