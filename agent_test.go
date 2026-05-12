@@ -2,8 +2,10 @@ package main
 
 import (
 	"context"
+	"errors"
 	"net"
 	"reflect"
+	"sync/atomic"
 	"testing"
 	"time"
 )
@@ -259,6 +261,86 @@ func TestNewAgentInitializesMissingChassis(t *testing.T) {
 	}
 	if a.staleCleanupJitter < 0 || a.staleCleanupJitter > maxStaleCleanupJitter {
 		t.Errorf("staleCleanupJitter = %v, should be in [0, %v]", a.staleCleanupJitter, maxStaleCleanupJitter)
+	}
+}
+
+// TestConnectWithRetry_SucceedsFirstTry verifies the happy path: when connect
+// returns nil on the first call, the helper returns nil immediately without
+// sleeping for retryInterval.
+func TestConnectWithRetry_SucceedsFirstTry(t *testing.T) {
+	var calls atomic.Int32
+	connect := func(context.Context) error {
+		calls.Add(1)
+		return nil
+	}
+
+	start := time.Now()
+	if err := connectWithRetry(context.Background(), connect, time.Hour); err != nil {
+		t.Fatalf("connectWithRetry: unexpected error: %v", err)
+	}
+	if got := calls.Load(); got != 1 {
+		t.Errorf("connect calls = %d, want 1", got)
+	}
+	if elapsed := time.Since(start); elapsed > time.Second {
+		t.Errorf("returned in %s, expected near-instant on first-try success", elapsed)
+	}
+}
+
+// TestConnectWithRetry_RetriesOnFailure verifies the retry path: when connect
+// fails several times, the helper keeps calling it without returning the
+// error, until it eventually succeeds. The retry interval is set short so
+// the test stays cheap.
+func TestConnectWithRetry_RetriesOnFailure(t *testing.T) {
+	var calls atomic.Int32
+	const wantCalls = 3
+	connect := func(context.Context) error {
+		if calls.Add(1) < wantCalls {
+			return errors.New("connection refused")
+		}
+		return nil
+	}
+
+	if err := connectWithRetry(context.Background(), connect, 10*time.Millisecond); err != nil {
+		t.Fatalf("connectWithRetry: unexpected error: %v", err)
+	}
+	if got := calls.Load(); got != wantCalls {
+		t.Errorf("connect calls = %d, want %d", got, wantCalls)
+	}
+}
+
+// TestConnectWithRetry_ReturnsCtxErrOnCancel verifies that a context cancelled
+// while the helper is in the retry-wait branch yields ctx.Err() (not a
+// generic timeout, not a panic, not a swallowed error). This is the
+// production contract that lets a SIGTERM during cold-start retry exit
+// cleanly.
+func TestConnectWithRetry_ReturnsCtxErrOnCancel(t *testing.T) {
+	var calls atomic.Int32
+	connect := func(context.Context) error {
+		calls.Add(1)
+		return errors.New("always fails")
+	}
+
+	ctx, cancel := context.WithCancel(context.Background())
+	// Cancel shortly after entering the retry-wait branch; the retry
+	// interval is long enough that the helper is definitely waiting on
+	// either ctx.Done or the timer when the cancel fires.
+	go func() {
+		time.Sleep(50 * time.Millisecond)
+		cancel()
+	}()
+
+	start := time.Now()
+	err := connectWithRetry(ctx, connect, 10*time.Second)
+	elapsed := time.Since(start)
+
+	if !errors.Is(err, context.Canceled) {
+		t.Fatalf("connectWithRetry err = %v, want context.Canceled", err)
+	}
+	if elapsed > 2*time.Second {
+		t.Errorf("helper took %s to honour cancel — should return promptly", elapsed)
+	}
+	if got := calls.Load(); got != 1 {
+		t.Errorf("connect calls = %d, want 1 (one failed attempt before cancel)", got)
 	}
 }
 

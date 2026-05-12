@@ -45,6 +45,12 @@ type Agent struct {
 // chassis grace period to prevent thundering-herd cleanup across agents.
 const maxStaleCleanupJitter = 30 * time.Second
 
+// ovnConnectRetryInterval is how long Run waits between failed OVN connect
+// attempts. The agent is a long-running daemon: when its OVN endpoint is
+// unreachable on cold start, the right behaviour is to keep retrying rather
+// than crash a unit that systemd would only restart in a tight loop anyway.
+const ovnConnectRetryInterval = 5 * time.Second
+
 func NewAgent(cfg Config) (*Agent, error) {
 	a := &Agent{
 		cfg:                cfg,
@@ -65,6 +71,27 @@ func (a *Agent) triggerReconcile() {
 	case a.reconcileCh <- struct{}{}:
 	default:
 		// Already pending
+	}
+}
+
+// connectWithRetry calls connect repeatedly, sleeping retryInterval between
+// failed attempts, until connect returns nil or ctx is cancelled. It returns
+// nil on success or ctx.Err() if the context was cancelled during a retry
+// wait. Errors from connect itself do not terminate the loop — the agent is
+// a long-running daemon and the contract on cold start with an unreachable
+// OVN endpoint is to keep retrying, not exit.
+func connectWithRetry(ctx context.Context, connect func(context.Context) error, retryInterval time.Duration) error {
+	for {
+		err := connect(ctx)
+		if err == nil {
+			return nil
+		}
+		slog.Error("failed to connect to OVN, retrying", "error", err, "retry_in", retryInterval)
+		select {
+		case <-ctx.Done():
+			return ctx.Err()
+		case <-time.After(retryInterval):
+		}
 	}
 }
 
@@ -102,18 +129,9 @@ func (a *Agent) Run(ctx context.Context) error {
 		slog.Info("tracking single chassisredirect port", "gateway_port", a.cfg.GatewayPort)
 	}
 
-	// Connect to OVN with retry
-	for {
-		err := a.ovn.Connect(ctx)
-		if err == nil {
-			break
-		}
-		slog.Error("failed to connect to OVN, retrying in 5s", "error", err)
-		select {
-		case <-ctx.Done():
-			return ctx.Err()
-		case <-time.After(5 * time.Second):
-		}
+	// Connect to OVN with retry.
+	if err := connectWithRetry(ctx, a.ovn.Connect, ovnConnectRetryInterval); err != nil {
+		return err
 	}
 	defer a.ovn.Close()
 
