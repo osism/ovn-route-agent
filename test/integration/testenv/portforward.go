@@ -24,6 +24,14 @@ const (
 	SysctlTCPL3mdevAccept = "/proc/sys/net/ipv4/tcp_l3mdev_accept"
 )
 
+// BridgeProxyARPPath returns the per-device proxy_arp sysctl path the agent
+// flips on startup via EnableProxyARP. Used by bridge-IP lifecycle scenarios
+// (#63) that wrap the path in SaveSysctl so the host is left as it was
+// regardless of how the agent currently treats restore-on-shutdown.
+func BridgeProxyARPPath(bridge string) string {
+	return "/proc/sys/net/ipv4/conf/" + bridge + "/proxy_arp"
+}
+
 // EnsureLoopback1 checks that the loopback1 dummy device exists and is
 // enslaved to vrf-provider. It does *not* create the device — that is
 // setup.sh's job and a missing device means the host was not bootstrapped.

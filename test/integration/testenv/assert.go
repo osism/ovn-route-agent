@@ -3,6 +3,7 @@
 package testenv
 
 import (
+	"encoding/json"
 	"fmt"
 	"net"
 	"os/exec"
@@ -56,6 +57,113 @@ func AssertNoKernelRoute(t *testing.T, ip string, timeout time.Duration) {
 		}
 		time.Sleep(100 * time.Millisecond)
 	}
+}
+
+// AssertBridgeAddress fails the test if cidr is not present on bridge within
+// timeout. cidr is matched against `ip -j -4 addr show dev <bridge>` as the
+// (local, prefixlen) pair extracted from each addr_info entry, so the caller
+// must pass the address in CIDR form (e.g. "169.254.169.254/32") to be
+// unambiguous about the mask length.
+//
+// Used by the bridge-IP lifecycle scenarios (#63): on cold start the agent
+// adds BridgeIP to br-ex via EnsureBridgeIP, and several scenarios assert
+// that exactly one such address exists, that a custom address replaces the
+// default, and that cleanup removes it.
+func AssertBridgeAddress(t *testing.T, bridge, cidr string, timeout time.Duration) {
+	t.Helper()
+	ip, prefix, err := parseCIDRForBridge(cidr)
+	if err != nil {
+		t.Fatalf("AssertBridgeAddress: %v", err)
+	}
+	deadline := time.Now().Add(timeout)
+	for {
+		count, lastOut, lastErr := countBridgeAddress(bridge, ip, prefix)
+		if count == 1 {
+			return
+		}
+		if count > 1 {
+			t.Fatalf("bridge %s has %d copies of %s (expected exactly 1); last output: %q",
+				bridge, count, cidr, lastOut)
+		}
+		if time.Now().After(deadline) {
+			t.Fatalf("bridge address %s on %s not present after %s (last output: %q, err: %v)",
+				cidr, bridge, timeout, lastOut, lastErr)
+		}
+		time.Sleep(100 * time.Millisecond)
+	}
+}
+
+// AssertNoBridgeAddress fails the test if cidr remains on bridge past timeout.
+// Mirrors AssertBridgeAddress for the negative case — used to verify that
+// CleanupOnShutdown removes the BridgeIP and that a configured non-default
+// BridgeIP excludes the default.
+func AssertNoBridgeAddress(t *testing.T, bridge, cidr string, timeout time.Duration) {
+	t.Helper()
+	ip, prefix, err := parseCIDRForBridge(cidr)
+	if err != nil {
+		t.Fatalf("AssertNoBridgeAddress: %v", err)
+	}
+	deadline := time.Now().Add(timeout)
+	for {
+		count, lastOut, _ := countBridgeAddress(bridge, ip, prefix)
+		if count == 0 {
+			return
+		}
+		if time.Now().After(deadline) {
+			t.Fatalf("bridge address %s still present on %s after %s (last output: %q)",
+				cidr, bridge, timeout, lastOut)
+		}
+		time.Sleep(100 * time.Millisecond)
+	}
+}
+
+// parseCIDRForBridge splits "<ip>/<prefix>" into the canonical IP form and
+// integer prefix length. Rejects bare IPs so callers cannot accidentally
+// match a /24 entry when they meant /32.
+func parseCIDRForBridge(cidr string) (string, int, error) {
+	ipStr, prefixStr, ok := strings.Cut(cidr, "/")
+	if !ok {
+		return "", 0, fmt.Errorf("invalid CIDR %q: expected form ip/prefix", cidr)
+	}
+	ip := net.ParseIP(ipStr)
+	if ip == nil {
+		return "", 0, fmt.Errorf("invalid CIDR %q: bad IP", cidr)
+	}
+	var prefix int
+	if _, err := fmt.Sscanf(prefixStr, "%d", &prefix); err != nil || prefix < 0 || prefix > 32 {
+		return "", 0, fmt.Errorf("invalid CIDR %q: bad prefix", cidr)
+	}
+	return ip.String(), prefix, nil
+}
+
+// countBridgeAddress runs `ip -j -4 addr show dev <bridge>` and returns the
+// number of addr_info entries whose (local, prefixlen) match (ip, prefix).
+// Returns the raw stdout for inclusion in diagnostic messages.
+func countBridgeAddress(bridge, ip string, prefix int) (int, string, error) {
+	out, err := exec.Command("ip", "-j", "-4", "addr", "show", "dev", bridge).CombinedOutput()
+	text := strings.TrimSpace(string(out))
+	if err != nil {
+		return 0, text, err
+	}
+	type addrInfo struct {
+		Local     string `json:"local"`
+		Prefixlen int    `json:"prefixlen"`
+	}
+	var entries []struct {
+		AddrInfo []addrInfo `json:"addr_info"`
+	}
+	if jerr := json.Unmarshal(out, &entries); jerr != nil {
+		return 0, text, jerr
+	}
+	count := 0
+	for _, e := range entries {
+		for _, a := range e.AddrInfo {
+			if a.Local == ip && a.Prefixlen == prefix {
+				count++
+			}
+		}
+	}
+	return count, text, nil
 }
 
 // AssertOVSFlow fails the test if no flow with the given cookie exists on
