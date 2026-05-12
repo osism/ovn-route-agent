@@ -388,3 +388,74 @@ func TestMissingChassisGracePeriodTracking(t *testing.T) {
 		t.Error("dead-node should still be in missingChassis")
 	}
 }
+
+// reconcile takes ctx and passes it to OVN methods that issue OVSDB
+// transactions, but it does not loop or block, so a pre-cancelled context
+// should never make it hang or panic — it should simply complete promptly
+// while the ctx-aware OVN calls observe the cancel and return early. With
+// a dry-run RouteManager and a fake OVN client carrying populated state,
+// the test exercises the full reconcile body to lock in that "context
+// cancellation while a reconcile is in flight" stays a no-side-effects
+// fast-return, not a partial-write hang.
+func TestReconcileCompletesPromptlyOnCancelledContext(t *testing.T) {
+	_, cidr, _ := net.ParseCIDR("198.51.100.0/24")
+	rm := &RouteManager{
+		bridgeDev:   "br-ex",
+		vrfName:     "vrf-provider",
+		vethNexthop: "169.254.0.1",
+		dryRun:      true,
+	}
+	c, _, _ := newOVNClientWithFakes(t, "host-a")
+	// Populate state so reconcile takes the HasLocalRouters branch and
+	// therefore reaches the ctx-aware EnsureGatewayRouting /
+	// EnsureActivePriorityLead calls.
+	c.state.LocalRouters = []LocalRouterInfo{
+		{
+			RouterName:  "router1",
+			RouterUUID:  "lr-1",
+			LRPName:     "lrp-abc",
+			LRPMAC:      "aa:aa:aa:aa:aa:aa",
+			LRPNetworks: []string{"198.51.100.0/24"},
+		},
+	}
+	c.state.HasLocalRouters = true
+	c.state.DiscoveredNetworks = []*net.IPNet{cidr}
+
+	a := &Agent{
+		cfg:            Config{},
+		ovn:            c,
+		routing:        rm,
+		reconcileCh:    make(chan struct{}, 1),
+		missingChassis: make(map[string]time.Time),
+	}
+
+	ctx, cancel := context.WithCancel(context.Background())
+	cancel() // cancel BEFORE reconcile starts — the strict "mid-cycle" case
+
+	done := make(chan struct{})
+	start := time.Now()
+	go func() {
+		defer close(done)
+		// reconcile must not panic even with a cancelled ctx.
+		a.reconcile(ctx, "test")
+	}()
+
+	select {
+	case <-done:
+	case <-time.After(2 * time.Second):
+		t.Fatalf("reconcile did not return within 2s on cancelled ctx — possible hang")
+	}
+
+	if elapsed := time.Since(start); elapsed > time.Second {
+		t.Errorf("reconcile returned in %s, expected near-instant on cancelled ctx", elapsed)
+	}
+
+	// effectiveFilters is recomputed each cycle and is the only piece of
+	// agent state mutated by reconcile. With HasLocalRouters=true and a
+	// discovered /24, the slice must be set — i.e. reconcile completed its
+	// state-derivation phase rather than aborting mid-flight in a way that
+	// would leave the agent half-initialised on the next tick.
+	if len(a.effectiveFilters) != 1 || a.effectiveFilters[0].String() != "198.51.100.0/24" {
+		t.Errorf("effectiveFilters = %v, want [198.51.100.0/24]", a.effectiveFilters)
+	}
+}
