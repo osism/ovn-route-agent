@@ -4,6 +4,7 @@ package integration
 
 import (
 	"context"
+	"fmt"
 	"os/exec"
 	"testing"
 	"time"
@@ -161,11 +162,18 @@ func TestScenario_MultipleStaleChassisCleanup(t *testing.T) {
 	testenv.DeleteChassis(t, ctx, sb, peerAUUID)
 	testenv.DeleteChassis(t, ctx, sb, peerBUUID)
 
-	testenv.Eventually(t, func() bool {
-		return testenv.CountManagedRoutes(t, ctx, nb, peerAName) == 0 &&
-			testenv.CountManagedRoutes(t, ctx, nb, peerBName) == 0
-	}, 60*time.Second, 500*time.Millisecond,
-		"surviving agent must delete both managed routes in a single cleanup sweep")
+	testenv.AssertEventually(t,
+		func() bool {
+			return testenv.CountManagedRoutes(t, ctx, nb, peerAName) == 0 &&
+				testenv.CountManagedRoutes(t, ctx, nb, peerBName) == 0
+		},
+		60*time.Second, 500*time.Millisecond,
+		"surviving agent must delete both managed routes in a single cleanup sweep",
+		func() string {
+			return fmt.Sprintf("managed-route counts: %s=%d %s=%d",
+				peerAName, testenv.CountManagedRoutes(t, ctx, nb, peerAName),
+				peerBName, testenv.CountManagedRoutes(t, ctx, nb, peerBName))
+		})
 }
 
 // TestScenario_OneStaleOneReturning (#64 scenario 4):
