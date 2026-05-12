@@ -284,12 +284,47 @@ func MakeLocalRouter(t *testing.T, ctx context.Context, nb, sb client.Client, op
 // and returns the new NAT UUID.
 func AddFIP(t *testing.T, ctx context.Context, nb client.Client, router RouterRef, externalIP, logicalIP string) string {
 	t.Helper()
-	natRow := &NBNAT{
+	return insertNAT(t, ctx, nb, router, &NBNAT{
 		UUID:       "nat_named",
 		Type:       "dnat_and_snat",
 		ExternalIP: externalIP,
 		LogicalIP:  logicalIP,
-	}
+	})
+}
+
+// AddFIPWithExternalMAC inserts a dnat_and_snat NAT entry with the optional
+// external_mac override that Neutron sets when a FIP is bound to a specific
+// host MAC (e.g. distributed FIP). Tests use it to pin the agent's behaviour
+// around external_mac into a regression test — see issue #62.
+func AddFIPWithExternalMAC(t *testing.T, ctx context.Context, nb client.Client, router RouterRef, externalIP, logicalIP, externalMAC string) string {
+	t.Helper()
+	mac := externalMAC
+	return insertNAT(t, ctx, nb, router, &NBNAT{
+		UUID:        "nat_named",
+		Type:        "dnat_and_snat",
+		ExternalIP:  externalIP,
+		ExternalMAC: &mac,
+		LogicalIP:   logicalIP,
+	})
+}
+
+// AddSNATEntry inserts an `snat`-type NAT entry on the given router. logicalIP
+// is typically a CIDR (e.g. "10.0.0.0/24") covering the internal source range
+// the router rewrites to externalIP on egress.
+func AddSNATEntry(t *testing.T, ctx context.Context, nb client.Client, router RouterRef, externalIP, logicalIP string) string {
+	t.Helper()
+	return insertNAT(t, ctx, nb, router, &NBNAT{
+		UUID:       "nat_named",
+		Type:       "snat",
+		ExternalIP: externalIP,
+		LogicalIP:  logicalIP,
+	})
+}
+
+// insertNAT inserts a NAT row and attaches it to router.nat in a single
+// transaction, returning the resulting NAT UUID.
+func insertNAT(t *testing.T, ctx context.Context, nb client.Client, router RouterRef, natRow *NBNAT) string {
+	t.Helper()
 	natOps, err := nb.Create(natRow)
 	if err != nil {
 		t.Fatalf("create nat op: %v", err)
@@ -305,7 +340,7 @@ func AddFIP(t *testing.T, ctx context.Context, nb client.Client, router RouterRe
 		Mutations: []ovsdb.Mutation{{
 			Column:  "nat",
 			Mutator: ovsdb.MutateOperationInsert,
-			Value:   ovsdb.OvsSet{GoSet: []any{nameUUID("nat_named")}},
+			Value:   ovsdb.OvsSet{GoSet: []any{nameUUID(natRow.UUID)}},
 		}},
 	}
 	results := Transact(t, ctx, nb, append(natOps, mutateOp))
