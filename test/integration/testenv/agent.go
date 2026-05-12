@@ -288,6 +288,22 @@ func (p *AgentProc) Stop(timeout time.Duration) error {
 	}
 }
 
+// Alive reports whether the agent subprocess is still running. It does so
+// non-destructively by peeking at exitCh — Wait() has been started in
+// RunAgent, so exitCh closes (with the exit error) the moment the process
+// terminates. Scenarios that need to confirm "the agent did NOT exit after
+// some external perturbation" should poll this rather than re-signalling.
+func (p *AgentProc) Alive() bool {
+	select {
+	case err := <-p.exitCh:
+		// Put the value back so a subsequent Stop / Alive sees it too.
+		p.exitCh <- err
+		return false
+	default:
+		return true
+	}
+}
+
 // LogTail returns the last n lines of agent stderr captured so far.
 func (p *AgentProc) LogTail(n int) string {
 	p.mu.Lock()
