@@ -109,6 +109,54 @@ network_cidr:
 	}
 }
 
+// StringOrSlice accepts either a scalar string or a YAML sequence. A mapping
+// node (the third YAML container kind) is malformed for this type and must
+// surface as a descriptive decode error — not a panic, not a silent empty
+// value that would make a typo'd `network_cidr: {foo: bar}` look like an
+// empty filter list and quietly disable network filtering.
+func TestStringOrSliceUnmarshalRejectsMappingInput(t *testing.T) {
+	tests := []struct {
+		name string
+		yaml string
+	}{
+		{
+			name: "inline mapping",
+			yaml: `network_cidr: {foo: bar}` + "\n",
+		},
+		{
+			name: "block mapping",
+			yaml: "network_cidr:\n  foo: bar\n",
+		},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			path := filepath.Join(t.TempDir(), "config.yaml")
+			if err := os.WriteFile(path, []byte(tt.yaml), 0644); err != nil {
+				t.Fatalf("write test config: %v", err)
+			}
+
+			// Must not panic on a mapping node — the function decodes the
+			// value into a []string in the non-scalar branch, and yaml.v3
+			// returns an error from Decode rather than panicking. Catch any
+			// panic explicitly so a future refactor that drops the safe
+			// Decode path is flagged here.
+			defer func() {
+				if r := recover(); r != nil {
+					t.Fatalf("UnmarshalYAML panicked on mapping input: %v", r)
+				}
+			}()
+
+			fc, err := readConfigFile(path)
+			if err == nil {
+				t.Fatalf("expected decode error for mapping input, got success with NetworkCIDR=%v", fc.NetworkCIDR)
+			}
+			if errStr := err.Error(); errStr == "" {
+				t.Errorf("decode error message is empty")
+			}
+		})
+	}
+}
+
 func TestApplyEnvConfigMultipleCIDRs(t *testing.T) {
 	cfg := Config{}
 	t.Setenv("OVN_NETWORK_NETWORK_CIDR", "10.0.0.0/24,172.16.0.0/12")
