@@ -183,6 +183,185 @@ func TestStartMetricsServerServesMetricsEndpoint(t *testing.T) {
 	}
 }
 
+// TestInitMetricsAssignsProcessRegistry verifies that initMetrics builds a
+// fresh registry and assigns it to the process-wide `metrics` variable so
+// recording helpers go through it.
+func TestInitMetricsAssignsProcessRegistry(t *testing.T) {
+	prev := metrics
+	metrics = nil
+	t.Cleanup(func() { metrics = prev })
+
+	m := initMetrics()
+	if m == nil {
+		t.Fatal("initMetrics returned nil")
+	}
+	if metrics != m {
+		t.Errorf("process-wide metrics not assigned: metrics = %p, want %p", metrics, m)
+	}
+	if m.registry == nil {
+		t.Error("returned registry has no underlying prometheus.Registry")
+	}
+}
+
+func TestSetReconcileInProgressTogglesGauge(t *testing.T) {
+	m := withTestMetrics(t)
+
+	setReconcileInProgress(true)
+	setReconcileInProgress(false)
+
+	got, _ := m.registry.Gather()
+	for _, mf := range got {
+		if mf.GetName() != "ovn_network_agent_reconcile_in_progress" {
+			continue
+		}
+		if v := mf.GetMetric()[0].GetGauge().GetValue(); v != 0 {
+			t.Errorf("reconcile_in_progress = %v after setting to false, want 0", v)
+		}
+	}
+}
+
+func TestSetDesiredStateUpdatesGauges(t *testing.T) {
+	m := withTestMetrics(t)
+	setDesiredState(7, 3, 2)
+
+	got, _ := m.registry.Gather()
+	wantValues := map[string]float64{
+		"ovn_network_agent_desired_ips":        7,
+		"ovn_network_agent_local_routers":      3,
+		"ovn_network_agent_effective_networks": 2,
+	}
+	for _, mf := range got {
+		want, ok := wantValues[mf.GetName()]
+		if !ok {
+			continue
+		}
+		if v := mf.GetMetric()[0].GetGauge().GetValue(); v != want {
+			t.Errorf("%s = %v, want %v", mf.GetName(), v, want)
+		}
+	}
+}
+
+func TestRecordRouteReAddsAddsLabelledCounters(t *testing.T) {
+	m := withTestMetrics(t)
+	recordRouteReAdds(2, 5) // frr=2, kernel=5
+
+	got, _ := m.registry.Gather()
+	for _, mf := range got {
+		if mf.GetName() != "ovn_network_agent_route_readds_total" {
+			continue
+		}
+		seen := map[string]float64{}
+		for _, item := range mf.GetMetric() {
+			for _, l := range item.GetLabel() {
+				if l.GetName() == "plane" {
+					seen[l.GetValue()] = item.GetCounter().GetValue()
+				}
+			}
+		}
+		if seen["frr"] != 2 || seen["kernel"] != 5 {
+			t.Errorf("route_readds_total = %v, want frr=2 kernel=5", seen)
+		}
+	}
+}
+
+func TestRecordRouteReAddsSkipsZeroValues(t *testing.T) {
+	m := withTestMetrics(t)
+	// Counters are pre-initialised to 0 in newMetricsRegistry. Calling with
+	// zero counts must not increment either label.
+	recordRouteReAdds(0, 0)
+
+	got, _ := m.registry.Gather()
+	for _, mf := range got {
+		if mf.GetName() != "ovn_network_agent_route_readds_total" {
+			continue
+		}
+		for _, item := range mf.GetMetric() {
+			if v := item.GetCounter().GetValue(); v != 0 {
+				t.Errorf("counter incremented despite zero input: %v", v)
+			}
+		}
+	}
+}
+
+func TestSetConsecutiveReAddsSetsGauge(t *testing.T) {
+	m := withTestMetrics(t)
+	setConsecutiveReAdds(4)
+
+	got, _ := m.registry.Gather()
+	for _, mf := range got {
+		if mf.GetName() != "ovn_network_agent_consecutive_readds" {
+			continue
+		}
+		if v := mf.GetMetric()[0].GetGauge().GetValue(); v != 4 {
+			t.Errorf("consecutive_readds = %v, want 4", v)
+		}
+	}
+}
+
+func TestRecordDrainCountsByOutcome(t *testing.T) {
+	m := withTestMetrics(t)
+	recordDrain("completed", 750*time.Millisecond)
+	recordDrain("timeout", 5*time.Second)
+	recordDrain("completed", 250*time.Millisecond)
+
+	got, _ := m.registry.Gather()
+	for _, mf := range got {
+		if mf.GetName() != "ovn_network_agent_drain_total" {
+			continue
+		}
+		seen := map[string]float64{}
+		for _, item := range mf.GetMetric() {
+			for _, l := range item.GetLabel() {
+				if l.GetName() == "outcome" {
+					seen[l.GetValue()] = item.GetCounter().GetValue()
+				}
+			}
+		}
+		if seen["completed"] != 2 || seen["timeout"] != 1 {
+			t.Errorf("drain_total = %v, want completed=2 timeout=1", seen)
+		}
+	}
+}
+
+func TestRecordStaleChassisCleanupDefaultsCountToOne(t *testing.T) {
+	m := withTestMetrics(t)
+	recordStaleChassisCleanup("success", 0) // 0 should become 1
+	recordStaleChassisCleanup("error", 3)
+
+	got, _ := m.registry.Gather()
+	for _, mf := range got {
+		if mf.GetName() != "ovn_network_agent_stale_chassis_cleanup_total" {
+			continue
+		}
+		seen := map[string]float64{}
+		for _, item := range mf.GetMetric() {
+			for _, l := range item.GetLabel() {
+				if l.GetName() == "outcome" {
+					seen[l.GetValue()] = item.GetCounter().GetValue()
+				}
+			}
+		}
+		if seen["success"] != 1 || seen["error"] != 3 {
+			t.Errorf("cleanup_total = %v, want success=1 error=3", seen)
+		}
+	}
+}
+
+func TestSetMissingChassisSetsGauge(t *testing.T) {
+	m := withTestMetrics(t)
+	setMissingChassis(2)
+
+	got, _ := m.registry.Gather()
+	for _, mf := range got {
+		if mf.GetName() != "ovn_network_agent_missing_chassis" {
+			continue
+		}
+		if v := mf.GetMetric()[0].GetGauge().GetValue(); v != 2 {
+			t.Errorf("missing_chassis = %v, want 2", v)
+		}
+	}
+}
+
 func TestStartMetricsServerNoopWhenAddrEmpty(t *testing.T) {
 	if err := startMetricsServer(context.Background(), "", newMetricsRegistry()); err != nil {
 		t.Fatalf("expected nil error for empty addr, got %v", err)
