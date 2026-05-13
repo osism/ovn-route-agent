@@ -18,6 +18,8 @@ OVN_SB_REMOTE="${OVN_SB_REMOTE:-tcp:central:6642}"
 ENCAP_IP="${ENCAP_IP:-127.0.0.1}"
 BRIDGE_DEV="${BRIDGE_DEV:-br-ex}"
 BRIDGE_MAPPING="${BRIDGE_MAPPING:-physnet1:${BRIDGE_DEV}}"
+VRF_NAME="${VRF_NAME:-vrf-provider}"
+VRF_TABLE_ID="${VRF_TABLE_ID:-100}"
 
 start_ovs() {
     log "starting Open vSwitch (userspace datapath)"
@@ -69,27 +71,73 @@ start_ovn_controller() {
     exit 1
 }
 
+setup_vrf() {
+    # The agent's veth VRF leak feature attaches a veth peer to a kernel
+    # VRF device (matches the production gateway layout). Create the
+    # device here so the agent does not crash on first reconcile with
+    # "Link not found".
+    log "ensuring kernel VRF device ${VRF_NAME} (table ${VRF_TABLE_ID})"
+    modprobe vrf 2>/dev/null || log "modprobe vrf failed (already loaded or built in?)"
+    if ! ip link show "${VRF_NAME}" >/dev/null 2>&1; then
+        ip link add "${VRF_NAME}" type vrf table "${VRF_TABLE_ID}"
+    fi
+    ip link set "${VRF_NAME}" up
+}
+
 start_frr() {
     log "starting FRR"
+    # watchfrr keeps state under /var/tmp/frr; stale entries from a
+    # previous crash-restart make it refuse to start. Clean up before
+    # launching frrinit.sh.
+    rm -rf /var/tmp/frr/* 2>/dev/null || true
     # /usr/lib/frr/frrinit.sh is the canonical service entrypoint shipped
     # by the FRR Debian package; it launches the daemons listed in
     # /etc/frr/daemons.
     /usr/lib/frr/frrinit.sh start
     for _ in $(seq 1 30); do
         if vtysh -c 'show version' >/dev/null 2>&1; then
-            return 0
+            break
         fi
         sleep 1
     done
-    echo "FRR did not become ready" >&2
-    exit 1
+    if ! vtysh -c 'show version' >/dev/null 2>&1; then
+        echo "FRR did not become ready" >&2
+        exit 1
+    fi
+}
+
+configure_frr() {
+    # Push the minimal config the agent expects: the prefix-list it
+    # writes /32 entries into and a vrf-provider BGP router with a
+    # placeholder upstream neighbour. The neighbour does not need to
+    # establish a session for the lab to come up — per issue #44 the
+    # upstream peer may stay idle.
+    log "pushing minimal FRR config (vrf ${VRF_NAME} + ANNOUNCED-NETWORKS)"
+    vtysh <<EOF
+configure terminal
+ip prefix-list ANNOUNCED-NETWORKS seq 5 permit 0.0.0.0/0 ge 32 le 32
+vrf ${VRF_NAME}
+exit-vrf
+router bgp 65000 vrf ${VRF_NAME}
+ bgp router-id 127.0.0.1
+ no bgp default ipv4-unicast
+ neighbor 192.0.2.1 remote-as 65001
+ address-family ipv4 unicast
+  redistribute static
+  neighbor 192.0.2.1 activate
+  neighbor 192.0.2.1 prefix-list ANNOUNCED-NETWORKS out
+ exit-address-family
+end
+EOF
 }
 
 main() {
     start_ovs
     configure_ovs
     start_ovn_controller
+    setup_vrf
     start_frr
+    configure_frr
 
     log "exec ovn-network-agent"
     exec /usr/local/bin/ovn-network-agent \
