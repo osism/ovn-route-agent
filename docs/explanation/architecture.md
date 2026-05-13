@@ -35,11 +35,13 @@ the desired state:
                   │                    │     Reconciler       │  │
                   │                    │                      │  │
                   │                    │  1. Compute desired  │  │
-                  │                    │     IPs (FIPs+SNATs) │  │
+                  │                    │     IPs (FIPs, SNATs,│  │
+                  │                    │     LRP gws, PF VIPs)│  │
                   │                    │  2. Ensure OVS flows │  │
                   │                    │  3. Ensure OVN GW ──────────► OVN NB
-                  │                    │     routing          │  │    (default route
-                  │                    │  4. Sync routes      │  │     + MAC binding)
+                  │                    │     routing + active │  │    (default route,
+                  │                    │     priority lead    │  │     MAC binding,
+                  │                    │  4. Sync routes      │  │     priority lead)
                   │                    │  5. Verify + re-add  │  │
                   │                    └──┬──────┬──────┬─────┘  │
                   └───────────────────────┼──────┼──────┼────────┘
@@ -61,21 +63,31 @@ For each locally-active router the agent:
    MAC binding** into OVN NB — the
    [virtual gateway](gatewayless-networks) makes reply traffic exit the
    logical router without a real upstream gateway.
-2. Installs **OVS MAC-tweak flows** on `br-ex` — rewrites the destination
+2. Boosts the **active `Gateway_Chassis` priority** to `max(max peer + 1, 2)`
+   so a previously-drained peer that returns at priority 1 cannot trigger
+   a reverse failover (see [gateway drain](gateway-drain#priority-semantics)).
+3. Installs **OVS MAC-tweak flows** on `br-ex` — rewrites the destination
    MAC on packets arriving from OVN's patch port so the kernel accepts them.
-3. Installs **OVS hairpin flows** on `br-ex` — reflects same-chassis
+4. Installs **OVS hairpin flows** on `br-ex` — reflects same-chassis
    cross-router traffic back into OVN via `output:in_port` with rewritten
    MACs.
-4. Creates `/32` **kernel routes** (with `ip rule` entries when using a
-   dedicated routing table) on `br-ex` so the kernel can receive packets
-   for each FIP.
-5. Creates `/32` **FRR static routes** in `vrf-provider` so BGP announces
-   each FIP to the external fabric.
-6. Triggers a **BGP outbound soft-refresh** only when routes are removed
+5. Reconciles **per-network veth-leak routes and policy rules** so the
+   provider subnet's reply traffic crosses from the default VRF into
+   `vrf-provider` for BGP delivery.
+6. Creates `/32` **kernel routes** (with `ip rule` entries when using a
+   dedicated routing table) on `br-ex` for every FIP, SNAT IP, router LRP
+   gateway IP, and configured port-forward VIP.
+7. Creates `/32` **FRR static routes** in `vrf-provider` for the same set
+   so BGP announces them to the external fabric.
+8. Triggers a **BGP outbound soft-refresh** only when routes are removed
    (withdrawals) — additions rely on FRR's normal route redistribution to
    avoid disrupting existing BGP announcements.
-7. **Verifies** all desired routes (FRR and kernel) after every route change
+9. **Verifies** all desired routes (FRR and kernel) after every route change
    and re-adds any that went missing as a safety net.
+
+Port forwarding (DNAT) reconciliation runs independently of router locality
+— configured VIPs always get kernel/FRR routes so they remain announced via
+BGP even on a chassis that currently hosts no OVN gateway.
 
 ## Data plane
 

@@ -33,13 +33,23 @@ provider bridge).
      rewriting both source MAC (`br-ex` MAC) and destination MAC (owning
      router port MAC) — see
      [Hairpin OVS flows](gatewayless-networks#hairpin-ovs-flows-on-br-ex).
+   - Applies the **active priority lead boost** to its `Gateway_Chassis`
+     entries: when this chassis is active, its priority is raised to
+     `max(max peer + 1, 2)` so a peer returning from drain (restored to 1)
+     cannot trigger reverse failover — see
+     [Priority semantics](gateway-drain#priority-semantics).
+   - Reconciles **per-network veth-leak routes and policy rules** in the
+     veth leak table (default 200) so SNAT reply traffic on the provider
+     subnet crosses into `vrf-provider` for BGP delivery.
    - Ensures `/32` **kernel routes** (with IP rules when using a dedicated
-     routing table) and **FRR static routes** in the VRF for each FIP/SNAT
-     IP.
+     routing table) and **FRR static routes** in the VRF for each FIP, SNAT
+     IP, router LRP gateway IP, and (independent of router locality)
+     configured port-forward VIP.
    - If configured, reconciles the **FRR prefix-list** with
      `permit <network> ge 32 le 32` entries for each discovered provider
      network.
-   - If no routers are locally active: removes all managed routes.
+   - If no routers are locally active: removes all managed routes (port
+     forward VIPs still get kernel/FRR routes if any are configured).
 5. **Port forwarding (DNAT)** — optionally forwards traffic from anycast VIP
    addresses (on a loopback interface in the VRF) to internal backends.
    Supports multiple backends per rule with sticky source-IP hashing

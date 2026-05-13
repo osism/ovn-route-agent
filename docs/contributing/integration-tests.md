@@ -8,24 +8,31 @@ so the default `go test ./...` run does not pick them up.
 
 ```
 test/integration/
-  README.md                        — stub linking to this page
-  setup.sh                         — apt + service bootstrap (run once per host)
-  smoke_test.go                    — connect / initial-reconcile / clean-shutdown smoke test
-  scenarios_helpers_test.go        — shared per-scenario boilerplate (startScenario, readyAgent)
-  scenario_fip_test.go             — FIP add/remove, gatewayless gw, multi-router on one chassis
-  scenario_failover_test.go        — failover, stale-chassis cleanup (incl. multi-stale + one-stale-one-returning), drain & restore-drained
-  scenario_reconnect_test.go       — OVN database pause/resume resilience (#64 scenario 1)
-  scenario_drain_edges_test.go     — drain edge cases (timeout, no local routers, cleanup_on_shutdown=false)
-  scenario_network_cidrs_test.go   — manual network_cidr override vs. auto-discovery, empty-filter sweep
-  scenario_port_forward_test.go    — DNAT, sticky multi-backend, VIP mgmt, masquerade, hairpin
-  scenario_metrics_test.go         — Prometheus /metrics scrapes (reconcile counter, drain outcome, stale-chassis, desired-state gauges)
-  scenario_failure_injection_test.go         — mid-cycle vtysh/nft/ovs-ofctl failures + self-heal (#88 item 1)
-  scenario_route_tables_test.go              — non-overlapping route_table_id / port_forward_table_id / veth_leak_table_id (#88 item 2)
-  scenario_cleanup_no_drain_test.go          — RemoveManagedNBEntries with drain_on_shutdown=false (#88 item 3)
+  README.md                                   — stub linking to this page
+  setup.sh                                    — apt + service bootstrap (run once per host)
+  smoke_test.go                               — connect / initial-reconcile / clean-shutdown smoke test
+  scenarios_helpers_test.go                   — shared per-scenario boilerplate (startScenario, readyAgent)
+  scenario_fip_test.go                        — FIP add/remove, gatewayless gw, multi-router on one chassis
+  scenario_failover_test.go                   — failover, stale-chassis cleanup (incl. multi-stale + one-stale-one-returning), drain & restore-drained
+  scenario_reconnect_test.go                  — OVN database pause/resume resilience (#64 scenario 1)
+  scenario_drain_edges_test.go                — drain edge cases (timeout, no local routers, cleanup_on_shutdown=false)
+  scenario_drift_test.go                      — periodic-reconcile + verifyRoutes drift recovery (#55)
+  scenario_network_cidrs_test.go              — manual network_cidr override vs. auto-discovery, empty-filter sweep
+  scenario_gateway_port_test.go               — legacy single-router gateway_port filter (#62)
+  scenario_nat_types_test.go                  — `snat` vs `dnat_and_snat` rows + distributed `external_mac` (#62)
+  scenario_port_forward_test.go               — DNAT, sticky multi-backend, VIP mgmt, masquerade, hairpin
+  scenario_prefix_list_test.go                — ReconcileFRRPrefixList lifecycle on real FRR (#58)
+  scenario_bridge_ip_test.go                  — cold-start bridge IP + proxy_arp housekeeping (#63)
+  scenario_vethleak_test.go                   — SetupVethLeak / ReconcileVethLeakNetworks / TeardownVethLeak (#56)
+  scenario_ipv6_test.go                       — IPv6-capable OVS flow plumbing on br-ex (#54; kernel/FRR paths are v4-only today)
+  scenario_metrics_test.go                    — Prometheus /metrics scrapes (reconcile counter, drain outcome, stale-chassis, desired-state gauges)
+  scenario_failure_injection_test.go          — mid-cycle vtysh/nft/ovs-ofctl failures + self-heal (#88 item 1)
+  scenario_route_tables_test.go               — non-overlapping route_table_id / port_forward_table_id / veth_leak_table_id (#88 item 2)
+  scenario_cleanup_no_drain_test.go           — RemoveManagedNBEntries with drain_on_shutdown=false (#88 item 3)
   scenario_router_masquerade_ordering_test.go — router_masquerade configured before SNAT NAT exists (#88 item 4)
-  scenario_same_batch_fip_test.go            — single OVSDB transaction adds + removes FIPs (#88 item 5)
-  scenario_partial_failure_retry_test.go     — FRR write fails, kernel untouched, only FRR re-added (#88 item 6)
-  testenv/                         — Setup, Teardown, RunAgent, MakeLocalRouter, Assert*, ScrapeMetrics, WithFailingTool, …
+  scenario_same_batch_fip_test.go             — single OVSDB transaction adds + removes FIPs (#88 item 5)
+  scenario_partial_failure_retry_test.go      — FRR write fails, kernel untouched, only FRR re-added (#88 item 6)
+  testenv/                                    — Setup, Teardown, RunAgent, MakeLocalRouter, Assert*, ScrapeMetrics, WithFailingTool, …
 ```
 
 The failure-injection scenarios all share the `TestScenario_FailureInjection_`
