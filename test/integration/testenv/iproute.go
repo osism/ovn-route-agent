@@ -80,6 +80,46 @@ func AssertIPRulePriority(t *testing.T, prio int, mark int, table string, timeou
 	}
 }
 
+// AssertNoRouteInTable polls `ip -j route show table <table>` and fails the
+// test if any entry matching (dst, dev) is still present past timeout. The
+// matching rules mirror AssertRouteInTable; pass dst="" / dev="" to match on
+// the unspecified field. Used by the table-collisions scenario (#88 item 2)
+// to assert that a route the agent placed in one table does NOT appear in
+// another writer's table.
+func AssertNoRouteInTable(t *testing.T, table, dst, dev string, timeout time.Duration) {
+	t.Helper()
+	deadline := time.Now().Add(timeout)
+	var lastOut string
+	for {
+		out, err := exec.Command("ip", "-j", "-4", "route", "show", "table", table).CombinedOutput()
+		lastOut = strings.TrimSpace(string(out))
+		if err == nil {
+			var entries []ipRouteEntry
+			if jerr := json.Unmarshal(out, &entries); jerr == nil {
+				match := false
+				for _, e := range entries {
+					if dst != "" && e.Dst != dst {
+						continue
+					}
+					if dev != "" && e.Dev != dev {
+						continue
+					}
+					match = true
+					break
+				}
+				if !match {
+					return
+				}
+			}
+		}
+		if time.Now().After(deadline) {
+			t.Fatalf("ip route in table %s with dst=%q dev=%q unexpectedly present after %s (last output: %q)",
+				table, dst, dev, timeout, lastOut)
+		}
+		time.Sleep(200 * time.Millisecond)
+	}
+}
+
 // AssertRouteInTable polls `ip -j route show table <table>` and fails the
 // test if no entry matches (dst, dev) within timeout.
 //

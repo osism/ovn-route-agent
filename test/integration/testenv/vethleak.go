@@ -291,8 +291,17 @@ func AssertVethDefaultRouteInLeakTable(t *testing.T, timeout time.Duration) {
 // up to timeout to give the agent time to install rules after a state change.
 func AssertIPRuleAtPriority(t *testing.T, priority int, src string, timeout time.Duration) {
 	t.Helper()
+	AssertIPRuleAtPriorityTable(t, priority, src, DefaultVethLeakTableID, timeout)
+}
+
+// AssertIPRuleAtPriorityTable is the table-parameterised form of
+// AssertIPRuleAtPriority. Scenarios that override veth_leak_table_id (see
+// the table-collisions scenario in #88 item 2) need to assert against the
+// configured table rather than the agent's default.
+func AssertIPRuleAtPriorityTable(t *testing.T, priority int, src string, tableID int, timeout time.Duration) {
+	t.Helper()
 	if _, _, err := net.ParseCIDR(src); err != nil {
-		t.Fatalf("AssertIPRuleAtPriority: invalid CIDR %q: %v", src, err)
+		t.Fatalf("AssertIPRuleAtPriorityTable: invalid CIDR %q: %v", src, err)
 	}
 	deadline := time.Now().Add(timeout)
 	var lastOut string
@@ -305,7 +314,7 @@ func AssertIPRuleAtPriority(t *testing.T, priority int, src string, timeout time
 				for _, r := range rules {
 					if r.Priority == priority &&
 						r.srcCIDR() == src &&
-						tableMatches(r.Table, DefaultVethLeakTableID) {
+						tableMatches(r.Table, tableID) {
 						return
 					}
 				}
@@ -313,7 +322,7 @@ func AssertIPRuleAtPriority(t *testing.T, priority int, src string, timeout time
 		}
 		if time.Now().After(deadline) {
 			t.Fatalf("ip rule priority %d from %s table %d not present after %s (last: %q)",
-				priority, src, DefaultVethLeakTableID, timeout, strings.TrimSpace(lastOut))
+				priority, src, tableID, timeout, strings.TrimSpace(lastOut))
 		}
 		time.Sleep(150 * time.Millisecond)
 	}
