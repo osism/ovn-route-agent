@@ -125,6 +125,9 @@ sudo containerlab deploy   -t test/e2e/topology.clab.yml
 # Inspect the agent on gateway-1:
 docker exec clab-ovn-e2e-gateway-1 ovn-network-agent --help
 docker exec clab-ovn-e2e-gateway-1 ovs-vsctl show
+# Linux truncates /proc/<pid>/comm to 15 chars, so the agent process must
+# be matched via the full cmdline (pgrep -f), not pgrep -x.
+docker exec clab-ovn-e2e-gateway-1 pgrep -f /usr/local/bin/ovn-network-agent
 
 # Inspect OVN central:
 docker exec clab-ovn-e2e-central ovn-nbctl show
