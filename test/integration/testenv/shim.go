@@ -23,6 +23,7 @@ type FailingToolShim struct {
 	dir         string
 	armPath     string
 	counterPath string
+	matchPath   string
 	failCount   int
 	t           *testing.T
 }
@@ -63,14 +64,17 @@ func WithFailingTool(t *testing.T, tool string, failCount int) *FailingToolShim 
 		dir:         dir,
 		armPath:     filepath.Join(dir, tool+".armed"),
 		counterPath: filepath.Join(dir, tool+".remaining"),
+		matchPath:   filepath.Join(dir, tool+".match"),
 		failCount:   failCount,
 		t:           t,
 	}
 
 	// The shim is a small POSIX shell script. Each invocation:
 	//   1. If the arm file is absent, chain through to the real tool.
-	//   2. Otherwise read the counter; if positive, decrement and exit 1.
-	//   3. If counter has hit zero, chain through.
+	//   2. If a match file is present, only fail when the joined args
+	//      contain that substring; pass through otherwise.
+	//   3. Otherwise read the counter; if positive, decrement and exit 1.
+	//   4. If counter has hit zero, chain through.
 	//
 	// The shim strips its own directory from PATH before exec so the inner
 	// real-binary lookup cannot recurse into the shim — a recursion bug
@@ -79,10 +83,26 @@ func WithFailingTool(t *testing.T, tool string, failCount int) *FailingToolShim 
 set -e
 ARM=%q
 COUNTER=%q
+MATCH=%q
 REAL=%q
 SHIM_DIR=%q
+strip_path() {
+    # Strip the shim directory from PATH so the real binary lookup
+    # resolves to the system install, not back to us.
+    printf '%%s' "$PATH" | awk -v RS=: -v ORS=: -v skip="$SHIM_DIR" '$0!=skip{print}' | sed 's/:$//'
+}
 if [ ! -e "$ARM" ]; then
-    exec "$REAL" "$@"
+    PATH="$(strip_path)" exec "$REAL" "$@"
+fi
+if [ -s "$MATCH" ]; then
+    pattern=$(cat "$MATCH")
+    joined="$*"
+    case "$joined" in
+        *"$pattern"*) ;;
+        *)
+            PATH="$(strip_path)" exec "$REAL" "$@"
+            ;;
+    esac
 fi
 remaining=$(cat "$COUNTER" 2>/dev/null || echo 0)
 case "$remaining" in
@@ -94,11 +114,8 @@ if [ "$remaining" -gt 0 ]; then
     echo "ovn-network-agent test shim: forced failure of %s (remaining=$new)" >&2
     exit 1
 fi
-# Strip the shim directory from PATH so the real binary lookup resolves to
-# the system install, not back to us.
-clean_path=$(printf '%%s' "$PATH" | awk -v RS=: -v ORS=: -v skip="$SHIM_DIR" '$0!=skip{print}' | sed 's/:$//')
-PATH="$clean_path" exec "$REAL" "$@"
-`, shim.armPath, shim.counterPath, realPath, dir, tool)
+PATH="$(strip_path)" exec "$REAL" "$@"
+`, shim.armPath, shim.counterPath, shim.matchPath, realPath, dir, tool)
 	if err := os.WriteFile(filepath.Join(dir, tool), []byte(script), 0o755); err != nil {
 		t.Fatalf("WithFailingTool: write shim: %v", err)
 	}
@@ -130,6 +147,21 @@ func (s *FailingToolShim) Arm() {
 	if err := os.WriteFile(s.armPath, []byte("1\n"), 0o600); err != nil {
 		s.t.Fatalf("FailingToolShim.Arm: write arm file: %v", err)
 	}
+}
+
+// MatchArg narrows the shim's failure window to invocations whose joined
+// argv contains substring. The shim chains through unconditionally for
+// every call that does not match — useful when a scenario wants to fail
+// only one *kind* of invocation of a tool (e.g. vtysh's add-route call but
+// not its show-routes call).
+//
+// Returns the receiver to support fluent chaining at the call site.
+func (s *FailingToolShim) MatchArg(substring string) *FailingToolShim {
+	s.t.Helper()
+	if err := os.WriteFile(s.matchPath, []byte(substring), 0o600); err != nil {
+		s.t.Fatalf("FailingToolShim.MatchArg: %v", err)
+	}
+	return s
 }
 
 // Disarm removes the arm file so subsequent invocations chain through
