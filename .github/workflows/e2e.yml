@@ -1,0 +1,71 @@
+name: E2E
+
+# Per issue #45, the E2E workflow does not run on pull requests: the
+# containerlab harness boots three OVN+OVS+FRR gateway containers plus
+# a central node and clients, and even on the green path eats ~10 min
+# of runner time. Reserving it for `main` pushes and explicit
+# `workflow_dispatch` keeps PR feedback fast while still proving the
+# topology before a release.
+on:
+  push:
+    branches: [main]
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  baseline:
+    name: Baseline reachability
+    runs-on: ubuntu-latest
+    # Hard upper bound matching the issue's "~10-15 min budget".
+    timeout-minutes: 15
+
+    env:
+      E2E_TOPOLOGY: test/e2e/topology.clab.yml
+      LAB: ovn-e2e
+
+    steps:
+      - uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6
+
+      # Upstream-provided one-liner. Pinned by `bash -c "$(curl ...)"`
+      # rather than a SHA-pinned action because containerlab does not
+      # publish an official GitHub Action and this is the install path
+      # the issue explicitly mandates.
+      - name: Install containerlab
+        run: bash -c "$(curl -sL https://get.containerlab.dev)"
+
+      # The gwnode image uses kernel OVS so OVN's BFD-driven cr-lrp
+      # election over geneve tunnels actually converges. The ubuntu
+      # GHA runner ships the module but does not auto-load it, and the
+      # container only inherits CAP_NET_ADMIN so it cannot load it
+      # itself — load it on the host before bringing the lab up.
+      - name: Load openvswitch kernel module
+        run: sudo modprobe openvswitch
+
+      - name: Bring the lab up
+        run: make e2e-up
+
+      - name: Run baseline scenario
+        run: ./test/e2e/scenarios/baseline.sh
+
+      - name: Collect failure artifacts
+        if: failure()
+        run: |
+          ./test/e2e/scenarios/collect-artifacts.sh "${RUNNER_TEMP}/e2e-artifacts"
+
+      - name: Upload failure artifacts
+        if: failure()
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7
+        with:
+          name: e2e-artifacts-${{ github.run_id }}-${{ github.run_attempt }}
+          path: ${{ runner.temp }}/e2e-artifacts
+          if-no-files-found: warn
+          retention-days: 7
+
+      # Always tear the lab down so a partial-failure run does not leak
+      # docker networks/containers on a self-hosted runner. `if:
+      # always()` runs this step even when an earlier step failed.
+      - name: Tear the lab down
+        if: always()
+        run: make e2e-down
