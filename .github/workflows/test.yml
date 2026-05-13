@@ -24,3 +24,17 @@ jobs:
 
       - name: Show coverage
         run: go tool cover -func=coverage.out
+
+      # Fail the build if total statement coverage drops below the floor.
+      # The floor is set 2pp below the 80% target so unrelated PRs are not
+      # blocked by routine coverage drift. Raise it when the target moves.
+      - name: Enforce coverage floor
+        env:
+          COVERAGE_FLOOR: "78.0"
+        run: |
+          total=$(go tool cover -func=coverage.out | awk '/^total:/ {gsub("%","",$3); print $3}')
+          echo "total coverage: ${total}%"
+          awk -v t="$total" -v f="$COVERAGE_FLOOR" 'BEGIN { exit !(t+0 >= f+0) }' || {
+            echo "::error::total coverage ${total}% is below the floor of ${COVERAGE_FLOOR}%"
+            exit 1
+          }
