@@ -87,6 +87,14 @@ func TestScenario_FailureInjection_VtyshFailsOnce(t *testing.T) {
 // and re-apply. After the shim disarms (counter exhausted), the same
 // reconcile succeeds and the table reappears.
 //
+// The shim is filtered to `nft -f -` invocations only. The agent's
+// applyNftRuleset first runs `nft list table ip <name>` to decide whether
+// to prepend a `delete table` line; if that list call fails the agent
+// silently treats it as "table missing" and the subsequent ruleset load
+// happens anyway. Targeting `-f -` specifically guarantees the failure
+// hits the load step, which is the only step that maps to a reconcile-
+// level error in agent logs.
+//
 // The "syntactically valid but semantically conflicting prior rule" the
 // issue suggests is realised here as a shim-injected non-zero exit from
 // `nft -f -`. The reconcile path under test is the same regardless of
@@ -105,7 +113,7 @@ func TestScenario_FailureInjection_NftConflict(t *testing.T) {
 	}}
 	cfg.ReconcileInterval = "2s"
 
-	shim := testenv.WithFailingTool(t, "nft", 1)
+	shim := testenv.WithFailingTool(t, "nft", 1).MatchArg("-f -")
 	cfg.ExtraEnv = append(cfg.ExtraEnv, shim.Env())
 
 	a := readyAgent(t, cfg)
