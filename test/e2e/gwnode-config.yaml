@@ -1,0 +1,33 @@
+# ovn-network-agent config for the containerlab gateway-node image.
+#
+# The entrypoint may override ovn_*_remote via environment variables before
+# launching the agent; the values here are the defaults that match the
+# canned topology in topology.clab.yml (the OVN central container is
+# reachable as "central" on the management network).
+
+ovn_sb_remote: "tcp:central:6642"
+ovn_nb_remote: "tcp:central:6641"
+
+bridge_dev: "br-ex"
+
+# Match the FRR config the entrypoint pushes (vrf-provider VRF with a BGP
+# neighbour towards the "upstream" container). 169.254.0.1 is the
+# link-local nexthop used by the VRF veth leak feature.
+vrf_name: "vrf-provider"
+veth_nexthop: "169.254.0.1"
+
+# A link-local source IP for kernel ARP on br-ex; identical across all
+# gateways because br-ex has no upstream NIC inside the lab.
+bridge_ip: "169.254.169.254"
+
+# Quiet log level by default; override via --log-level on the command line
+# when triaging a scenario.
+log_level: "info"
+
+# Keep desired-state on shutdown so re-running `make e2e-up` after a
+# container restart does not require re-bootstrapping the NB DB.
+cleanup_on_shutdown: false
+
+# Drain is exercised explicitly in scenarios; default to off so a plain
+# `containerlab destroy` returns quickly.
+drain_on_shutdown: false
