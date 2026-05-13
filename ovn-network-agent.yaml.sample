@@ -207,11 +207,21 @@ ovn_nb_remote: "tcp:10.10.0.1:6641,tcp:10.10.0.2:6641,tcp:10.10.0.3:6641"
 #     NAT entries of type "snat") are masqueraded, leaving all other external
 #     clients' IPs fully preserved.
 #
+#   snat_to_ip: "<ipv4>"
+#     Replace masquerade with `snat to <ipv4>` for every SNAT action on this
+#     VIP (per-rule, hairpin, router). REQUIRED on all-in-one deployments
+#     where the masquerade-chosen egress IP is a local address on the
+#     gateway: the kernel's `local` table catches the reply before the
+#     fwmark rule runs and the un-SNAT'd egress is dropped. Pick an address
+#     that is NOT configured on any default-VRF interface — the veth-provider
+#     IP (default 169.254.0.2) is a typical choice. See issue #101.
+#
 #   Example — VIP accessible from both FIPs and router-NAT'd instances:
 #   - vip: "198.51.100.30"
 #     manage_vip: true
 #     hairpin_masquerade: true  # covers FIPs on the same node
 #     router_masquerade: true   # covers instances behind a router (no FIP)
+#     # snat_to_ip: "169.254.0.2"  # uncomment on all-in-one deployments
 #     rules:
 #       - proto: tcp
 #         port: 443

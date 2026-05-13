@@ -218,3 +218,57 @@ If the agent starts before OVN has reported any SNAT entry, the rule (and
 the entire `postrouting_snat` chain if it would otherwise be empty) is
 omitted to prevent accidental masquerade during startup. The rule is
 installed on the first reconciliation cycle that delivers SNAT IP data.
+
+### Case 3: all-in-one deployment with a local SNAT source (`snat_to_ip`)
+
+**The problem:** in an all-in-one deployment the OVN gateway, the port-forward
+agent, and the backend run on the same node. The kernel's `masquerade` action
+picks the egress-interface IP as the SNAT source — which is necessarily a
+local address on the gateway. When the backend's reply arrives, the kernel's
+`local` routing table (priority `0`) wins over the agent's `fwmark 0x200`
+policy rule, so the reply is delivered into `LOCAL_IN` and the un-SNAT'd
+egress is dropped. The external client never sees a `SYN-ACK` and the
+connection stalls in `SYN_RECV`.
+
+`masquerade` cannot avoid this on its own: there is no way for the kernel
+to pick a non-local egress IP when the egress interface is local.
+
+**The fix:** set `snat_to_ip` to a stable IPv4 address that is **not**
+configured on any Linux interface in the default routing context. The agent
+then emits `snat to <ip>` instead of `masquerade` for every SNAT action
+on that VIP (per-rule masquerade, hairpin masquerade, router masquerade).
+With a non-local SNAT source, the post-un-DNAT destination on the reply is
+not in the default `local` table, the standard `FORWARD` → `POSTROUTING`
+path applies, conntrack performs the reverse SNAT, and the packet exits
+via the provider-VRF return path.
+
+```yaml
+port_forwards:
+  - vip: "203.0.113.10"
+    manage_vip: true
+    masquerade: true             # or hairpin_masquerade / router_masquerade
+    snat_to_ip: "169.254.0.2"    # non-local in default VRF (here: veth-provider)
+    rules:
+      - proto: tcp
+        port: 443
+        dest_addr: "10.0.0.20"
+```
+
+```
+# Resulting postrouting_snat rule
+ip daddr 10.0.0.20 tcp dport 443 ct status dnat snat to 169.254.0.2
+```
+
+Choosing the address is operator policy:
+
+- The veth-provider IP (`veth_provider_ip`, default `169.254.0.2`) is in
+  `vrf-provider` and is **not** in the default namespace's `local` table —
+  it is a safe choice for all-in-one deployments.
+- Any address you allocate on a loopback inside `vrf-provider` works too,
+  as long as a return route from the backend to that address exists.
+- Do **not** pick an address that is already configured on a default-VRF
+  interface — that reintroduces the local-table trap.
+
+**When `snat_to_ip` is not set,** the agent emits `masquerade` exactly as
+before. Existing multi-chassis deployments where the masquerade-chosen
+egress IP is non-local in the default routing context need no change.

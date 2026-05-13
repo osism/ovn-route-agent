@@ -199,6 +199,34 @@ only emitted once OVN has reported at least one SNAT IP; on a cold start
 (before the first reconcile delivers SNAT data) the chain is omitted
 entirely to prevent accidental masquerade.
 
+**10. Non-local SNAT source for all-in-one (postrouting_snat, optional)** —
+When `snat_to_ip` is set on a VIP, every SNAT action for that VIP
+(per-rule, hairpin, router) is emitted as `snat to <ip>` instead of
+`masquerade`. This is the all-in-one fix: with `masquerade`, the kernel
+picks the egress-interface IP, which on a single-node deployment is a
+local address. The reverse-NAT'd reply then routes via the default
+namespace's `local` table (priority `0`) before the agent's `fwmark 0x200`
+rule is consulted, trapping the packet in `LOCAL_IN` and dropping the
+un-SNAT'd egress. An explicit non-local SNAT source (e.g. an IP in the
+provider VRF) keeps the post-un-DNAT destination off the default `local`
+table, so the standard `FORWARD` → `POSTROUTING` path applies and
+conntrack performs the reverse SNAT normally:
+
+```
+# masquerade flavours rewritten to `snat to <ip>` when snat_to_ip is set
+ip daddr 10.0.0.100 tcp dport 443 ct status dnat snat to 169.254.0.2
+ip saddr 5.182.234.0/24 ct original daddr 198.51.100.10 ct status dnat snat to 169.254.0.2
+ip saddr 203.0.113.50 ct original daddr 198.51.100.10 ct status dnat snat to 169.254.0.2
+```
+
+The operator picks `snat_to_ip` so it is **not** configured on any
+interface visible to the default namespace's routing — typically the
+veth-provider IP, or an address on a loopback inside `vrf-provider`.
+Multi-chassis deployments where the masquerade-chosen egress IP is
+already non-local in the default routing context can leave `snat_to_ip`
+unset and continue using `masquerade` unchanged. See
+[Case 3 in the guide](../guides/port-forwarding#case-3-all-in-one-deployment-with-a-local-snat-source-snat_to_ip).
+
 ## Why conntrack-based fwmark instead of simpler alternatives?
 
 | Approach | Client IP preserved? | Problem |
