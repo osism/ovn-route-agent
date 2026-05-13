@@ -54,6 +54,19 @@ type RouteManager struct {
 	// execOVSHook, when non-nil, replaces the real exec.Cmd runner used by
 	// OVS helpers. Tests set this to capture commands without executing them.
 	execOVSHook ovsExecFunc
+
+	// execVtyshHook, when non-nil, replaces the real exec.Cmd runner used by
+	// FRR/vtysh helpers. Tests set this to capture commands without executing them.
+	execVtyshHook ovsExecFunc
+}
+
+// runVtysh executes a vtysh command, dispatching through execVtyshHook when set.
+func (rm *RouteManager) runVtysh(args ...string) ([]byte, error) {
+	cmd := exec.Command("vtysh", args...)
+	if rm.execVtyshHook != nil {
+		return rm.execVtyshHook(cmd)
+	}
+	return cmd.CombinedOutput()
 }
 
 func NewRouteManager(cfg Config) *RouteManager {
@@ -131,8 +144,7 @@ func (rm *RouteManager) AddFRRRoutes(ips []string) error {
 			args = append(args, "-c", fmt.Sprintf("ip route %s/32 %s", ip, rm.vethNexthop))
 		}
 		args = append(args, "-c", "exit-vrf", "-c", "end")
-		cmd := exec.Command("vtysh", args...)
-		output, err := cmd.CombinedOutput()
+		output, err := rm.runVtysh(args...)
 		if err != nil {
 			return fmt.Errorf("vtysh batch add %d routes: %w (output: %s)", len(chunk), err, strings.TrimSpace(string(output)))
 		}
@@ -173,8 +185,7 @@ func (rm *RouteManager) DelFRRRoutes(ips []string) error {
 			args = append(args, "-c", fmt.Sprintf("no ip route %s/32 %s", ip, rm.vethNexthop))
 		}
 		args = append(args, "-c", "exit-vrf", "-c", "end")
-		cmd := exec.Command("vtysh", args...)
-		output, err := cmd.CombinedOutput()
+		output, err := rm.runVtysh(args...)
 		if err != nil {
 			return fmt.Errorf("vtysh batch del %d routes: %w (output: %s)", len(chunk), err, strings.TrimSpace(string(output)))
 		}
@@ -188,10 +199,7 @@ func (rm *RouteManager) HasFRRRoute(ip string) bool {
 	if err := validateIP(ip); err != nil {
 		return false
 	}
-	cmd := exec.Command("vtysh",
-		"-c", fmt.Sprintf("show ip route vrf %s %s/32", rm.vrfName, ip),
-	)
-	output, err := cmd.CombinedOutput()
+	output, err := rm.runVtysh("-c", fmt.Sprintf("show ip route vrf %s %s/32", rm.vrfName, ip))
 	if err != nil {
 		return false
 	}
@@ -203,10 +211,7 @@ func (rm *RouteManager) ListFRRRoutes() ([]string, error) {
 	if rm.dryRun {
 		return nil, nil
 	}
-	cmd := exec.Command("vtysh",
-		"-c", fmt.Sprintf("show ip route vrf %s static", rm.vrfName),
-	)
-	output, err := cmd.CombinedOutput()
+	output, err := rm.runVtysh("-c", fmt.Sprintf("show ip route vrf %s static", rm.vrfName))
 	if err != nil {
 		return nil, fmt.Errorf("vtysh list routes: %w", err)
 	}
@@ -238,10 +243,7 @@ func (rm *RouteManager) RefreshBGP() error {
 		slog.Info("[dry-run] would refresh BGP outbound")
 		return nil
 	}
-	cmd := exec.Command("vtysh",
-		"-c", fmt.Sprintf("clear ip bgp vrf %s * soft out", rm.vrfName),
-	)
-	output, err := cmd.CombinedOutput()
+	output, err := rm.runVtysh("-c", fmt.Sprintf("clear ip bgp vrf %s * soft out", rm.vrfName))
 	if err != nil {
 		return fmt.Errorf("BGP soft-refresh: %w (output: %s)", err, strings.TrimSpace(string(output)))
 	}
@@ -268,10 +270,7 @@ func (rm *RouteManager) ListFRRPrefixListEntries() ([]prefixListEntry, error) {
 	if rm.frrPrefixList == "" {
 		return nil, nil
 	}
-	cmd := exec.Command("vtysh",
-		"-c", fmt.Sprintf("show ip prefix-list %s", rm.frrPrefixList),
-	)
-	output, err := cmd.CombinedOutput()
+	output, err := rm.runVtysh("-c", fmt.Sprintf("show ip prefix-list %s", rm.frrPrefixList))
 	if err != nil {
 		return nil, fmt.Errorf("vtysh show prefix-list %s: %w (output: %s)", rm.frrPrefixList, err, strings.TrimSpace(string(output)))
 	}
@@ -334,12 +333,11 @@ func (rm *RouteManager) ReconcileFRRPrefixList(networks []*net.IPNet) error {
 	for network := range desired {
 		if _, exists := currentByNetwork[network]; !exists {
 			maxSeq += 5
-			cmd := exec.Command("vtysh",
+			output, err := rm.runVtysh(
 				"-c", "conf t",
 				"-c", fmt.Sprintf("ip prefix-list %s seq %d permit %s ge 32 le 32", rm.frrPrefixList, maxSeq, network),
 				"-c", "end",
 			)
-			output, err := cmd.CombinedOutput()
 			if err != nil {
 				return fmt.Errorf("add prefix-list entry %s seq %d: %w (output: %s)", network, maxSeq, err, strings.TrimSpace(string(output)))
 			}
@@ -350,12 +348,11 @@ func (rm *RouteManager) ReconcileFRRPrefixList(networks []*net.IPNet) error {
 	// Remove stale entries.
 	for network, seq := range currentByNetwork {
 		if !desired[network] {
-			cmd := exec.Command("vtysh",
+			output, err := rm.runVtysh(
 				"-c", "conf t",
 				"-c", fmt.Sprintf("no ip prefix-list %s seq %d permit %s ge 32 le 32", rm.frrPrefixList, seq, network),
 				"-c", "end",
 			)
-			output, err := cmd.CombinedOutput()
 			if err != nil {
 				return fmt.Errorf("remove prefix-list entry %s seq %d: %w (output: %s)", network, seq, err, strings.TrimSpace(string(output)))
 			}
