@@ -91,14 +91,21 @@ SHIM_DIR=%q
 INVOKE=%q
 # Append one line per invocation so the test can verify the shim was on
 # the agent's PATH even when no failure was injected. Best-effort; loss
-# of this line never breaks the pass-through path.
-printf '%%s\n' "invoked: $*" >>"$INVOKE" 2>/dev/null || true
+# of this line never breaks the pass-through path. The "armed=" suffix
+# records whether the arm file is visible to the shim at the moment of
+# the call — distinguishing a missing-arm-file bug from a missing-shim
+# bug.
+armed=no
+if [ -e "$ARM" ]; then
+    armed=yes
+fi
+printf '%%s\n' "invoked (armed=$armed): $*" >>"$INVOKE" 2>/dev/null || true
 strip_path() {
     # Strip the shim directory from PATH so the real binary lookup
     # resolves to the system install, not back to us.
     printf '%%s' "$PATH" | awk -v RS=: -v ORS=: -v skip="$SHIM_DIR" '$0!=skip{print}' | sed 's/:$//'
 }
-if [ ! -e "$ARM" ]; then
+if [ "$armed" != yes ]; then
     PATH="$(strip_path)" exec "$REAL" "$@"
 fi
 if [ -s "$MATCH" ]; then
