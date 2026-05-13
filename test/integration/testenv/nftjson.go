@@ -364,6 +364,22 @@ func (r NftRule) HasMasquerade() bool {
 	return false
 }
 
+// HasSNATTo asserts the rule contains a {"snat": {"addr": addr, "family":
+// "ip"}} statement. Used by issue-#101 scenarios to verify a VIP's
+// snat_to_ip is emitted as explicit `snat to <ip>` instead of `masquerade`.
+func (r NftRule) HasSNATTo(addr string) bool {
+	for _, stmt := range r.Expr {
+		s, ok := stmt["snat"].(map[string]any)
+		if !ok {
+			continue
+		}
+		if a, _ := s["addr"].(string); a == addr {
+			return true
+		}
+	}
+	return false
+}
+
 // HasCTStatusDNAT asserts the rule matches `ct status dnat`. nft renders this
 // as {"match": {"op": "in", "left": {"ct": {"key": "status"}}, "right": "dnat"}}.
 func (r NftRule) HasCTStatusDNAT() bool {

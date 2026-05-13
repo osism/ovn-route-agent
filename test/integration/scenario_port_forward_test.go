@@ -726,6 +726,102 @@ func TestScenario_PortForwardFwmarkPolicyRoutes(t *testing.T) {
 		"default", "veth-default", 15*time.Second)
 }
 
+// TestScenario_PortForwardSNATToIPAllInOne (issue #101).
+//
+// In an all-in-one deployment the masquerade-chosen SNAT source is a local
+// IP on the gateway. The reverse-NATed reply then routes via the kernel's
+// `local` table (priority 0) before the agent's fwmark rule is consulted,
+// trapping the packet in LOCAL_IN — the TCP handshake never completes.
+//
+// The fix is opt-in: a per-VIP `snat_to_ip` replaces `masquerade` with
+// `snat to <ip>`. The operator points it at a stable non-local address
+// (e.g. an IP in the provider VRF) so the post-un-DNAT destination is not
+// in the default local table and the standard FORWARD → POSTROUTING path
+// applies.
+//
+// This scenario exercises all three masquerade flavours in a single VIP
+// (per-rule, hairpin, router) and asserts each emits `snat to <ip>`
+// instead of `masquerade`. The remote-backend (multi-chassis) regression
+// is covered by the other postrouting_snat scenarios which continue to
+// assert HasMasquerade — keeping both shapes pinned ensures the new flag
+// is strictly opt-in.
+func TestScenario_PortForwardSNATToIPAllInOne(t *testing.T) {
+	ctx, cancel, nb, sb := startScenario(t)
+	defer cancel()
+	testenv.EnsureLoopback1(t)
+
+	// Provider network 198.51.100.0/24 for hairpin; router with an SNAT
+	// entry inside the same prefix for router_masquerade. Mirrors the
+	// setup in TestScenario_PortForwardRouterMasquerade.
+	router := testenv.MakeLocalRouter(t, ctx, nb, sb, testenv.LocalRouterOpts{
+		Name:        "snattor",
+		LRPMAC:      "fa:16:3e:7a:00:02",
+		LRPNetworks: []string{"198.51.100.11/24"},
+	})
+
+	const (
+		vip       = "198.51.100.42"
+		backend   = "10.0.0.100"
+		snatToIP  = "169.254.0.2" // veth-provider IP — non-local in default VRF
+		routerSrc = "198.51.100.50"
+		routerNet = "10.0.0.0/24"
+	)
+	testenv.AddSNATEntry(t, ctx, nb, router, routerSrc, routerNet)
+
+	cfg := pfDefaults(t)
+	cfg.PortForwards = []testenv.PortForwardVIPFixture{{
+		VIP:               vip,
+		Masquerade:        true,
+		HairpinMasquerade: true,
+		RouterMasquerade:  true,
+		SNATToIP:          snatToIP,
+		Rules: []testenv.PortForwardRuleFixture{{
+			Proto: "tcp", Port: 443, DestAddr: backend,
+		}},
+	}}
+
+	a := readyAgent(t, cfg)
+	defer a.Stop(15 * time.Second)
+
+	// Per-rule masquerade: backend-targeted rule must emit `snat to`.
+	testenv.AssertNftRuleInChain(t, pfTable, "postrouting_snat",
+		func(r testenv.NftRule) bool {
+			return r.HasMatch("ip", "daddr", backend) &&
+				r.HasMatch("tcp", "dport", 443) &&
+				r.HasSNATTo(snatToIP)
+		},
+		30*time.Second, "per-rule masquerade must emit `snat to "+snatToIP+"`")
+
+	// Hairpin: provider-CIDR sourced traffic must emit `snat to`.
+	testenv.AssertNftRuleInChain(t, pfTable, "postrouting_snat",
+		func(r testenv.NftRule) bool {
+			return r.HasMatchPrefix("ip", "saddr", "198.51.100.0/24") &&
+				r.HasSNATTo(snatToIP)
+		},
+		30*time.Second, "hairpin masquerade must emit `snat to "+snatToIP+"`")
+
+	// Router masquerade: router SNAT IP sourced traffic must emit `snat to`.
+	testenv.AssertNftRuleInChain(t, pfTable, "postrouting_snat",
+		func(r testenv.NftRule) bool {
+			return r.HasMatch("ip", "saddr", routerSrc) &&
+				r.HasSNATTo(snatToIP)
+		},
+		30*time.Second, "router masquerade must emit `snat to "+snatToIP+"`")
+
+	// Defensive: no rule in postrouting_snat may carry a `masquerade`
+	// statement once snat_to_ip is set on the VIP. A regression that
+	// fell back to masquerade for any of the three branches would still
+	// pass the positive assertions above (they only require `snat to`
+	// to be present), so this loop pins the negative.
+	dump := testenv.DumpNftRuleset(t)
+	for _, r := range dump.RulesIn(pfTable, "postrouting_snat") {
+		if r.HasMasquerade() {
+			t.Errorf("snat_to_ip set on VIP %s but rule still uses masquerade: %s",
+				vip, string(r.Raw))
+		}
+	}
+}
+
 // TestScenario_PortForwardHairpinPlusPerRuleMasquerade (#61 scenario 4).
 //
 // A VIP with hairpin_masquerade:true and one rule overridden to
