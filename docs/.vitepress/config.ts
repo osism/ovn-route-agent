@@ -59,6 +59,7 @@ export default defineConfig({
         text: 'Contributing',
         items: [
           { text: 'Integration tests', link: '/contributing/integration-tests' },
+          { text: 'Containerlab E2E harness', link: '/contributing/e2e-tests' },
         ],
       },
     ],

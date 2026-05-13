@@ -32,6 +32,7 @@ Full documentation is published at
   - [Gateway drain mode](https://osism.github.io/ovn-network-agent/explanation/gateway-drain)
 - Contributing:
   - [Integration tests](https://osism.github.io/ovn-network-agent/contributing/integration-tests)
+  - [Containerlab E2E harness](https://osism.github.io/ovn-network-agent/contributing/e2e-tests)
 
 To build the docs locally:
 
