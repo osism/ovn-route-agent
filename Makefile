@@ -63,12 +63,13 @@ docs-gen-check: docs-gen
 
 # Build the containerlab E2E images for the host platform. The gwnode
 # Dockerfile builds the agent from source via a Go build stage, so no
-# pre-build of the binary is required.
+# pre-build of the binary is required. Plain `docker build` is used so
+# the target works on hosts without the docker-buildx-plugin (which is
+# only required for multi-arch publication, documented in
+# docs/contributing/e2e-tests.md).
 e2e-images:
-	docker buildx build --load \
-		-f test/e2e/Dockerfile.central -t $(E2E_CENTRAL_TAG) .
-	docker buildx build --load \
-		-f test/e2e/Dockerfile.gwnode  -t $(E2E_GWNODE_TAG)  .
+	docker build -f test/e2e/Dockerfile.central -t $(E2E_CENTRAL_TAG) .
+	docker build -f test/e2e/Dockerfile.gwnode  -t $(E2E_GWNODE_TAG)  .
 
 # Install the containerlab CLI when it is missing. Linux only: the
 # upstream project publishes Linux binaries and a one-line installer

@@ -116,10 +116,8 @@ make e2e-down        # containerlab destroy
 Equivalent manual sequence (useful for triage):
 
 ```sh
-docker buildx build --load \
-    -f test/e2e/Dockerfile.central -t ovn-network-agent/central:e2e .
-docker buildx build --load \
-    -f test/e2e/Dockerfile.gwnode  -t ovn-network-agent/gwnode:e2e  .
+docker build -f test/e2e/Dockerfile.central -t ovn-network-agent/central:e2e .
+docker build -f test/e2e/Dockerfile.gwnode  -t ovn-network-agent/gwnode:e2e  .
 
 sudo containerlab deploy   -t test/e2e/topology.clab.yml
 ./test/e2e/bootstrap.sh
@@ -159,12 +157,16 @@ docker image inspect ovn-network-agent/gwnode:e2e \
 
 The Go build stage in `Dockerfile.gwnode` honours `TARGETARCH`, and
 the Ubuntu/OVS/OVN/FRR packages used at runtime are published for
-both `amd64` and `arm64`. To build both arches in one shot:
+both `amd64` and `arm64`. Multi-arch publication requires the
+`docker-buildx-plugin` (on Debian/Ubuntu Docker CE hosts:
+`sudo apt-get install -y docker-buildx-plugin`). Once it is
+installed:
 
 ```sh
 docker buildx build --platform linux/amd64,linux/arm64 \
     -f test/e2e/Dockerfile.gwnode -t ovn-network-agent/gwnode:e2e --push .
 ```
 
-The `make e2e-up` target only builds for the host platform, which is
-the right default for local development and CI on a single runner.
+The `make e2e-up` target only builds for the host platform via plain
+`docker build`, which is the right default for local development and
+CI on a single runner and does not need the buildx plugin.
