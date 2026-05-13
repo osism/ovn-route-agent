@@ -29,6 +29,18 @@ test/e2e/
 - `make`, `docker buildx`, and a Go toolchain matching `go.mod` (the
   gwnode image builds the agent from source).
 
+`make e2e-install-tools` bootstraps containerlab on Linux via the
+upstream installer (`get.containerlab.dev`); it is a no-op when
+`containerlab` is already on PATH.
+
+macOS is **not** a supported host for containerlab itself — upstream
+ships no darwin binary. The supported macOS workflow is to run the
+lab from a Linux VM (OrbStack, Colima, Docker Desktop's Linux VM,
+etc.); see the upstream guide at
+<https://containerlab.dev/macos/>. `make e2e-install-tools` exits
+with an explanatory error on macOS instead of pretending to install
+something.
+
 The lab also runs on a GitHub Actions `ubuntu-latest` runner without extra
 setup: Docker is preinstalled and supports privileged containers, which is
 what containerlab requires.
