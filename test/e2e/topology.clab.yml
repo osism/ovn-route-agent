@@ -1,0 +1,89 @@
+# Containerlab topology for the ovn-network-agent E2E harness.
+#
+#   central                    — ovn-northd + NB/SB ovsdb-server
+#   gateway-{1,2,3}            — OVS userspace + ovn-controller + FRR + agent
+#   upstream                   — FRR BGP peer for the gateways
+#   client-{1,2}               — reachability probes attached to upstream
+#
+# Layout:
+#   * containerlab's default management network connects every node and
+#     resolves them by name; the gateway agent talks to `central` here.
+#   * each gateway has a dedicated point-to-point underlay link to
+#     `upstream` (eth1 on both sides) carrying the BGP session.
+#   * each client has a point-to-point link to `upstream` so the upstream
+#     router is its egress towards FIPs announced by the gateways.
+#
+# Build the images with `make e2e-up`. The image tags below match the
+# Makefile targets.
+
+name: ovn-e2e
+
+mgmt:
+  network: ovn-e2e-mgmt
+  ipv4-subnet: 172.30.0.0/24
+
+topology:
+  defaults:
+    env:
+      # Forwarded into the gwnode entrypoint so each chassis registers
+      # under a stable name.
+      OVN_SB_REMOTE: tcp:central:6642
+
+  kinds:
+    linux:
+      # All containers in this lab need network-admin level capability for
+      # OVS / ovn-controller / FRR / nftables to work. containerlab adds
+      # NET_ADMIN/SYS_ADMIN by default for linux kind; bind extra paths
+      # OVS needs at runtime.
+      binds:
+        - /lib/modules:/lib/modules:ro
+
+  nodes:
+    central:
+      kind: linux
+      image: ovn-network-agent/central:e2e
+      ports:
+        - 6641:6641/tcp
+        - 6642:6642/tcp
+
+    gateway-1:
+      kind: linux
+      image: ovn-network-agent/gwnode:e2e
+      env:
+        CHASSIS_NAME: gateway-1
+
+    gateway-2:
+      kind: linux
+      image: ovn-network-agent/gwnode:e2e
+      env:
+        CHASSIS_NAME: gateway-2
+
+    gateway-3:
+      kind: linux
+      image: ovn-network-agent/gwnode:e2e
+      env:
+        CHASSIS_NAME: gateway-3
+
+    upstream:
+      kind: linux
+      image: frrouting/frr:latest
+
+    client-1:
+      kind: linux
+      image: nicolaka/netshoot:latest
+      # Stay alive without a service — netshoot exits otherwise.
+      cmd: "sleep infinity"
+
+    client-2:
+      kind: linux
+      image: nicolaka/netshoot:latest
+      cmd: "sleep infinity"
+
+  links:
+    # Underlay: gateway <-> upstream (BGP peering).
+    - endpoints: [gateway-1:eth1, upstream:eth1]
+    - endpoints: [gateway-2:eth1, upstream:eth2]
+    - endpoints: [gateway-3:eth1, upstream:eth3]
+    # Clients hang off the upstream router for reachability tests.
+    - endpoints: [client-1:eth1, upstream:eth4]
+    - endpoints: [client-2:eth1, upstream:eth5]
