@@ -158,9 +158,12 @@ func RunAgent(t *testing.T, cfg AgentConfig) *AgentProc {
 	bin := AgentBinary(t)
 	cmd := exec.Command(bin, "--config", configPath)
 	cmd.Env = append(os.Environ(), "GOTRACEBACK=all")
-	// ExtraEnv entries trail os.Environ() so they win when keys collide —
-	// PATH overrides from WithFailingTool depend on this order.
-	cmd.Env = append(cmd.Env, cfg.ExtraEnv...)
+	// ExtraEnv must REPLACE existing entries with the same key, not append.
+	// Linux's getenv() returns the first matching entry, so a trailing
+	// "PATH=<shim>:..." would be ignored — the agent would still resolve
+	// tools via the original PATH and the WithFailingTool shim would never
+	// fire. mergeEnv splices each "KEY=value" in over its prior occurrence.
+	cmd.Env = mergeEnv(cmd.Env, cfg.ExtraEnv)
 
 	stderr, err := cmd.StderrPipe()
 	if err != nil {
@@ -407,4 +410,37 @@ func writeTempConfig(t *testing.T, cfg AgentConfig) string {
 		t.Fatalf("write config: %v", err)
 	}
 	return path
+}
+
+// mergeEnv returns base with each "KEY=value" entry from overrides spliced
+// in over its prior occurrence. Keys not yet present are appended at the
+// end. Unlike a naive `append`, this guarantees the override wins
+// regardless of whether libc's getenv() returns the first or last matching
+// entry — Linux libc returns the first, which is exactly the trap
+// WithFailingTool used to fall into.
+func mergeEnv(base, overrides []string) []string {
+	out := make([]string, len(base))
+	copy(out, base)
+	for _, entry := range overrides {
+		key := entry
+		if i := strings.IndexByte(entry, '='); i >= 0 {
+			key = entry[:i]
+		}
+		replaced := false
+		for i, existing := range out {
+			eKey := existing
+			if j := strings.IndexByte(existing, '='); j >= 0 {
+				eKey = existing[:j]
+			}
+			if eKey == key {
+				out[i] = entry
+				replaced = true
+				break
+			}
+		}
+		if !replaced {
+			out = append(out, entry)
+		}
+	}
+	return out
 }
