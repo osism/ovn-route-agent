@@ -67,16 +67,12 @@ RUN apt-get update \
  && rm -rf /var/lib/apt/lists/* /var/cache/apt/archives/* \
            /usr/share/doc /usr/share/man /usr/share/locale
 
-# Enable the FRR daemons the agent drives: bgpd for the upstream peer and
-# staticd for the VRF static routes the agent writes via vtysh. zebra is
-# always on. The "vrf" knob in /etc/frr/daemons gates VRF support inside
-# zebra (kernel VRF devices are still required at runtime).
-RUN sed -i \
-        -e 's/^bgpd=no/bgpd=yes/' \
-        -e 's/^staticd=no/staticd=yes/' \
-        /etc/frr/daemons \
- && grep -q '^bgpd=yes' /etc/frr/daemons \
- && grep -q '^staticd=yes' /etc/frr/daemons
+# Enable bgpd so FRR can peer with the upstream container. staticd is
+# always started by /etc/init.d/frr on this FRR build (and is what the
+# agent writes VRF static routes through). Zebra owns VRF support;
+# kernel VRF devices are still a host-level concern.
+RUN sed -i 's/^bgpd=no/bgpd=yes/' /etc/frr/daemons \
+ && grep -q '^bgpd=yes' /etc/frr/daemons
 
 COPY --from=build /out/ovn-network-agent /usr/local/bin/ovn-network-agent
 COPY test/e2e/gwnode-entrypoint.sh /usr/local/bin/gwnode-entrypoint.sh
