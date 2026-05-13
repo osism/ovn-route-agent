@@ -78,7 +78,7 @@ type metricInfo struct {
 	IsVec       bool     // true for *Vec collectors
 	Labels      []string // label names (nil for non-Vec)
 	Help        string
-	StructField string   // metricsRegistry field that holds this collector
+	StructField string // metricsRegistry field that holds this collector
 	// LabelValues maps each declared label to the literal values
 	// seen in the bootstrap `WithLabelValues(...)` calls inside
 	// newMetricsRegistry, in first-seen order. Empty for metrics
