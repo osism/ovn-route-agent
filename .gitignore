@@ -1,2 +1,7 @@
 # Binary
 ovn-network-agent
+
+# Documentation site (VitePress)
+node_modules/
+docs/.vitepress/cache/
+docs/.vitepress/dist/
