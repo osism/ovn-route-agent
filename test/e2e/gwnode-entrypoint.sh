@@ -15,15 +15,33 @@ log() { printf '[gwnode] %s\n' "$*" >&2; }
 # the canned topology.
 CHASSIS_NAME="${CHASSIS_NAME:-$(hostname -s)}"
 OVN_SB_REMOTE="${OVN_SB_REMOTE:-tcp:central:6642}"
-ENCAP_IP="${ENCAP_IP:-127.0.0.1}"
+# Encap IP must be unique per chassis: containerlab puts every node on
+# the management network as `eth0`, so picking that address gives each
+# gateway a routable, distinct geneve endpoint. The earlier 127.0.0.1
+# default collided across the three gateways and only the first
+# registration "stuck" in SB, which broke gateway_chassis HA priorities
+# (cr-lr0-public landed on whichever chassis happened to register
+# first, not on the priority-30 master).
+ENCAP_IP="${ENCAP_IP:-$(ip -o -4 addr show eth0 | awk '{print $4}' | cut -d/ -f1)}"
 BRIDGE_DEV="${BRIDGE_DEV:-br-ex}"
 BRIDGE_MAPPING="${BRIDGE_MAPPING:-physnet1:${BRIDGE_DEV}}"
 VRF_NAME="${VRF_NAME:-vrf-provider}"
 VRF_TABLE_ID="${VRF_TABLE_ID:-100}"
 
 start_ovs() {
-    log "starting Open vSwitch (userspace datapath)"
+    log "starting Open vSwitch (kernel datapath)"
     mkdir -p /var/run/openvswitch /var/log/openvswitch /etc/openvswitch
+    # The userspace datapath (datapath_type=netdev) sounded attractive
+    # for a container-only lab, but OVN's chassisredirect election uses
+    # BFD over the geneve tunnels between chassis and BFD never
+    # converges with userspace OVS in this setup — cr-lrp gets claimed,
+    # then immediately released, and the LR external port stays
+    # unbound. Kernel OVS is the path that actually carries inter-chassis
+    # traffic in containerlab. The host module is mounted into the
+    # container via the /lib/modules:ro bind in topology.clab.yml, and
+    # we best-effort modprobe it on startup in case the host did not
+    # auto-load it.
+    modprobe openvswitch 2>/dev/null || log "modprobe openvswitch failed (already loaded or built in?)"
     # ovs-ctl honours the existing conf.db when present and creates a new
     # one otherwise, which keeps re-runs idempotent.
     /usr/share/openvswitch/scripts/ovs-ctl --system-id="${CHASSIS_NAME}" start
@@ -40,21 +58,16 @@ start_ovs() {
 
 configure_ovs() {
     log "configuring Open_vSwitch external_ids for ovn-controller"
-    # ovn-bridge-datapath-type=netdev hints to ovn-controller to create
-    # br-int with the userspace datapath, so the lab does not depend on
-    # the openvswitch kernel module being loaded on the host.
     ovs-vsctl set Open_vSwitch . \
         external_ids:ovn-remote="${OVN_SB_REMOTE}" \
         external_ids:ovn-encap-type=geneve \
         external_ids:ovn-encap-ip="${ENCAP_IP}" \
         external_ids:system-id="${CHASSIS_NAME}" \
         external_ids:hostname="${CHASSIS_NAME}" \
-        external_ids:ovn-bridge-mappings="${BRIDGE_MAPPING}" \
-        external_ids:ovn-bridge-datapath-type=netdev
+        external_ids:ovn-bridge-mappings="${BRIDGE_MAPPING}"
 
-    log "ensuring ${BRIDGE_DEV} exists (datapath_type=netdev)"
-    ovs-vsctl --may-exist add-br "${BRIDGE_DEV}" \
-        -- set bridge "${BRIDGE_DEV}" datapath_type=netdev
+    log "ensuring ${BRIDGE_DEV} exists"
+    ovs-vsctl --may-exist add-br "${BRIDGE_DEV}"
     ip link set "${BRIDGE_DEV}" up
 }
 
