@@ -72,12 +72,18 @@ type flagInfo struct {
 }
 
 type metricInfo struct {
-	Name     string   // unqualified metric name (Opts.Name)
-	FullName string   // namespace + "_" + name
-	Kind     string   // "counter" | "gauge" | "histogram"
-	IsVec    bool     // true for *Vec collectors
-	Labels   []string // label names (nil for non-Vec)
-	Help     string
+	Name        string   // unqualified metric name (Opts.Name)
+	FullName    string   // namespace + "_" + name
+	Kind        string   // "counter" | "gauge" | "histogram"
+	IsVec       bool     // true for *Vec collectors
+	Labels      []string // label names (nil for non-Vec)
+	Help        string
+	StructField string   // metricsRegistry field that holds this collector
+	// LabelValues maps each declared label to the literal values
+	// seen in the bootstrap `WithLabelValues(...)` calls inside
+	// newMetricsRegistry, in first-seen order. Empty for metrics
+	// that are never pre-populated.
+	LabelValues map[string][]string
 }
 
 func parseSource(root string) (*sourceInfo, error) {
@@ -606,8 +612,16 @@ func parseMetrics(f *ast.File, info *sourceInfo) error {
 		return fmt.Errorf("metrics.go: metricsRegistry composite literal not found")
 	}
 
+	// Map struct field name -> index in info.Metrics so we can look
+	// the metric back up when walking the WithLabelValues bootstrap
+	// calls below.
+	indexByField := map[string]int{}
 	for _, elt := range cl.Elts {
 		kv, ok := elt.(*ast.KeyValueExpr)
+		if !ok {
+			continue
+		}
+		fieldName, ok := kv.Key.(*ast.Ident)
 		if !ok {
 			continue
 		}
@@ -615,9 +629,80 @@ func parseMetrics(f *ast.File, info *sourceInfo) error {
 		if !ok {
 			continue
 		}
+		mi.StructField = fieldName.Name
 		info.Metrics = append(info.Metrics, mi)
+		indexByField[fieldName.Name] = len(info.Metrics) - 1
 	}
+
+	collectLabelValues(fn, indexByField, info.Metrics)
 	return nil
+}
+
+// collectLabelValues walks newMetricsRegistry for calls of the form
+// `m.<field>.WithLabelValues("v1", "v2", …).<op>(…)` and records the
+// literal values against the corresponding metric. Values are
+// associated positionally with the metric's declared labels.
+func collectLabelValues(fn *ast.FuncDecl, indexByField map[string]int, metrics []metricInfo) {
+	ast.Inspect(fn.Body, func(n ast.Node) bool {
+		outer, ok := n.(*ast.CallExpr)
+		if !ok {
+			return true
+		}
+		outerSel, ok := outer.Fun.(*ast.SelectorExpr)
+		if !ok {
+			return true
+		}
+		inner, ok := outerSel.X.(*ast.CallExpr)
+		if !ok {
+			return true
+		}
+		innerSel, ok := inner.Fun.(*ast.SelectorExpr)
+		if !ok || innerSel.Sel.Name != "WithLabelValues" {
+			return true
+		}
+		fieldSel, ok := innerSel.X.(*ast.SelectorExpr)
+		if !ok {
+			return true
+		}
+		recv, ok := fieldSel.X.(*ast.Ident)
+		if !ok || recv.Name != "m" {
+			return true
+		}
+		idx, ok := indexByField[fieldSel.Sel.Name]
+		if !ok {
+			return true
+		}
+		labels := metrics[idx].Labels
+		if len(labels) == 0 {
+			return true
+		}
+		if metrics[idx].LabelValues == nil {
+			metrics[idx].LabelValues = map[string][]string{}
+		}
+		for i, arg := range inner.Args {
+			if i >= len(labels) {
+				break
+			}
+			val, ok := stringLit(arg)
+			if !ok {
+				continue
+			}
+			label := labels[i]
+			if !containsString(metrics[idx].LabelValues[label], val) {
+				metrics[idx].LabelValues[label] = append(metrics[idx].LabelValues[label], val)
+			}
+		}
+		return true
+	})
+}
+
+func containsString(haystack []string, needle string) bool {
+	for _, s := range haystack {
+		if s == needle {
+			return true
+		}
+	}
+	return false
 }
 
 // metricFromCall recognises calls of the form

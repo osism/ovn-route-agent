@@ -131,7 +131,7 @@ type metricsRegistry struct {
 }
 
 func newMetricsRegistry() *metricsRegistry {
-	return &metricsRegistry{
+	m := &metricsRegistry{
 		reconcileTotal: prometheus.NewCounterVec(prometheus.CounterOpts{
 			Namespace: metricsNamespace,
 			Name:      "reconcile_total",
@@ -150,6 +150,12 @@ func newMetricsRegistry() *metricsRegistry {
 			Help:      "Unique IPs the agent wants routes for.",
 		}),
 	}
+
+	m.reconcileTotal.WithLabelValues("event").Add(0)
+	m.reconcileTotal.WithLabelValues("periodic").Add(0)
+	m.reconcileTotal.WithLabelValues("startup").Add(0)
+
+	return m
 }
 `
 
@@ -338,6 +344,39 @@ func TestParseSource_Metrics(t *testing.T) {
 			if got.Labels[j] != lbl {
 				t.Errorf("metric[%d].Labels[%d] = %q, want %q", i, j, got.Labels[j], lbl)
 			}
+		}
+	}
+}
+
+func TestParseSource_MetricLabelValues(t *testing.T) {
+	dir := writeFixture(t, map[string]string{
+		"config.go":  configFixture,
+		"metrics.go": metricsFixture,
+	})
+
+	info, err := parseSource(dir)
+	if err != nil {
+		t.Fatalf("parseSource: %v", err)
+	}
+
+	var reconcile *metricInfo
+	for i := range info.Metrics {
+		if info.Metrics[i].Name == "reconcile_total" {
+			reconcile = &info.Metrics[i]
+			break
+		}
+	}
+	if reconcile == nil {
+		t.Fatalf("reconcile_total metric not parsed")
+	}
+	got := reconcile.LabelValues["trigger"]
+	want := []string{"event", "periodic", "startup"}
+	if len(got) != len(want) {
+		t.Fatalf("LabelValues[trigger] = %v, want %v", got, want)
+	}
+	for i, v := range want {
+		if got[i] != v {
+			t.Errorf("LabelValues[trigger][%d] = %q, want %q", i, got[i], v)
 		}
 	}
 }

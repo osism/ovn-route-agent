@@ -74,6 +74,29 @@ func renderConfiguration(info *sourceInfo) string {
 	return b.String()
 }
 
+// renderMetricLabels renders the Labels cell. For a Vec collector we
+// show each label followed by its bootstrap value set (when known)
+// so the table is as informative as the previously hand-written one.
+func renderMetricLabels(m metricInfo) string {
+	if len(m.Labels) == 0 {
+		return "—"
+	}
+	parts := make([]string, len(m.Labels))
+	for i, label := range m.Labels {
+		values := m.LabelValues[label]
+		if len(values) == 0 {
+			parts[i] = mdCode(label)
+			continue
+		}
+		vals := make([]string, len(values))
+		for j, v := range values {
+			vals[j] = mdCode(v)
+		}
+		parts[i] = mdCode(label) + "={" + strings.Join(vals, ",") + "}"
+	}
+	return strings.Join(parts, ", ")
+}
+
 func renderEnv(fl flagInfo, info *sourceInfo) string {
 	if fl.ConfigField != "" {
 		if v, ok := info.EnvByField[fl.ConfigField]; ok {
@@ -151,14 +174,6 @@ func renderMetrics(info *sourceInfo) string {
 	b.WriteString("| Metric | Type | Labels | Description |\n")
 	b.WriteString("|--------|------|--------|-------------|\n")
 	for _, m := range info.Metrics {
-		labels := "—"
-		if len(m.Labels) > 0 {
-			parts := make([]string, len(m.Labels))
-			for i, l := range m.Labels {
-				parts[i] = mdCode(l)
-			}
-			labels = strings.Join(parts, ", ")
-		}
 		typ := m.Kind
 		if m.IsVec {
 			typ = m.Kind + " (vec)"
@@ -166,7 +181,7 @@ func renderMetrics(info *sourceInfo) string {
 		fmt.Fprintf(&b, "| %s | %s | %s | %s |\n",
 			mdCode(m.FullName),
 			typ,
-			labels,
+			renderMetricLabels(m),
 			mdRow(m.Help),
 		)
 	}
