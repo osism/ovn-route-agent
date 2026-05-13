@@ -63,6 +63,20 @@ type AgentConfig struct {
 	PortForwardL3mdevAccept *bool                   `yaml:"port_forward_l3mdev_accept,omitempty"`
 	PortForwardCTZone       *int                    `yaml:"port_forward_ct_zone,omitempty"`
 	PortForwards            []PortForwardVIPFixture `yaml:"port_forwards,omitempty"`
+
+	// Routing-table IDs for each writer plane. Mirrors the agent's
+	// route_table_id / veth_leak_table_id / port_forward_table_id options.
+	// Pointer so a test can opt into a non-default value without forcing
+	// every other test to populate them.
+	RouteTableID       *int `yaml:"route_table_id,omitempty"`
+	VethLeakTableID    *int `yaml:"veth_leak_table_id,omitempty"`
+	PortForwardTableID *int `yaml:"port_forward_table_id,omitempty"`
+
+	// ExtraEnv is appended to the agent subprocess's environment after
+	// os.Environ(). Scenario tests use it to prepend a shim directory to
+	// PATH (see WithFailingTool) — later "KEY=value" entries override
+	// earlier ones, which is how PATH overrides work.
+	ExtraEnv []string `yaml:"-"`
 }
 
 // PortForwardVIPFixture mirrors the agent's PortForwardVIP for scenario
@@ -144,6 +158,9 @@ func RunAgent(t *testing.T, cfg AgentConfig) *AgentProc {
 	bin := AgentBinary(t)
 	cmd := exec.Command(bin, "--config", configPath)
 	cmd.Env = append(os.Environ(), "GOTRACEBACK=all")
+	// ExtraEnv entries trail os.Environ() so they win when keys collide —
+	// PATH overrides from WithFailingTool depend on this order.
+	cmd.Env = append(cmd.Env, cfg.ExtraEnv...)
 
 	stderr, err := cmd.StderrPipe()
 	if err != nil {
@@ -377,6 +394,10 @@ func writeTempConfig(t *testing.T, cfg AgentConfig) string {
 	if len(cfg.PortForwards) > 0 {
 		doc["port_forwards"] = cfg.PortForwards
 	}
+
+	putInt("route_table_id", cfg.RouteTableID)
+	putInt("veth_leak_table_id", cfg.VethLeakTableID)
+	putInt("port_forward_table_id", cfg.PortForwardTableID)
 
 	out, err := yaml.Marshal(doc)
 	if err != nil {
