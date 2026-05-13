@@ -194,6 +194,48 @@ func TestEnsureOVSFlowsWithCachedDiscovery(t *testing.T) {
 	}
 }
 
+// TestEnsureOVSFlowsRunsDiscoveryWhenUncached exercises the first-call
+// discovery path: with no cached values, EnsureOVSFlows calls
+// discoverPatchPort and getOFPort via the OVS hook and only falls over at
+// GetBridgeMAC (which has no hook). The discovery branches are covered up
+// to that point, and the function returns the wrapped MAC error.
+func TestEnsureOVSFlowsRunsDiscoveryWhenUncached(t *testing.T) {
+	rec := newOVSRecorder()
+	rec.on(
+		[]string{"ovs-vsctl", "list-ports", "ovnagent-nonexistent-br"},
+		"phy-eth0\npatch-provnet-0\n", nil,
+	)
+	rec.on(
+		[]string{"ovs-vsctl", "--if-exists", "get", "Interface", "phy-eth0", "type"},
+		"\n", nil,
+	)
+	rec.on(
+		[]string{"ovs-vsctl", "--if-exists", "get", "Interface", "patch-provnet-0", "type"},
+		"patch\n", nil,
+	)
+	rec.on(
+		[]string{"ovs-vsctl", "get", "Interface", "patch-provnet-0", "ofport"},
+		"42\n", nil,
+	)
+	rm := &RouteManager{
+		bridgeDev:   "ovnagent-nonexistent-br",
+		execOVSHook: rec.hook(),
+	}
+
+	err := rm.EnsureOVSFlows()
+	if err == nil {
+		t.Fatal("expected GetBridgeMAC error in absence of a real bridge")
+	}
+	if !strings.Contains(err.Error(), "get bridge MAC") {
+		t.Errorf("expected 'get bridge MAC' wrapped error, got: %v", err)
+	}
+	// Discovery commands must have been dispatched before the MAC lookup failed.
+	if rm.cachedPatchPort != "" || rm.cachedOfport != "" {
+		t.Errorf("cache should remain empty when discovery aborts: patch=%q ofport=%q",
+			rm.cachedPatchPort, rm.cachedOfport)
+	}
+}
+
 func TestEnsureOVSFlowsTolersDelFailure(t *testing.T) {
 	// del-flows is treated as best-effort; a failure must not abort the
 	// subsequent add-flow calls.
