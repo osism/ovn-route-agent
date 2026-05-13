@@ -3,7 +3,14 @@ VERSION   ?= $(shell git describe --tags --always --dirty 2>/dev/null || echo "d
 LDFLAGS   := -s -w -X main.version=$(VERSION)
 GOFLAGS   := -trimpath
 
-.PHONY: all build build-static clean fmt vet test test-integration install docs-gen docs-gen-check
+.PHONY: all build build-static clean fmt vet test test-integration install docs-gen docs-gen-check e2e-images e2e-up e2e-down
+
+# Containerlab E2E harness. See test/e2e/README.md for the topology and
+# acceptance criteria (issue #44).
+E2E_TOPOLOGY    := test/e2e/topology.clab.yml
+E2E_BOOTSTRAP   := test/e2e/bootstrap.sh
+E2E_GWNODE_TAG  := ovn-network-agent/gwnode:e2e
+E2E_CENTRAL_TAG := ovn-network-agent/central:e2e
 
 all: build
 
@@ -53,3 +60,22 @@ docs-gen-check: docs-gen
 		echo "docs/reference/ is out of date — run 'make docs-gen' and commit the result."; \
 		exit 1; \
 	)
+
+# Build the containerlab E2E images for the host platform. The gwnode
+# Dockerfile builds the agent from source via a Go build stage, so no
+# pre-build of the binary is required.
+e2e-images:
+	docker buildx build --load \
+		-f test/e2e/Dockerfile.central -t $(E2E_CENTRAL_TAG) .
+	docker buildx build --load \
+		-f test/e2e/Dockerfile.gwnode  -t $(E2E_GWNODE_TAG)  .
+
+# Bring the containerlab E2E lab up: build the images, deploy the
+# topology, and seed the OVN NB DB with the canned state.
+e2e-up: e2e-images
+	containerlab deploy -t $(E2E_TOPOLOGY)
+	$(E2E_BOOTSTRAP)
+
+# Tear the containerlab E2E lab down.
+e2e-down:
+	containerlab destroy -t $(E2E_TOPOLOGY) --cleanup
