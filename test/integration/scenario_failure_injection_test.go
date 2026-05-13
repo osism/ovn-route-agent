@@ -190,4 +190,3 @@ func TestScenario_FailureInjection_OvsOfctlFailsOnce(t *testing.T) {
 		t.Errorf("expected forced-failure marker for ovs-ofctl in agent log; tail:\n%s", a.LogTail(40))
 	}
 }
-
