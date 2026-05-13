@@ -1,0 +1,300 @@
+package main
+
+import (
+	"fmt"
+	"regexp"
+	"strings"
+)
+
+// renderConfiguration emits docs/reference/configuration.md: a banner
+// plus one row per CLI flag with the corresponding env var, YAML key,
+// default, and description, followed by sub-tables for the YAML-only
+// PortForwardRule and PortForwardVIP structs.
+func renderConfiguration(info *sourceInfo) string {
+	var b strings.Builder
+	writeBanner(&b)
+	b.WriteString("# Configuration reference\n\n")
+	b.WriteString("Settings are loaded with the following priority (highest wins):\n\n")
+	b.WriteString("**CLI flags > environment variables > config file > defaults**\n\n")
+	b.WriteString("For task-oriented setup notes (where the config file lives, how to override\n")
+	b.WriteString("via env vars, the example config), see\n")
+	b.WriteString("[Configure the agent](../guides/configuration).\n\n")
+	b.WriteString("Every row below is derived from the corresponding Go declaration in\n")
+	b.WriteString("[`config.go`](https://github.com/osism/ovn-network-agent/blob/main/config.go);\n")
+	b.WriteString("regenerate this page with `go generate ./...`.\n\n")
+
+	b.WriteString("## Flags, environment variables and YAML keys\n\n")
+	b.WriteString("| Flag | Env Var | Config key | Default | Description |\n")
+	b.WriteString("|------|---------|------------|---------|-------------|\n")
+	for _, fl := range info.Flags {
+		fmt.Fprintf(&b, "| %s | %s | %s | %s | %s |\n",
+			mdCode("--"+fl.Name),
+			renderEnv(fl, info),
+			renderYAML(fl, info),
+			renderDefault(resolveDefault(fl, info)),
+			mdRow(fl.Usage),
+		)
+	}
+
+	// YAML-only Config fields: Config has a yaml binding (via
+	// configFile + applyFileConfig) but no CLI flag (currently:
+	// port_forwards).
+	if extra := extraYAMLOnlyRows(info); len(extra) > 0 {
+		b.WriteString("\nAdditional YAML-only keys:\n\n")
+		b.WriteString("| Config key | Type | Description |\n")
+		b.WriteString("|------------|------|-------------|\n")
+		for _, row := range extra {
+			fmt.Fprintf(&b, "| %s | %s | %s |\n", mdCode(row.key), mdCode(row.typ), mdRow(row.desc))
+		}
+	}
+
+	// PortForwardVIP and PortForwardRule cover the YAML-only nested
+	// structures driven by port_forwards.
+	for _, name := range []string{"PortForwardVIP", "PortForwardRule"} {
+		st, ok := info.Structs[name]
+		if !ok {
+			continue
+		}
+		fmt.Fprintf(&b, "\n## `%s` (YAML-only)\n\n", name)
+		b.WriteString("Nested YAML structure used inside `port_forwards`.\n\n")
+		b.WriteString("| YAML key | Type | Description |\n")
+		b.WriteString("|----------|------|-------------|\n")
+		for _, f := range st.Fields {
+			if f.YAMLTag == "" {
+				continue
+			}
+			desc := f.Comment
+			if desc == "" {
+				desc = "—"
+			}
+			fmt.Fprintf(&b, "| %s | %s | %s |\n", mdCode(f.YAMLTag), mdCode(f.Type), mdRow(desc))
+		}
+	}
+
+	return b.String()
+}
+
+func renderEnv(fl flagInfo, info *sourceInfo) string {
+	if fl.ConfigField != "" {
+		if v, ok := info.EnvByField[fl.ConfigField]; ok {
+			return mdCode(v)
+		}
+	}
+	if fl.ImplicitEnv != "" {
+		return mdCode(fl.ImplicitEnv)
+	}
+	return "—"
+}
+
+func renderYAML(fl flagInfo, info *sourceInfo) string {
+	if fl.ConfigField == "" {
+		return "—"
+	}
+	if v, ok := info.YAMLByField[fl.ConfigField]; ok {
+		return mdCode(v)
+	}
+	return "—"
+}
+
+// renderCLI emits docs/reference/cli.md: a banner, a brief intro, and
+// one row per CLI flag with its default and usage string.
+func renderCLI(info *sourceInfo) string {
+	var b strings.Builder
+	writeBanner(&b)
+	b.WriteString("# Command-line flags\n\n")
+	b.WriteString("Every command-line flag accepted by `ovn-network-agent`. Most flags also\n")
+	b.WriteString("have an environment variable and YAML equivalent — see the\n")
+	b.WriteString("[configuration reference](configuration) for the cross-reference table.\n\n")
+	b.WriteString("This page is generated from the `flag.FlagSet` declared in\n")
+	b.WriteString("[`config.go`](https://github.com/osism/ovn-network-agent/blob/main/config.go);\n")
+	b.WriteString("regenerate it with `go generate ./...`.\n\n")
+	b.WriteString("| Flag | Default | Description |\n")
+	b.WriteString("|------|---------|-------------|\n")
+	for _, fl := range info.Flags {
+		fmt.Fprintf(&b, "| %s | %s | %s |\n",
+			mdCode("--"+fl.Name),
+			renderDefault(resolveDefault(fl, info)),
+			mdRow(fl.Usage),
+		)
+	}
+	return b.String()
+}
+
+// renderMetrics emits docs/reference/metrics.md: a banner, the
+// hand-written intro and alert suggestions, and the auto-generated
+// metrics table sourced from metrics.go.
+func renderMetrics(info *sourceInfo) string {
+	var b strings.Builder
+	writeBanner(&b)
+	b.WriteString("# Metrics\n\n")
+	b.WriteString("The agent can expose Prometheus-formatted metrics on an optional HTTP\n")
+	b.WriteString("endpoint. Enable it by setting `--metrics-listen` (or\n")
+	b.WriteString("`OVN_NETWORK_METRICS_LISTEN` / `metrics_listen`) to a `host:port` such as\n")
+	b.WriteString("`127.0.0.1:9273`. The endpoint is **off by default**; bind to `127.0.0.1` for\n")
+	b.WriteString("node-local scraping, or to `0.0.0.0` for a remote scraper.\n\n")
+	b.WriteString("```bash\n")
+	b.WriteString("ovn-network-agent --metrics-listen 127.0.0.1:9273\n")
+	b.WriteString("curl -s http://127.0.0.1:9273/metrics\n")
+	b.WriteString("```\n\n")
+	b.WriteString("Two paths are served:\n\n")
+	b.WriteString("- `/metrics` — Prometheus exposition format\n")
+	b.WriteString("- `/healthz` — returns `200 ok` for liveness probes\n\n")
+	if info.Namespace != "" {
+		fmt.Fprintf(&b, "All metrics are prefixed with `%s_`. The table below is generated from the\n", info.Namespace)
+	} else {
+		b.WriteString("The table below is generated from the\n")
+	}
+	b.WriteString("`prometheus.New*` constructors in\n")
+	b.WriteString("[`metrics.go`](https://github.com/osism/ovn-network-agent/blob/main/metrics.go);\n")
+	b.WriteString("regenerate it with `go generate ./...`.\n\n")
+
+	b.WriteString("| Metric | Type | Labels | Description |\n")
+	b.WriteString("|--------|------|--------|-------------|\n")
+	for _, m := range info.Metrics {
+		labels := "—"
+		if len(m.Labels) > 0 {
+			parts := make([]string, len(m.Labels))
+			for i, l := range m.Labels {
+				parts[i] = mdCode(l)
+			}
+			labels = strings.Join(parts, ", ")
+		}
+		typ := m.Kind
+		if m.IsVec {
+			typ = m.Kind + " (vec)"
+		}
+		fmt.Fprintf(&b, "| %s | %s | %s | %s |\n",
+			mdCode(m.FullName),
+			typ,
+			labels,
+			mdRow(m.Help),
+		)
+	}
+
+	b.WriteString("\n## Suggested alerts\n\n")
+	b.WriteString("- `consecutive_readds >= 3` — persistent route instability (FRR or kernel\n")
+	b.WriteString("  races).\n")
+	b.WriteString("- `ovn_connection_state{database=\"nb\"} == 0` for >2m — NB DB unreachable;\n")
+	b.WriteString("  agent cannot write OVN state.\n")
+	b.WriteString("- `rate(route_readds_total[10m]) > 0` — flapping routes.\n")
+	b.WriteString("- `histogram_quantile(0.95, rate(reconcile_duration_seconds_bucket[5m])) > 5`\n")
+	b.WriteString("  — slow reconciles.\n")
+
+	return b.String()
+}
+
+// resolveDefault picks the effective default for a flag: the Config
+// composite-literal value (highest signal) wins over the literal
+// default supplied to fs.<Kind>(...).
+func resolveDefault(fl flagInfo, info *sourceInfo) string {
+	if fl.ConfigField != "" {
+		if v, ok := info.DefaultByField[fl.ConfigField]; ok && v != "" {
+			return v
+		}
+	}
+	return fl.Default
+}
+
+// renderDefault formats a Go literal as a Markdown cell. We
+// special-case `time.Duration` arithmetic and bare string literals
+// because those are the dominant shapes in this codebase; the rest
+// is passed through verbatim.
+func renderDefault(raw string) string {
+	raw = strings.TrimSpace(raw)
+	if raw == "" || raw == `""` {
+		return ""
+	}
+	if dur, ok := durationLiteral(raw); ok {
+		return mdCode(dur)
+	}
+	// String literals: drop surrounding quotes if balanced.
+	if len(raw) >= 2 && raw[0] == '"' && raw[len(raw)-1] == '"' {
+		return mdCode(raw[1 : len(raw)-1])
+	}
+	return mdCode(raw)
+}
+
+var durationPattern = regexp.MustCompile(`^(\d+)\s*\*\s*time\.(Nanosecond|Microsecond|Millisecond|Second|Minute|Hour)$`)
+
+// durationLiteral converts compound Go time expressions like
+// `60 * time.Second` into the human-readable form `60s`.
+func durationLiteral(raw string) (string, bool) {
+	m := durationPattern.FindStringSubmatch(raw)
+	if m == nil {
+		return "", false
+	}
+	suffix := map[string]string{
+		"Nanosecond":  "ns",
+		"Microsecond": "us",
+		"Millisecond": "ms",
+		"Second":      "s",
+		"Minute":      "m",
+		"Hour":        "h",
+	}[m[2]]
+	return m[1] + suffix, true
+}
+
+// extraYAMLOnlyRow describes a Config field that ships a YAML key on
+// configFile but has no CLI flag (currently port_forwards).
+type extraYAMLOnlyRow struct {
+	key  string
+	typ  string
+	desc string
+}
+
+func extraYAMLOnlyRows(info *sourceInfo) []extraYAMLOnlyRow {
+	cf, ok := info.Structs["configFile"]
+	if !ok {
+		return nil
+	}
+	var rows []extraYAMLOnlyRow
+	for _, f := range cf.Fields {
+		if f.YAMLTag == "" {
+			continue
+		}
+		// Skip keys already covered by a flag row.
+		if hasFlagForYAML(info, f.YAMLTag) {
+			continue
+		}
+		row := extraYAMLOnlyRow{
+			key:  f.YAMLTag,
+			typ:  f.Type,
+			desc: f.Comment,
+		}
+		if row.desc == "" {
+			row.desc = "See sample config for usage."
+		}
+		rows = append(rows, row)
+	}
+	return rows
+}
+
+func hasFlagForYAML(info *sourceInfo, yamlKey string) bool {
+	for _, fl := range info.Flags {
+		if fl.ConfigField == "" {
+			continue
+		}
+		if info.YAMLByField[fl.ConfigField] == yamlKey {
+			return true
+		}
+	}
+	return false
+}
+
+// mdCode wraps a value in backticks for Markdown.
+func mdCode(s string) string {
+	return "`" + s + "`"
+}
+
+// mdRow escapes the few characters that would break a Markdown table
+// row.
+func mdRow(s string) string {
+	s = strings.ReplaceAll(s, "|", `\|`)
+	s = strings.ReplaceAll(s, "\n", " ")
+	return strings.TrimSpace(s)
+}
+
+func writeBanner(b *strings.Builder) {
+	b.WriteString(banner)
+	b.WriteString("\n\n")
+}
