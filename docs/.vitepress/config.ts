@@ -40,6 +40,7 @@ export default defineConfig({
         text: 'Reference',
         items: [
           { text: 'Configuration', link: '/reference/configuration' },
+          { text: 'Command-line flags', link: '/reference/cli' },
           { text: 'Metrics', link: '/reference/metrics' },
         ],
       },
