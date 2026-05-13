@@ -31,6 +31,12 @@ type fakeOVSDBClient struct {
 	transactErr error
 	listErr     error
 
+	// opResults, when non-nil, is returned by Transact instead of the
+	// default zero-result slice. Tests use this to simulate per-operation
+	// OVSDB errors (e.g. constraint violations) that callers must detect
+	// via ovsdb.CheckOperationResults.
+	opResults []ovsdb.OperationResult
+
 	// onTransact is invoked synchronously for each Transact call (after the
 	// op has been recorded). Used by drain tests to mutate rows mid-poll so
 	// countLocalCRPorts can converge.
@@ -177,6 +183,9 @@ func (f *fakeOVSDBClient) Transact(_ context.Context, ops ...ovsdb.Operation) ([
 	}
 	if f.transactErr != nil {
 		return nil, f.transactErr
+	}
+	if f.opResults != nil {
+		return f.opResults, nil
 	}
 	results := make([]ovsdb.OperationResult, len(ops))
 	return results, nil

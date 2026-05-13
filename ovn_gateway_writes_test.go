@@ -4,6 +4,7 @@ import (
 	"context"
 	"errors"
 	"fmt"
+	"reflect"
 	"testing"
 	"time"
 
@@ -875,8 +876,106 @@ func TestRestoreDrainedGateways_ListErrorIsLoggedNotPanicking(t *testing.T) {
 }
 
 // =============================================================================
+// ListManagedRouteChassis
+// =============================================================================
+
+func TestListManagedRouteChassis_CollectsTaggedChassis(t *testing.T) {
+	c, nb, _ := newOVNClientWithFakes(t, "host-a")
+	nb.setRows("Logical_Router_Static_Route",
+		// Two managed entries, different chassis.
+		&NBLogicalRouterStaticRoute{
+			UUID:     "r1",
+			IPPrefix: "0.0.0.0/0",
+			ExternalIDs: map[string]string{
+				"ovn-network-agent":         "managed",
+				"ovn-network-agent-chassis": "host-a",
+			},
+		},
+		&NBLogicalRouterStaticRoute{
+			UUID:     "r2",
+			IPPrefix: "0.0.0.0/0",
+			ExternalIDs: map[string]string{
+				"ovn-network-agent":         "managed",
+				"ovn-network-agent-chassis": "host-b",
+			},
+		},
+		// Duplicate chassis tag — should dedupe in the result.
+		&NBLogicalRouterStaticRoute{
+			UUID:     "r3",
+			IPPrefix: "0.0.0.0/0",
+			ExternalIDs: map[string]string{
+				"ovn-network-agent":         "managed",
+				"ovn-network-agent-chassis": "host-a",
+			},
+		},
+		// Managed but with an empty chassis tag — must be skipped.
+		&NBLogicalRouterStaticRoute{
+			UUID:     "r4",
+			IPPrefix: "0.0.0.0/0",
+			ExternalIDs: map[string]string{
+				"ovn-network-agent":         "managed",
+				"ovn-network-agent-chassis": "",
+			},
+		},
+		// Unmanaged route with a chassis tag — must be skipped.
+		&NBLogicalRouterStaticRoute{
+			UUID:     "r5",
+			IPPrefix: "10.0.0.0/8",
+			ExternalIDs: map[string]string{
+				"ovn-network-agent-chassis": "host-c",
+			},
+		},
+		// Route with nil ExternalIDs.
+		&NBLogicalRouterStaticRoute{
+			UUID:     "r6",
+			IPPrefix: "192.0.2.0/24",
+		},
+	)
+
+	got := c.ListManagedRouteChassis(context.Background())
+	want := map[string]bool{"host-a": true, "host-b": true}
+	if !reflect.DeepEqual(got, want) {
+		t.Errorf("ListManagedRouteChassis() = %v, want %v", got, want)
+	}
+}
+
+func TestListManagedRouteChassis_EmptyOnNoRoutes(t *testing.T) {
+	c, _, _ := newOVNClientWithFakes(t, "host-a")
+	got := c.ListManagedRouteChassis(context.Background())
+	if len(got) != 0 {
+		t.Errorf("expected empty result on no routes, got %v", got)
+	}
+}
+
+func TestListManagedRouteChassis_ListErrorReturnsNil(t *testing.T) {
+	c, nb, _ := newOVNClientWithFakes(t, "host-a")
+	nb.listErr = errors.New("connection refused")
+	if got := c.ListManagedRouteChassis(context.Background()); got != nil {
+		t.Errorf("expected nil on list error, got %v", got)
+	}
+}
+
+// =============================================================================
 // transactOps error propagation (sanity check on the shared helper)
 // =============================================================================
+
+// TestTransactOpsSurfacesPerOperationErrors verifies the second error path
+// in transactOps: when libovsdb's CheckOperationResults returns errors for
+// individual operations, the helper returns the joined error so callers
+// detect constraint violations even though Transact() succeeded.
+func TestTransactOpsSurfacesPerOperationErrors(t *testing.T) {
+	c, nb, _ := newOVNClientWithFakes(t, "host-a")
+	// Patch the fake to return an OperationResult with an Error string so
+	// ovsdb.CheckOperationResults flags it.
+	nb.opResults = []ovsdb.OperationResult{{Error: "constraint violation", Details: "duplicate row"}}
+
+	err := c.transactOps(context.Background(), []ovsdb.Operation{
+		{Op: ovsdb.OperationInsert, Table: "Logical_Router_Static_Route"},
+	})
+	if err == nil {
+		t.Fatal("expected error when CheckOperationResults reports a per-op error")
+	}
+}
 
 func TestTransactOpsPropagatesTransportError(t *testing.T) {
 	c, nb, _ := newOVNClientWithFakes(t, "host-a")
