@@ -19,7 +19,24 @@ test/integration/
   scenario_network_cidrs_test.go   — manual network_cidr override vs. auto-discovery, empty-filter sweep
   scenario_port_forward_test.go    — DNAT, sticky multi-backend, VIP mgmt, masquerade, hairpin
   scenario_metrics_test.go         — Prometheus /metrics scrapes (reconcile counter, drain outcome, stale-chassis, desired-state gauges)
-  testenv/                         — Setup, Teardown, RunAgent, MakeLocalRouter, Assert*, ScrapeMetrics, …
+  scenario_failure_injection_test.go         — mid-cycle vtysh/nft/ovs-ofctl failures + self-heal (#88 item 1)
+  scenario_route_tables_test.go              — non-overlapping route_table_id / port_forward_table_id / veth_leak_table_id (#88 item 2)
+  scenario_cleanup_no_drain_test.go          — RemoveManagedNBEntries with drain_on_shutdown=false (#88 item 3)
+  scenario_router_masquerade_ordering_test.go — router_masquerade configured before SNAT NAT exists (#88 item 4)
+  scenario_same_batch_fip_test.go            — single OVSDB transaction adds + removes FIPs (#88 item 5)
+  scenario_partial_failure_retry_test.go     — FRR write fails, kernel untouched, only FRR re-added (#88 item 6)
+  testenv/                         — Setup, Teardown, RunAgent, MakeLocalRouter, Assert*, ScrapeMetrics, WithFailingTool, …
+```
+
+The failure-injection scenarios all share the `TestScenario_FailureInjection_`
+prefix so they can be targeted as a group, e.g. for the flake-resistance
+check from issue #88:
+
+```sh
+sudo OVN_AGENT_BINARY=$PWD/ovn-network-agent \
+    go test -tags=integration -v -count=10 \
+            -run TestScenario_FailureInjection_ \
+            ./test/integration/...
 ```
 
 Port-forward scenarios additionally rely on:
