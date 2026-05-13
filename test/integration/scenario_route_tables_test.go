@@ -48,12 +48,12 @@ func TestScenario_FailureInjection_RouteTableCollisions(t *testing.T) {
 	})
 
 	const (
-		fipExternal     = "198.51.100.42"
-		pfVIP           = "198.51.100.71"
-		providerNet     = "198.51.100.0/24"
-		routeTable      = 200
-		portForwardTbl  = 201
-		vethLeakTbl     = 202
+		fipExternal    = "198.51.100.42"
+		pfVIP          = "198.51.100.71"
+		providerNet    = "198.51.100.0/24"
+		routeTable     = 200
+		portForwardTbl = 201
+		vethLeakTbl    = 202
 	)
 	testenv.AddFIP(t, ctx, nb, router, fipExternal, "10.0.0.42")
 
