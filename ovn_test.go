@@ -2,12 +2,15 @@ package main
 
 import (
 	"context"
+	"errors"
 	"net"
 	"reflect"
 	"sync"
 	"sync/atomic"
 	"testing"
 	"time"
+
+	"github.com/ovn-kubernetes/libovsdb/model"
 )
 
 func TestOvsdbEndpoints(t *testing.T) {
@@ -298,6 +301,71 @@ func TestCloseClients_OnlySBSet(t *testing.T) {
 	}
 }
 
+// TestCloseWithoutLoopDone verifies that Close() does not block waiting for
+// a refresh loop that was never started. closeClients() is still invoked so
+// the OVSDB clients are released.
+func TestCloseWithoutLoopDone(t *testing.T) {
+	c, nb, sb := newOVNClientWithFakes(t, "host-a")
+	sbCounter := &closeCountingClient{fakeOVSDBClient: sb}
+	nbCounter := &closeCountingClient{fakeOVSDBClient: nb}
+	c.sbClient = sbCounter
+	c.nbClient = nbCounter
+	c.ready.Store(true)
+
+	done := make(chan struct{})
+	go func() {
+		c.Close()
+		close(done)
+	}()
+	select {
+	case <-done:
+	case <-time.After(time.Second):
+		t.Fatal("Close blocked even though loopDone is nil")
+	}
+	if c.ready.Load() {
+		t.Error("Close should mark ready=false")
+	}
+	if sbCounter.closes != 1 || nbCounter.closes != 1 {
+		t.Errorf("Close should call Close() on each client once, got sb=%d nb=%d",
+			sbCounter.closes, nbCounter.closes)
+	}
+}
+
+// TestCloseWaitsForLoopDone verifies that Close() blocks until the refresh
+// loop has signalled completion by closing loopDone, then tears down clients.
+func TestCloseWaitsForLoopDone(t *testing.T) {
+	c, nb, sb := newOVNClientWithFakes(t, "host-a")
+	sbCounter := &closeCountingClient{fakeOVSDBClient: sb}
+	nbCounter := &closeCountingClient{fakeOVSDBClient: nb}
+	c.sbClient = sbCounter
+	c.nbClient = nbCounter
+	c.loopDone = make(chan struct{})
+
+	closeDone := make(chan struct{})
+	go func() {
+		c.Close()
+		close(closeDone)
+	}()
+
+	// Close must still be blocked because loopDone is open.
+	select {
+	case <-closeDone:
+		t.Fatal("Close returned before loopDone was closed")
+	case <-time.After(100 * time.Millisecond):
+	}
+
+	close(c.loopDone)
+	select {
+	case <-closeDone:
+	case <-time.After(time.Second):
+		t.Fatal("Close did not return after loopDone closed")
+	}
+	if sbCounter.closes != 1 || nbCounter.closes != 1 {
+		t.Errorf("expected one Close() per client, got sb=%d nb=%d",
+			sbCounter.closes, nbCounter.closes)
+	}
+}
+
 func TestCloseClients_Idempotent(t *testing.T) {
 	// Both Connect()'s defer and a later explicit Close() can run on the
 	// same OVNClient. Calling closeClients() twice must be safe.
@@ -428,6 +496,471 @@ func TestImmediateStateRefreshCoalesces(t *testing.T) {
 	n := refreshCount.Load()
 	if n < 1 || n > 2 {
 		t.Errorf("expected 1 or 2 refresh passes, got %d", n)
+	}
+}
+
+// TestIsChassisRedirect covers the SB event-handler's port-binding filter.
+// It returns true only for SB Port_Binding rows whose Type == "chassisredirect".
+func TestIsChassisRedirect(t *testing.T) {
+	c, _, _ := newOVNClientWithFakes(t, "host-a")
+	h := &sbEventHandler{ovn: c}
+
+	tests := []struct {
+		name  string
+		table string
+		model model.Model
+		want  bool
+	}{
+		{
+			"port binding with chassisredirect type",
+			"Port_Binding",
+			&SBPortBinding{Type: "chassisredirect", LogicalPort: "cr-lrp-abc"},
+			true,
+		},
+		{
+			"port binding with patch type",
+			"Port_Binding",
+			&SBPortBinding{Type: "patch"},
+			false,
+		},
+		{
+			"chassis table is never a chassisredirect",
+			"Chassis",
+			&SBChassis{Name: "ch-a"},
+			false,
+		},
+		{
+			"wrong model type for Port_Binding",
+			"Port_Binding",
+			&SBChassis{Name: "ch-a"},
+			false,
+		},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			if got := h.isChassisRedirect(tt.table, tt.model); got != tt.want {
+				t.Errorf("isChassisRedirect(%q, %T) = %v, want %v",
+					tt.table, tt.model, got, tt.want)
+			}
+		})
+	}
+}
+
+// TestDrainSignalsEmptiesBothChannels verifies that drainSignals consumes a
+// pending signal on each channel without blocking when they are empty.
+func TestDrainSignalsEmptiesBothChannels(t *testing.T) {
+	c, _, _ := newOVNClientWithFakes(t, "host-a")
+
+	// Pre-fill both signal channels (cap = 1).
+	c.debounceCh <- struct{}{}
+	c.immediateCh <- struct{}{}
+	if len(c.debounceCh) != 1 || len(c.immediateCh) != 1 {
+		t.Fatalf("setup: expected both channels to hold one signal, got %d/%d",
+			len(c.debounceCh), len(c.immediateCh))
+	}
+
+	c.drainSignals()
+
+	if got := len(c.debounceCh); got != 0 {
+		t.Errorf("debounceCh len after drain = %d, want 0", got)
+	}
+	if got := len(c.immediateCh); got != 0 {
+		t.Errorf("immediateCh len after drain = %d, want 0", got)
+	}
+
+	// Calling drainSignals on empty channels must not block.
+	c.drainSignals()
+}
+
+// TestDebounceStateRefreshIgnoresNotReady verifies that signals are dropped
+// before Connect() has marked the client ready. This is the production
+// contract that prevents event handlers from triggering work on a
+// half-initialised client.
+func TestDebounceStateRefreshIgnoresNotReady(t *testing.T) {
+	c, _, _ := newOVNClientWithFakes(t, "host-a")
+	// ready defaults to false; explicit for clarity.
+	c.ready.Store(false)
+
+	c.debounceStateRefresh()
+	if got := len(c.debounceCh); got != 0 {
+		t.Errorf("debounceCh should remain empty when not ready, got len = %d", got)
+	}
+}
+
+// TestDebounceStateRefreshQueuesAndCoalesces verifies the buffered-send
+// semantics: the first call queues, subsequent calls coalesce until the
+// channel is drained.
+func TestDebounceStateRefreshQueuesAndCoalesces(t *testing.T) {
+	c, _, _ := newOVNClientWithFakes(t, "host-a")
+	c.ready.Store(true)
+
+	c.debounceStateRefresh()
+	if got := len(c.debounceCh); got != 1 {
+		t.Fatalf("expected debounceCh len = 1 after first signal, got %d", got)
+	}
+
+	// A burst of additional calls must not block: the buffered slot is full
+	// and the function takes the default branch.
+	for i := 0; i < 20; i++ {
+		c.debounceStateRefresh()
+	}
+	if got := len(c.debounceCh); got != 1 {
+		t.Errorf("debounceCh should coalesce, got len = %d, want 1", got)
+	}
+
+	// Drain and verify a fresh signal can be queued again.
+	<-c.debounceCh
+	c.debounceStateRefresh()
+	if got := len(c.debounceCh); got != 1 {
+		t.Errorf("debounceCh should accept a new signal after drain, got len = %d", got)
+	}
+}
+
+// TestSBEventHandlerOnAddImmediateForChassisRedirect verifies that a
+// chassisredirect Port_Binding add triggers the immediate refresh path,
+// bypassing debouncing.
+func TestSBEventHandlerOnAddImmediateForChassisRedirect(t *testing.T) {
+	c, _, _ := newOVNClientWithFakes(t, "host-a")
+	c.ready.Store(true)
+	h := &sbEventHandler{ovn: c}
+
+	h.OnAdd("Port_Binding", &SBPortBinding{Type: "chassisredirect"})
+	if got := len(c.immediateCh); got != 1 {
+		t.Errorf("immediateCh len = %d, want 1", got)
+	}
+	if got := len(c.debounceCh); got != 0 {
+		t.Errorf("debounceCh should be untouched, got len = %d", got)
+	}
+}
+
+// TestSBEventHandlerOnAddDebouncesForOtherTables verifies that ordinary
+// table changes (Chassis, non-chassisredirect Port_Binding) take the
+// debounced refresh path.
+func TestSBEventHandlerOnAddDebouncesForOtherTables(t *testing.T) {
+	c, _, _ := newOVNClientWithFakes(t, "host-a")
+	c.ready.Store(true)
+	h := &sbEventHandler{ovn: c}
+
+	h.OnAdd("Port_Binding", &SBPortBinding{Type: "patch"})
+	if got := len(c.debounceCh); got != 1 {
+		t.Errorf("debounceCh len after patch port add = %d, want 1", got)
+	}
+	if got := len(c.immediateCh); got != 0 {
+		t.Errorf("immediateCh should be untouched, got len = %d", got)
+	}
+
+	// Drain and try a chassis change.
+	<-c.debounceCh
+	h.OnAdd("Chassis", &SBChassis{Name: "ch-a"})
+	if got := len(c.debounceCh); got != 1 {
+		t.Errorf("debounceCh len after chassis add = %d, want 1", got)
+	}
+}
+
+func TestSBEventHandlerOnUpdateAndOnDelete(t *testing.T) {
+	c, _, _ := newOVNClientWithFakes(t, "host-a")
+	c.ready.Store(true)
+	h := &sbEventHandler{ovn: c}
+
+	// chassisredirect update → immediate.
+	h.OnUpdate("Port_Binding",
+		&SBPortBinding{Type: "chassisredirect"},
+		&SBPortBinding{Type: "chassisredirect"})
+	if got := len(c.immediateCh); got != 1 {
+		t.Errorf("OnUpdate(chassisredirect) immediateCh len = %d, want 1", got)
+	}
+	<-c.immediateCh
+
+	// chassisredirect delete → immediate.
+	h.OnDelete("Port_Binding", &SBPortBinding{Type: "chassisredirect"})
+	if got := len(c.immediateCh); got != 1 {
+		t.Errorf("OnDelete(chassisredirect) immediateCh len = %d, want 1", got)
+	}
+	<-c.immediateCh
+
+	// Non-chassisredirect update → debounce.
+	h.OnUpdate("Chassis", &SBChassis{Name: "ch-a"}, &SBChassis{Name: "ch-a"})
+	if got := len(c.debounceCh); got != 1 {
+		t.Errorf("OnUpdate(Chassis) debounceCh len = %d, want 1", got)
+	}
+	<-c.debounceCh
+
+	// Non-chassisredirect delete → debounce.
+	h.OnDelete("Chassis", &SBChassis{Name: "ch-a"})
+	if got := len(c.debounceCh); got != 1 {
+		t.Errorf("OnDelete(Chassis) debounceCh len = %d, want 1", got)
+	}
+}
+
+func TestSBEventHandlerHandleChangeFiltersUnrelatedTables(t *testing.T) {
+	c, _, _ := newOVNClientWithFakes(t, "host-a")
+	c.ready.Store(true)
+	h := &sbEventHandler{ovn: c}
+
+	// An unrelated SB table should not trigger any signal.
+	h.handleChange("Datapath_Binding")
+	if got := len(c.debounceCh) + len(c.immediateCh); got != 0 {
+		t.Errorf("unrelated table signalled refresh: deb=%d imm=%d",
+			len(c.debounceCh), len(c.immediateCh))
+	}
+}
+
+func TestNBEventHandlerOnlyRelevantTablesTriggerDebounce(t *testing.T) {
+	c, _, _ := newOVNClientWithFakes(t, "host-a")
+	c.ready.Store(true)
+	h := &nbEventHandler{ovn: c}
+
+	tables := []string{"NAT", "Logical_Router", "Logical_Router_Port"}
+	for _, table := range tables {
+		// Drain first so each iteration starts empty.
+		select {
+		case <-c.debounceCh:
+		default:
+		}
+		h.OnAdd(table, nil)
+		if got := len(c.debounceCh); got != 1 {
+			t.Errorf("OnAdd(%q) debounceCh len = %d, want 1", table, got)
+		}
+	}
+
+	// Drain.
+	select {
+	case <-c.debounceCh:
+	default:
+	}
+
+	// Unrelated NB table — must not signal.
+	h.OnAdd("Static_MAC_Binding", nil)
+	if got := len(c.debounceCh); got != 0 {
+		t.Errorf("OnAdd(Static_MAC_Binding) should not debounce, got len = %d", got)
+	}
+
+	// OnUpdate and OnDelete should also fan into handleChange.
+	h.OnUpdate("NAT", nil, nil)
+	if got := len(c.debounceCh); got != 1 {
+		t.Errorf("OnUpdate(NAT) debounceCh len = %d, want 1", got)
+	}
+	<-c.debounceCh
+	h.OnDelete("Logical_Router_Port", nil)
+	if got := len(c.debounceCh); got != 1 {
+		t.Errorf("OnDelete(Logical_Router_Port) debounceCh len = %d, want 1", got)
+	}
+}
+
+// TestRefreshStatePopulatesLocalRoutersAndNATs exercises the bulk of
+// refreshState end-to-end with fake clients. It verifies that the mapping
+// chain (SB chassisredirect → NB LRP → NB router → NB NAT) produces the
+// expected derived state for a chassis with one locally-active router.
+func TestRefreshStatePopulatesLocalRoutersAndNATs(t *testing.T) {
+	c, nb, sb := newOVNClientWithFakes(t, "host-a")
+
+	sb.setRows("Chassis",
+		&SBChassis{UUID: "ch-a", Name: "ch-a", Hostname: "host-a"},
+		&SBChassis{UUID: "ch-b", Name: "ch-b", Hostname: "host-b"},
+	)
+
+	chA := "ch-a"
+	chB := "ch-b"
+	sb.setRows("Port_Binding",
+		// Local chassisredirect — counts.
+		&SBPortBinding{
+			UUID:        "pb-1",
+			LogicalPort: "cr-lrp-local",
+			Type:        "chassisredirect",
+			Chassis:     &chA,
+		},
+		// Remote chassisredirect — must be ignored.
+		&SBPortBinding{
+			UUID:        "pb-2",
+			LogicalPort: "cr-lrp-remote",
+			Type:        "chassisredirect",
+			Chassis:     &chB,
+		},
+		// Patch port for the gateway with NatAddresses (SB SNAT discovery path).
+		// The NAT IP is within the discovered network filter so it survives
+		// the effectiveFilters check in refreshState.
+		&SBPortBinding{
+			UUID:        "pb-3",
+			LogicalPort: "external-port",
+			Type:        "patch",
+			Options:     map[string]string{"peer": "lrp-local"},
+			ExternalIDs: map[string]string{"neutron:device_owner": "network:router_gateway"},
+			NatAddresses: []string{
+				"fa:16:3e:11:22:33 198.51.100.60 is_chassis_resident(\"cr-lrp-local\")",
+			},
+		},
+	)
+
+	nb.setRows("Logical_Router_Port",
+		&NBLogicalRouterPort{
+			UUID:     "lrp-uuid-local",
+			Name:     "lrp-local",
+			MAC:      "fa:16:3e:aa:aa:aa",
+			Networks: []string{"198.51.100.1/24"},
+		},
+		&NBLogicalRouterPort{
+			UUID:     "lrp-uuid-remote",
+			Name:     "lrp-remote",
+			MAC:      "fa:16:3e:bb:bb:bb",
+			Networks: []string{"203.0.113.1/24"},
+		},
+	)
+	nb.setRows("Logical_Router",
+		&NBLogicalRouter{
+			UUID:  "lr-local",
+			Name:  "router-local",
+			Ports: []string{"lrp-uuid-local"},
+			Nat:   []string{"nat-fip", "nat-snat"},
+		},
+		&NBLogicalRouter{
+			UUID:  "lr-remote",
+			Name:  "router-remote",
+			Ports: []string{"lrp-uuid-remote"},
+			Nat:   []string{"nat-remote"},
+		},
+	)
+	nb.setRows("NAT",
+		&NBNAT{UUID: "nat-fip", Type: "dnat_and_snat", ExternalIP: "198.51.100.50"},
+		&NBNAT{UUID: "nat-snat", Type: "snat", ExternalIP: "198.51.100.51"},
+		&NBNAT{UUID: "nat-remote", Type: "snat", ExternalIP: "203.0.113.50"},
+	)
+
+	c.state.LocalChassisName = "host-a"
+	c.refreshState(context.Background())
+
+	snap := c.GetState()
+
+	if !snap.HasLocalRouters {
+		t.Fatal("HasLocalRouters should be true")
+	}
+	if len(snap.LocalRouters) != 1 {
+		t.Fatalf("LocalRouters length = %d, want 1", len(snap.LocalRouters))
+	}
+	if snap.LocalRouters[0].RouterName != "router-local" {
+		t.Errorf("LocalRouters[0].RouterName = %q, want %q",
+			snap.LocalRouters[0].RouterName, "router-local")
+	}
+
+	// FIP and SNAT should both be present for the local router.
+	if got := snap.FIPs; len(got) != 1 || got[0] != "198.51.100.50" {
+		t.Errorf("FIPs = %v, want [198.51.100.50]", got)
+	}
+	// SB-derived SNAT (198.51.100.60) and NB-derived SNAT (198.51.100.51).
+	wantSNATs := map[string]bool{"198.51.100.51": true, "198.51.100.60": true}
+	gotSNATs := map[string]bool{}
+	for _, ip := range snap.SNATIPs {
+		gotSNATs[ip] = true
+	}
+	if !reflect.DeepEqual(gotSNATs, wantSNATs) {
+		t.Errorf("SNATIPs = %v, want %v", gotSNATs, wantSNATs)
+	}
+
+	// Discovered network from the LRP.
+	if got := snap.DiscoveredNetworks; len(got) != 1 || got[0].String() != "198.51.100.0/24" {
+		var s []string
+		for _, n := range got {
+			s = append(s, n.String())
+		}
+		t.Errorf("DiscoveredNetworks = %v, want [198.51.100.0/24]", s)
+	}
+
+	// AllChassisNames should reflect both chassis from the SB Chassis table.
+	if !snap.AllChassisNames["host-a"] || !snap.AllChassisNames["host-b"] {
+		t.Errorf("AllChassisNames = %v, missing host-a or host-b", snap.AllChassisNames)
+	}
+
+	// NATIPToRouterMAC should map both local NAT IPs to the local LRP MAC.
+	if snap.NATIPToRouterMAC["198.51.100.50"] != "fa:16:3e:aa:aa:aa" {
+		t.Errorf("NATIPToRouterMAC[FIP] = %q, want %q",
+			snap.NATIPToRouterMAC["198.51.100.50"], "fa:16:3e:aa:aa:aa")
+	}
+}
+
+func TestRefreshStateNoLocalRouters(t *testing.T) {
+	c, nb, sb := newOVNClientWithFakes(t, "host-a")
+
+	sb.setRows("Chassis", &SBChassis{UUID: "ch-b", Name: "ch-b", Hostname: "host-b"})
+	chB := "ch-b"
+	sb.setRows("Port_Binding", &SBPortBinding{
+		UUID:        "pb-remote",
+		LogicalPort: "cr-lrp-remote",
+		Type:        "chassisredirect",
+		Chassis:     &chB,
+	})
+	nb.setRows("Logical_Router_Port",
+		&NBLogicalRouterPort{UUID: "lrp-r", Name: "lrp-remote", Networks: []string{"203.0.113.1/24"}})
+	nb.setRows("Logical_Router",
+		&NBLogicalRouter{UUID: "lr-r", Name: "router-r", Ports: []string{"lrp-r"}})
+
+	c.state.LocalChassisName = "host-a"
+	c.refreshState(context.Background())
+	snap := c.GetState()
+
+	if snap.HasLocalRouters {
+		t.Errorf("HasLocalRouters should be false when no chassisredirect ports are local, got true")
+	}
+	if len(snap.LocalRouters) != 0 {
+		t.Errorf("LocalRouters length = %d, want 0", len(snap.LocalRouters))
+	}
+}
+
+// TestImmediateStateRefreshIgnoresNotReady mirrors the debounce test for the
+// immediate channel: signals received before Connect() marks ready=true must
+// be dropped silently to avoid spurious refreshes on a half-initialised
+// client.
+func TestImmediateStateRefreshIgnoresNotReady(t *testing.T) {
+	c, _, _ := newOVNClientWithFakes(t, "host-a")
+	c.ready.Store(false)
+	c.immediateStateRefresh()
+	if got := len(c.immediateCh); got != 0 {
+		t.Errorf("immediateCh should remain empty when not ready, got len = %d", got)
+	}
+}
+
+// TestRefreshLoopDebouncePath drives the loop through the full debounce →
+// refresh → onChange sequence, which is the production code path for
+// non-chassisredirect events. Existing tests cover only the immediate
+// channel; this test exercises the debounce + reconcile timers.
+func TestRefreshLoopDebouncePath(t *testing.T) {
+	c, _, _ := newOVNClientWithFakes(t, "node1")
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	c.ready.Store(true)
+
+	var refreshCount atomic.Int64
+	c.onChange = func() { refreshCount.Add(1) }
+
+	loopDone := startRefreshLoop(c, ctx)
+
+	c.debounceStateRefresh()
+
+	// Wait for debounce (500ms) + reconcile (100ms) timers to fire.
+	deadline := time.Now().Add(3 * time.Second)
+	for time.Now().Before(deadline) {
+		if refreshCount.Load() >= 1 {
+			break
+		}
+		time.Sleep(50 * time.Millisecond)
+	}
+
+	cancel()
+	<-loopDone
+
+	if got := refreshCount.Load(); got < 1 {
+		t.Errorf("expected at least one onChange after debounce, got %d", got)
+	}
+}
+
+func TestRefreshStateSBListErrorAborts(t *testing.T) {
+	c, _, sb := newOVNClientWithFakes(t, "host-a")
+	sb.listErr = errors.New("connection refused")
+
+	// Should return without panicking and without populating state.
+	c.refreshState(context.Background())
+	snap := c.GetState()
+	if snap.HasLocalRouters {
+		t.Error("HasLocalRouters should remain false on SB list error")
 	}
 }
 
