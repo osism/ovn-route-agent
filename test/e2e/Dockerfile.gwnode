@@ -1,0 +1,94 @@
+# Gateway-node image for the containerlab E2E harness.
+#
+# Bundles a single Linux container that mirrors a production gateway node:
+# Open vSwitch (userspace datapath) + ovn-controller + FRR + the
+# ovn-network-agent. The entrypoint starts the supporting daemons and then
+# execs the agent in the foreground.
+#
+# Build:
+#   docker buildx build --platform linux/amd64 \
+#       -f test/e2e/Dockerfile.gwnode -t ovn-network-agent/gwnode:e2e .
+#
+# The Dockerfile is multi-arch: the Go build stage honours TARGETARCH and
+# the runtime layer pulls multi-arch Ubuntu/OVS/OVN packages.
+
+ARG GO_VERSION=1.25
+ARG UBUNTU_VERSION=24.04
+
+# ---------------------------------------------------------------------------
+# Build stage — produce a static ovn-network-agent for the target arch.
+# ---------------------------------------------------------------------------
+FROM --platform=$BUILDPLATFORM golang:${GO_VERSION}-bookworm AS build
+
+ARG TARGETARCH
+ARG VERSION=e2e
+
+WORKDIR /src
+
+# Cache module downloads before copying the rest of the tree.
+COPY go.mod go.sum ./
+RUN go mod download
+
+COPY . .
+
+RUN CGO_ENABLED=0 GOOS=linux GOARCH=${TARGETARCH} \
+    go build -trimpath \
+        -ldflags "-s -w -X main.version=${VERSION}" \
+        -o /out/ovn-network-agent .
+
+# ---------------------------------------------------------------------------
+# Runtime stage — Ubuntu 24.04 + OVS + ovn-host + FRR + the agent.
+# ---------------------------------------------------------------------------
+FROM ubuntu:${UBUNTU_VERSION}
+
+ENV DEBIAN_FRONTEND=noninteractive
+
+# Pull OVN from the Ubuntu Cloud Archive flamingo pocket — same source the
+# integration harness uses (see test/integration/setup.sh) so the NB schema
+# matches what the agent expects.
+RUN apt-get update \
+ && apt-get install -y --no-install-recommends \
+        ca-certificates \
+        software-properties-common \
+        ubuntu-cloud-keyring \
+ && add-apt-repository -y cloud-archive:flamingo \
+ && apt-get update \
+ && apt-get install -y --no-install-recommends \
+        openvswitch-switch \
+        ovn-host \
+        frr \
+        frr-pythontools \
+        nftables \
+        iproute2 \
+        iputils-ping \
+        tcpdump \
+ && apt-get purge -y software-properties-common \
+ && apt-get autoremove -y \
+ && rm -rf /var/lib/apt/lists/* /var/cache/apt/archives/* \
+           /usr/share/doc /usr/share/man /usr/share/locale
+
+# Enable the FRR daemons the agent drives: bgpd for the upstream peer and
+# staticd for the VRF static routes the agent writes via vtysh. zebra is
+# always on. The "vrf" knob in /etc/frr/daemons gates VRF support inside
+# zebra (kernel VRF devices are still required at runtime).
+RUN sed -i \
+        -e 's/^bgpd=no/bgpd=yes/' \
+        -e 's/^staticd=no/staticd=yes/' \
+        /etc/frr/daemons \
+ && grep -q '^bgpd=yes' /etc/frr/daemons \
+ && grep -q '^staticd=yes' /etc/frr/daemons
+
+COPY --from=build /out/ovn-network-agent /usr/local/bin/ovn-network-agent
+COPY test/e2e/gwnode-entrypoint.sh /usr/local/bin/gwnode-entrypoint.sh
+COPY test/e2e/gwnode-config.yaml   /etc/ovn-network-agent/config.yaml
+RUN chmod 0755 /usr/local/bin/gwnode-entrypoint.sh \
+               /usr/local/bin/ovn-network-agent
+
+# Healthcheck per issue #44: OVS responsive + ovn-controller and the agent
+# both running.
+HEALTHCHECK --interval=10s --timeout=5s --start-period=30s --retries=5 \
+    CMD ovs-vsctl show >/dev/null 2>&1 \
+        && pgrep -x ovn-controller >/dev/null \
+        && pgrep -x ovn-network-agent >/dev/null
+
+ENTRYPOINT ["/usr/local/bin/gwnode-entrypoint.sh"]
