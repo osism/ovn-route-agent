@@ -105,6 +105,7 @@ type PortForwardVIP struct {
 	Masquerade        bool              `yaml:"masquerade"`         // SNAT forwarded traffic with outgoing interface IP
 	HairpinMasquerade bool              `yaml:"hairpin_masquerade"` // SNAT only traffic from provider networks (fixes hairpin NAT for FIPs)
 	RouterMasquerade  bool              `yaml:"router_masquerade"`  // SNAT only traffic from known router SNAT IPs (fixes hairpin NAT for instances behind a router without FIP)
+	SNATToIP          string            `yaml:"snat_to_ip"`         // explicit SNAT source IP — emits `snat to <ip>` instead of masquerade for all SNAT actions on this VIP (per-rule, hairpin, router); pick a stable IPv4 that is NOT configured on any default-VRF interface
 	Rules             []PortForwardRule `yaml:"rules"`
 }
 
@@ -443,6 +444,15 @@ func validateConfig(cfg *Config) error {
 				return fmt.Errorf("port_forwards[%d]: duplicate VIP: %q", i, pf.VIP)
 			}
 			seenVIPs[pf.VIP] = true
+			if pf.SNATToIP != "" {
+				snatIP := net.ParseIP(pf.SNATToIP)
+				if snatIP == nil {
+					return fmt.Errorf("port_forwards[%d] (vip=%s): invalid snat_to_ip: %q", i, pf.VIP, pf.SNATToIP)
+				}
+				if snatIP.To4() == nil {
+					return fmt.Errorf("port_forwards[%d] (vip=%s): IPv6 snat_to_ip not supported: %q (only IPv4)", i, pf.VIP, pf.SNATToIP)
+				}
+			}
 			if len(pf.Rules) == 0 {
 				return fmt.Errorf("port_forwards[%d] (vip=%s): no rules defined", i, pf.VIP)
 			}

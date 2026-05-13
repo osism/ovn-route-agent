@@ -86,10 +86,18 @@ func buildNftRuleset(forwards []PortForwardVIP, providerNetworks []*net.IPNet, s
 	// be masqueraded (the reply originates locally and is handled by the
 	// output chains), while remote backends MUST be masqueraded so their
 	// replies return to this node for reverse NAT.
+	//
+	// snatTo, when non-empty, replaces `masquerade` with `snat to <snatTo>`
+	// for this backend. This is the all-in-one fix from issue #101: a
+	// per-VIP `snat_to_ip` overrides the default masquerade so the SNAT
+	// source is a stable non-local address (e.g. in the provider VRF)
+	// instead of the egress-interface IP picked by masquerade — which on
+	// an all-in-one node is local and traps the reply in LOCAL_IN.
 	type snatEntry struct {
-		addr  string // backend dest address (post-DNAT)
-		proto string
-		port  int // backend dest port (post-DNAT)
+		addr   string // backend dest address (post-DNAT)
+		proto  string
+		port   int    // backend dest port (post-DNAT)
+		snatTo string // explicit SNAT source IP (empty = masquerade)
 	}
 	var snatEntries []snatEntry
 	for _, pf := range forwards {
@@ -107,9 +115,10 @@ func buildNftRuleset(forwards []PortForwardVIP, providerNetworks []*net.IPNet, s
 			}
 			for _, addr := range addrs {
 				snatEntries = append(snatEntries, snatEntry{
-					addr:  addr,
-					proto: r.Proto,
-					port:  destPort,
+					addr:   addr,
+					proto:  r.Proto,
+					port:   destPort,
+					snatTo: pf.SNATToIP,
 				})
 			}
 		}
@@ -122,10 +131,16 @@ func buildNftRuleset(forwards []PortForwardVIP, providerNetworks []*net.IPNet, s
 	// Unlike the VIP-level masquerade (which masquerades all traffic), this
 	// is source-selective: only packets whose source is within a provider
 	// network are masqueraded.
-	var hairpinVIPs []string
+	//
+	// Each entry carries the VIP's snat_to_ip (empty = use masquerade).
+	type masqVIP struct {
+		vip    string
+		snatTo string
+	}
+	var hairpinVIPs []masqVIP
 	for _, pf := range forwards {
 		if pf.HairpinMasquerade {
-			hairpinVIPs = append(hairpinVIPs, pf.VIP)
+			hairpinVIPs = append(hairpinVIPs, masqVIP{vip: pf.VIP, snatTo: pf.SNATToIP})
 		}
 	}
 
@@ -139,10 +154,10 @@ func buildNftRuleset(forwards []PortForwardVIP, providerNetworks []*net.IPNet, s
 	// Unlike hairpin_masquerade (which uses the full provider CIDR), this is
 	// more surgical: only the specific known SNAT IPs are masqueraded, leaving
 	// all other external clients' IPs fully preserved.
-	var routerMasqVIPs []string
+	var routerMasqVIPs []masqVIP
 	for _, pf := range forwards {
 		if pf.RouterMasquerade {
-			routerMasqVIPs = append(routerMasqVIPs, pf.VIP)
+			routerMasqVIPs = append(routerMasqVIPs, masqVIP{vip: pf.VIP, snatTo: pf.SNATToIP})
 		}
 	}
 
@@ -324,12 +339,22 @@ func buildNftRuleset(forwards []PortForwardVIP, providerNetworks []*net.IPNet, s
 	//    masqueraded, leaving external clients' IPs fully preserved.
 	hairpinNeeded := len(hairpinVIPs) > 0 && len(providerNetworks) > 0
 	routerMasqNeeded := len(routerMasqVIPs) > 0 && len(snatIPs) > 0
+	// snatAction returns the nft statement that performs SNAT: either
+	// `masquerade` (let the kernel pick the egress IP) or `snat to <ip>`
+	// when the VIP specifies an explicit non-local SNAT source. See the
+	// snat_to_ip field on PortForwardVIP and issue #101.
+	snatAction := func(snatTo string) string {
+		if snatTo != "" {
+			return "snat to " + snatTo
+		}
+		return "masquerade"
+	}
 	if len(snatEntries) > 0 || hairpinNeeded || routerMasqNeeded {
 		b.WriteString("    chain postrouting_snat {\n")
 		b.WriteString("        type nat hook postrouting priority srcnat; policy accept;\n")
 		for _, e := range snatEntries {
-			fmt.Fprintf(&b, "        ip daddr %s %s dport %d ct status dnat masquerade\n",
-				e.addr, e.proto, e.port)
+			fmt.Fprintf(&b, "        ip daddr %s %s dport %d ct status dnat %s\n",
+				e.addr, e.proto, e.port, snatAction(e.snatTo))
 		}
 		if hairpinNeeded {
 			nets := make([]string, len(providerNetworks))
@@ -342,9 +367,9 @@ func buildNftRuleset(forwards []PortForwardVIP, providerNetworks []*net.IPNet, s
 			} else {
 				srcMatch = "{ " + strings.Join(nets, ", ") + " }"
 			}
-			for _, vip := range hairpinVIPs {
-				fmt.Fprintf(&b, "        ip saddr %s ct original daddr %s ct status dnat masquerade\n",
-					srcMatch, vip)
+			for _, v := range hairpinVIPs {
+				fmt.Fprintf(&b, "        ip saddr %s ct original daddr %s ct status dnat %s\n",
+					srcMatch, v.vip, snatAction(v.snatTo))
 			}
 		}
 		if routerMasqNeeded {
@@ -357,9 +382,9 @@ func buildNftRuleset(forwards []PortForwardVIP, providerNetworks []*net.IPNet, s
 			} else {
 				srcMatch = "{ " + strings.Join(sortedSNATIPs, ", ") + " }"
 			}
-			for _, vip := range routerMasqVIPs {
-				fmt.Fprintf(&b, "        ip saddr %s ct original daddr %s ct status dnat masquerade\n",
-					srcMatch, vip)
+			for _, v := range routerMasqVIPs {
+				fmt.Fprintf(&b, "        ip saddr %s ct original daddr %s ct status dnat %s\n",
+					srcMatch, v.vip, snatAction(v.snatTo))
 			}
 		}
 		b.WriteString("    }\n")

@@ -1022,6 +1022,40 @@ port_forwards:
 	}
 }
 
+// TestPortForwardSNATToIPParsing pins the YAML key for the issue #101 fix.
+// A typo here would silently fall back to masquerade and reintroduce the
+// all-in-one regression, so we assert the value reaches PortForwardVIP.
+func TestPortForwardSNATToIPParsing(t *testing.T) {
+	content := `
+ovn_sb_remote: "tcp:10.0.0.1:6642"
+ovn_nb_remote: "tcp:10.0.0.1:6641"
+port_forwards:
+  - vip: "198.51.100.10"
+    manage_vip: true
+    masquerade: true
+    snat_to_ip: "169.254.0.2"
+    rules:
+      - proto: tcp
+        port: 443
+        dest_addr: "10.0.0.100"
+`
+	path := filepath.Join(t.TempDir(), "config.yaml")
+	if err := os.WriteFile(path, []byte(content), 0644); err != nil {
+		t.Fatalf("write test config: %v", err)
+	}
+
+	cfg, err := loadConfig([]string{"--config", path})
+	if err != nil {
+		t.Fatalf("loadConfig() error: %v", err)
+	}
+	if len(cfg.PortForwards) != 1 {
+		t.Fatalf("len(PortForwards) = %d, want 1", len(cfg.PortForwards))
+	}
+	if got, want := cfg.PortForwards[0].SNATToIP, "169.254.0.2"; got != want {
+		t.Errorf("SNATToIP = %q, want %q", got, want)
+	}
+}
+
 func TestPortForwardValidation(t *testing.T) {
 	base := func() Config {
 		return Config{
@@ -1204,6 +1238,30 @@ func TestPortForwardValidation(t *testing.T) {
 		cfg.PortForwardTableID = 201
 		if err := validateConfig(&cfg); err == nil {
 			t.Error("expected error: veth_leak_table_id 254 (main) must not coexist with route_table_id 0 (main alias)")
+		}
+	})
+
+	t.Run("snat_to_ip_valid", func(t *testing.T) {
+		cfg := base()
+		cfg.PortForwards[0].SNATToIP = "169.254.0.2"
+		if err := validateConfig(&cfg); err != nil {
+			t.Errorf("unexpected error for valid snat_to_ip: %v", err)
+		}
+	})
+
+	t.Run("snat_to_ip_invalid", func(t *testing.T) {
+		cfg := base()
+		cfg.PortForwards[0].SNATToIP = "not-an-ip"
+		if err := validateConfig(&cfg); err == nil {
+			t.Error("expected error for invalid snat_to_ip")
+		}
+	})
+
+	t.Run("snat_to_ip_ipv6_rejected", func(t *testing.T) {
+		cfg := base()
+		cfg.PortForwards[0].SNATToIP = "2001:db8::1"
+		if err := validateConfig(&cfg); err == nil {
+			t.Error("expected error for IPv6 snat_to_ip")
 		}
 	})
 }

@@ -65,6 +65,7 @@ Nested YAML structure used inside `port_forwards`.
 | `masquerade` | `bool` | SNAT forwarded traffic with outgoing interface IP |
 | `hairpin_masquerade` | `bool` | SNAT only traffic from provider networks (fixes hairpin NAT for FIPs) |
 | `router_masquerade` | `bool` | SNAT only traffic from known router SNAT IPs (fixes hairpin NAT for instances behind a router without FIP) |
+| `snat_to_ip` | `string` | explicit SNAT source IP — emits `snat to <ip>` instead of masquerade for all SNAT actions on this VIP (per-rule, hairpin, router); pick a stable IPv4 that is NOT configured on any default-VRF interface |
 | `rules` | `[]PortForwardRule` | — |
 
 ## `PortForwardRule` (YAML-only)

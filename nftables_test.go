@@ -751,6 +751,149 @@ func TestBuildNftRulesetRouterMasqueradeDoesNotAffectOtherVIPs(t *testing.T) {
 	}
 }
 
+// TestBuildNftRulesetSNATToIPPerRule covers the fix for issue #101: when a
+// VIP sets snat_to_ip, per-rule masquerade emits `snat to <ip>` instead of
+// `masquerade`. The default-IP case (no snat_to_ip) keeps `masquerade` —
+// asserting both shapes in the same chain pins the conditional behaviour.
+func TestBuildNftRulesetSNATToIPPerRule(t *testing.T) {
+	forwards := []PortForwardVIP{
+		{
+			VIP:        "198.51.100.10",
+			Masquerade: true,
+			SNATToIP:   "169.254.0.2",
+			Rules: []PortForwardRule{
+				{Proto: "tcp", Port: 443, DestAddr: "10.0.0.100"},
+			},
+		},
+		{
+			// Second VIP without snat_to_ip — must keep masquerade
+			// so existing deployments are unaffected by the new flag.
+			VIP:        "198.51.100.20",
+			Masquerade: true,
+			Rules: []PortForwardRule{
+				{Proto: "tcp", Port: 80, DestAddr: "10.0.0.200"},
+			},
+		},
+	}
+
+	result := buildNftRuleset(forwards, nil, nil, dnatCTZoneDefault)
+	snat := extractChain(result, "postrouting_snat")
+	if snat == "" {
+		t.Fatal("missing postrouting_snat chain")
+	}
+
+	if !strings.Contains(snat, "ip daddr 10.0.0.100 tcp dport 443 ct status dnat snat to 169.254.0.2") {
+		t.Errorf("expected `snat to` for VIP with snat_to_ip set, got:\n%s", snat)
+	}
+	if !strings.Contains(snat, "ip daddr 10.0.0.200 tcp dport 80 ct status dnat masquerade") {
+		t.Errorf("expected `masquerade` for VIP without snat_to_ip, got:\n%s", snat)
+	}
+	// Defensive: the VIP-with-snat_to_ip rule must NOT emit `masquerade`.
+	if strings.Contains(snat, "ip daddr 10.0.0.100 tcp dport 443 ct status dnat masquerade") {
+		t.Errorf("VIP with snat_to_ip must not emit masquerade for its backend, got:\n%s", snat)
+	}
+}
+
+// TestBuildNftRulesetSNATToIPHairpin covers issue #101 for hairpin masquerade:
+// hairpin_masquerade with snat_to_ip set must emit `snat to <ip>` instead of
+// `masquerade`, so the post-un-DNAT destination on the reply is non-local.
+func TestBuildNftRulesetSNATToIPHairpin(t *testing.T) {
+	_, provNet, _ := net.ParseCIDR("5.182.234.0/24")
+	forwards := []PortForwardVIP{
+		{
+			VIP:               "194.93.78.239",
+			HairpinMasquerade: true,
+			SNATToIP:          "169.254.0.2",
+			Rules: []PortForwardRule{
+				{Proto: "tcp", Port: 80, DestAddr: "10.1.8.226"},
+			},
+		},
+	}
+
+	result := buildNftRuleset(forwards, []*net.IPNet{provNet}, nil, dnatCTZoneDefault)
+	snat := extractChain(result, "postrouting_snat")
+	if snat == "" {
+		t.Fatal("missing postrouting_snat chain")
+	}
+
+	expected := "ip saddr 5.182.234.0/24 ct original daddr 194.93.78.239 ct status dnat snat to 169.254.0.2"
+	if !strings.Contains(snat, expected) {
+		t.Errorf("missing hairpin `snat to` rule.\nwant: %s\ngot:\n%s", expected, snat)
+	}
+	if strings.Contains(snat, "ct status dnat masquerade") {
+		t.Errorf("hairpin with snat_to_ip must not emit masquerade, got:\n%s", snat)
+	}
+}
+
+// TestBuildNftRulesetSNATToIPRouter covers issue #101 for router masquerade:
+// router_masquerade with snat_to_ip set must emit `snat to <ip>` instead of
+// `masquerade` for the source-selective rule.
+func TestBuildNftRulesetSNATToIPRouter(t *testing.T) {
+	snatIPs := []string{"203.0.113.50"}
+	forwards := []PortForwardVIP{
+		{
+			VIP:              "194.93.78.239",
+			RouterMasquerade: true,
+			SNATToIP:         "169.254.0.2",
+			Rules: []PortForwardRule{
+				{Proto: "tcp", Port: 80, DestAddr: "10.1.8.226"},
+			},
+		},
+	}
+
+	result := buildNftRuleset(forwards, nil, snatIPs, dnatCTZoneDefault)
+	snat := extractChain(result, "postrouting_snat")
+	if snat == "" {
+		t.Fatal("missing postrouting_snat chain")
+	}
+
+	expected := "ip saddr 203.0.113.50 ct original daddr 194.93.78.239 ct status dnat snat to 169.254.0.2"
+	if !strings.Contains(snat, expected) {
+		t.Errorf("missing router `snat to` rule.\nwant: %s\ngot:\n%s", expected, snat)
+	}
+	if strings.Contains(snat, "ct status dnat masquerade") {
+		t.Errorf("router_masquerade with snat_to_ip must not emit masquerade, got:\n%s", snat)
+	}
+}
+
+// TestBuildNftRulesetSNATToIPMixed covers the case where one VIP uses
+// snat_to_ip and another does not — each VIP's chosen SNAT action must be
+// emitted independently. This guards against a regression where a single
+// VIP's flag would change behaviour for unrelated VIPs in the same ruleset.
+func TestBuildNftRulesetSNATToIPMixed(t *testing.T) {
+	_, provNet, _ := net.ParseCIDR("5.182.234.0/24")
+	forwards := []PortForwardVIP{
+		{
+			VIP:               "194.93.78.239",
+			HairpinMasquerade: true,
+			SNATToIP:          "169.254.0.2",
+			Rules: []PortForwardRule{
+				{Proto: "tcp", Port: 80, DestAddr: "10.1.8.226"},
+			},
+		},
+		{
+			VIP:               "194.93.78.240",
+			HairpinMasquerade: true,
+			Rules: []PortForwardRule{
+				{Proto: "tcp", Port: 80, DestAddr: "10.1.8.227"},
+			},
+		},
+	}
+
+	result := buildNftRuleset(forwards, []*net.IPNet{provNet}, nil, dnatCTZoneDefault)
+	snat := extractChain(result, "postrouting_snat")
+	if snat == "" {
+		t.Fatal("missing postrouting_snat chain")
+	}
+
+	if !strings.Contains(snat, "ct original daddr 194.93.78.239 ct status dnat snat to 169.254.0.2") {
+		t.Errorf("VIP .239 (snat_to_ip set) must emit `snat to`, got:\n%s", snat)
+	}
+	if !strings.Contains(snat, "ct original daddr 194.93.78.240 ct status dnat masquerade") {
+		t.Errorf("VIP .240 (no snat_to_ip) must keep `masquerade`, got:\n%s", snat)
+	}
+}
+
 // extractChain returns the text between "chain <name> {" and its matching "}".
 // Handles nested braces from nftables set syntax (e.g. "{ VIP1, VIP2 }").
 // Returns empty string if the chain is not found.
