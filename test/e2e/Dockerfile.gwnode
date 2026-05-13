@@ -6,11 +6,11 @@
 # execs the agent in the foreground.
 #
 # Build:
-#   docker buildx build --platform linux/amd64 \
-#       -f test/e2e/Dockerfile.gwnode -t ovn-network-agent/gwnode:e2e .
+#   docker build -f test/e2e/Dockerfile.gwnode -t ovn-network-agent/gwnode:e2e .
 #
-# The Dockerfile is multi-arch: the Go build stage honours TARGETARCH and
-# the runtime layer pulls multi-arch Ubuntu/OVS/OVN packages.
+# Works with both the legacy docker builder and BuildKit / buildx. For
+# multi-arch publication, use buildx with --platform=linux/amd64,linux/arm64;
+# the Go build stage honours TARGETARCH set by BuildKit.
 
 ARG GO_VERSION=1.25
 ARG UBUNTU_VERSION=24.04
@@ -18,8 +18,12 @@ ARG UBUNTU_VERSION=24.04
 # ---------------------------------------------------------------------------
 # Build stage — produce a static ovn-network-agent for the target arch.
 # ---------------------------------------------------------------------------
-FROM --platform=$BUILDPLATFORM golang:${GO_VERSION}-bookworm AS build
+FROM golang:${GO_VERSION}-bookworm AS build
 
+# BuildKit populates TARGETARCH automatically. With the legacy builder the
+# arg is empty, so the Go build falls back to GOARCH=amd64 (the only
+# architecture the canned topology is tested on for now). Override on the
+# command line with --build-arg TARGETARCH=arm64 when needed.
 ARG TARGETARCH
 ARG VERSION=e2e
 
@@ -31,7 +35,7 @@ RUN go mod download
 
 COPY . .
 
-RUN CGO_ENABLED=0 GOOS=linux GOARCH=${TARGETARCH} \
+RUN CGO_ENABLED=0 GOOS=linux GOARCH=${TARGETARCH:-amd64} \
     go build -trimpath \
         -ldflags "-s -w -X main.version=${VERSION}" \
         -o /out/ovn-network-agent .
