@@ -253,7 +253,7 @@ func TestReconcileNoLocalRoutersInvokesRemoveAllRoutes(t *testing.T) {
 	}
 	a.reconcile(context.Background(), "test")
 	// Reconcile must complete and leave effectiveFilters in a clean state.
-	if a.effectiveFilters != nil && len(a.effectiveFilters) != 0 {
+	if len(a.effectiveFilters) != 0 {
 		t.Errorf("effectiveFilters should be empty when no networks discovered, got %v", a.effectiveFilters)
 	}
 }
