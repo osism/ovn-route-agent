@@ -72,6 +72,12 @@ original prototype. The built-in veth VRF leak functionality
 (`--veth-leak-enabled`) replaces the standalone script
 [`veth-vrf-leak.sh`](./contrib/veth-vrf-leak.sh).
 
+## Security
+
+To report a security vulnerability, please follow the private disclosure
+process in [SECURITY.md](./SECURITY.md). Do not file public issues for
+suspected security problems.
+
 ## License
 
 Apache License 2.0 — see [LICENSE](./LICENSE).
