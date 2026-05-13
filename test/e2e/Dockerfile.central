@@ -1,0 +1,40 @@
+# OVN central image for the containerlab E2E harness.
+#
+# Runs ovsdb-server (NB + SB) and ovn-northd. The NB and SB databases are
+# exposed on TCP 0.0.0.0:6641 and 0.0.0.0:6642 so the gateway-node
+# containers can connect over the management network.
+#
+# Build:
+#   docker buildx build --platform linux/amd64 \
+#       -f test/e2e/Dockerfile.central -t ovn-network-agent/central:e2e .
+
+ARG UBUNTU_VERSION=24.04
+FROM ubuntu:${UBUNTU_VERSION}
+
+ENV DEBIAN_FRONTEND=noninteractive
+
+RUN apt-get update \
+ && apt-get install -y --no-install-recommends \
+        ca-certificates \
+        software-properties-common \
+        ubuntu-cloud-keyring \
+ && add-apt-repository -y cloud-archive:flamingo \
+ && apt-get update \
+ && apt-get install -y --no-install-recommends \
+        ovn-central \
+        iproute2 \
+ && apt-get purge -y software-properties-common \
+ && apt-get autoremove -y \
+ && rm -rf /var/lib/apt/lists/* /var/cache/apt/archives/* \
+           /usr/share/doc /usr/share/man /usr/share/locale
+
+COPY test/e2e/central-entrypoint.sh /usr/local/bin/central-entrypoint.sh
+RUN chmod 0755 /usr/local/bin/central-entrypoint.sh
+
+EXPOSE 6641 6642
+
+HEALTHCHECK --interval=10s --timeout=5s --start-period=30s --retries=5 \
+    CMD ovn-nbctl --db=tcp:127.0.0.1:6641 show >/dev/null 2>&1 \
+        && ovn-sbctl --db=tcp:127.0.0.1:6642 show >/dev/null 2>&1
+
+ENTRYPOINT ["/usr/local/bin/central-entrypoint.sh"]
