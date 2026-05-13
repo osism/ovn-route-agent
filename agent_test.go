@@ -5,6 +5,7 @@ import (
 	"errors"
 	"net"
 	"reflect"
+	"strings"
 	"sync/atomic"
 	"testing"
 	"time"
@@ -227,6 +228,287 @@ func TestVerifyRoutesConsecutiveReAddCounter(t *testing.T) {
 	a.verifyRoutes([]string{"192.168.1.1"}) // unmanaged → 0 re-adds
 	if a.consecutiveReAdds != 0 {
 		t.Errorf("expected consecutiveReAdds=0 after clean cycle, got %d", a.consecutiveReAdds)
+	}
+}
+
+// TestReconcileNoLocalRoutersInvokesRemoveAllRoutes drives reconcile down
+// the inactive-chassis branch: with no local routers and no port forwards,
+// the agent calls removeAllRoutes("no locally active routers …") and
+// cleans up veth-leak, prefix-list, and hairpin-flow state.
+func TestReconcileNoLocalRoutersInvokesRemoveAllRoutes(t *testing.T) {
+	rm := &RouteManager{
+		bridgeDev:   "br-ex",
+		vrfName:     "vrf-provider",
+		vethNexthop: "169.254.0.1",
+		dryRun:      true,
+	}
+	c, _, _ := newOVNClientWithFakes(t, "host-a")
+	// state.HasLocalRouters defaults to false; DiscoveredNetworks empty.
+	a := &Agent{
+		cfg:            Config{},
+		ovn:            c,
+		routing:        rm,
+		reconcileCh:    make(chan struct{}, 1),
+		missingChassis: make(map[string]time.Time),
+	}
+	a.reconcile(context.Background(), "test")
+	// Reconcile must complete and leave effectiveFilters in a clean state.
+	if a.effectiveFilters != nil && len(a.effectiveFilters) != 0 {
+		t.Errorf("effectiveFilters should be empty when no networks discovered, got %v", a.effectiveFilters)
+	}
+}
+
+// TestRemoveAllRoutesDryRun exercises removeAllRoutes end-to-end. In dry-run
+// mode List* helpers return (nil, nil) so the function walks every branch
+// (FRR list, kernel list, BGP refresh skipped because no routes to remove).
+func TestRemoveAllRoutesDryRun(t *testing.T) {
+	rm := &RouteManager{
+		bridgeDev:   "br-ex",
+		vrfName:     "vrf-provider",
+		vethNexthop: "169.254.0.1",
+		dryRun:      true,
+	}
+	a := &Agent{routing: rm}
+	a.removeAllRoutes("test reason")
+}
+
+// TestEnsureRoutesAddsMissingAndRemovesStale drives ensureRoutes with a
+// vtysh hook so the FRR add/delete paths and the BGP-refresh-on-delete
+// branch all execute. Kernel route helpers fail (bridge does not exist or
+// platform is non-Linux), which is expected and survives as a logged
+// warning — that path is itself exercised.
+func TestEnsureRoutesAddsMissingAndRemovesStale(t *testing.T) {
+	rec := newVtyshRecorder()
+	// FRR currently has B (already desired) and stale-X (managed but not desired).
+	rec.on(
+		[]string{"vtysh", "-c", "show ip route vrf vrf-provider static"},
+		`S>* 198.51.100.20/32 [1/0] via 169.254.0.1, veth-default, weight 1, 00:00:01
+S>* 198.51.100.99/32 [1/0] via 169.254.0.1, veth-default, weight 1, 00:00:01
+`,
+		nil,
+	)
+
+	rm := &RouteManager{
+		bridgeDev:     "ovnagent-nonexistent-br",
+		vrfName:       "vrf-provider",
+		vethNexthop:   "169.254.0.1",
+		execVtyshHook: rec.hook(),
+	}
+	_, cidr, _ := net.ParseCIDR("198.51.100.0/24")
+	a := &Agent{routing: rm, effectiveFilters: []*net.IPNet{cidr}}
+
+	// Desired: 198.51.100.10 (new) and 198.51.100.20 (already in FRR).
+	a.ensureRoutes([]string{"198.51.100.10", "198.51.100.20"})
+
+	var sawAdd, sawDel, sawRefresh bool
+	for _, c := range rec.calls {
+		joined := strings.Join(c, " ")
+		switch {
+		case strings.Contains(joined, "show ip route vrf"):
+			continue
+		case strings.Contains(joined, "ip route 198.51.100.10/32 169.254.0.1") &&
+			!strings.Contains(joined, "no ip route"):
+			sawAdd = true
+		case strings.Contains(joined, "no ip route 198.51.100.99/32"):
+			sawDel = true
+		case strings.Contains(joined, "clear ip bgp vrf vrf-provider"):
+			sawRefresh = true
+		}
+	}
+	if !sawAdd {
+		t.Errorf("expected add of 198.51.100.10, got calls: %v", rec.calls)
+	}
+	if !sawDel {
+		t.Errorf("expected del of stale 198.51.100.99, got calls: %v", rec.calls)
+	}
+	if !sawRefresh {
+		t.Errorf("expected BGP refresh after deletes, got calls: %v", rec.calls)
+	}
+}
+
+// TestRemoveAllRoutesWithStubbedFRRList exercises the FRR-driven removal
+// path: a stub vtysh hook reports two managed routes, the agent batches
+// the deletion, and a BGP soft-refresh follows because routes were removed.
+func TestRemoveAllRoutesWithStubbedFRRList(t *testing.T) {
+	rec := newVtyshRecorder()
+	rec.on(
+		[]string{"vtysh", "-c", "show ip route vrf vrf-provider static"},
+		`S>* 198.51.100.10/32 [1/0] via 169.254.0.1, veth-default, weight 1, 00:00:01
+S>* 198.51.100.11/32 [1/0] via 169.254.0.1, veth-default, weight 1, 00:00:01
+`,
+		nil,
+	)
+	rm := &RouteManager{
+		// Use a synthetic bridge name that does not exist on either macOS
+		// or Linux CI hosts so ListKernelRoutes errors out (netlink) or
+		// returns "only supported on Linux" (stub) instead of touching real
+		// kernel state. dryRun is intentionally false here because the
+		// FRR-list short-circuits to nil in dry-run mode and would skip
+		// the code path we want to exercise.
+		bridgeDev:     "ovnagent-nonexistent-br",
+		vrfName:       "vrf-provider",
+		vethNexthop:   "169.254.0.1",
+		execVtyshHook: rec.hook(),
+	}
+	_, cidr, _ := net.ParseCIDR("198.51.100.0/24")
+	a := &Agent{routing: rm, effectiveFilters: []*net.IPNet{cidr}}
+
+	a.removeAllRoutes("test")
+
+	// Expect: list FRR (1), batch delete (1), BGP soft-refresh (1).
+	var sawDel, sawRefresh bool
+	for _, c := range rec.calls {
+		joined := strings.Join(c, " ")
+		if strings.Contains(joined, "no ip route 198.51.100.10/32") &&
+			strings.Contains(joined, "no ip route 198.51.100.11/32") {
+			sawDel = true
+		}
+		if strings.Contains(joined, "clear ip bgp vrf vrf-provider") {
+			sawRefresh = true
+		}
+	}
+	if !sawDel {
+		t.Errorf("expected batched delete of both managed IPs, got calls: %v", rec.calls)
+	}
+	if !sawRefresh {
+		t.Errorf("expected BGP soft-refresh after deletes, got calls: %v", rec.calls)
+	}
+}
+
+// TestCleanupRunsShutdownPipeline drives the agent's cleanup() in dry-run
+// mode so each step (FRR routes, prefix-list, OVS flows, routing table,
+// port forwards, veth leak, bridge IP, OVN managed entries) executes without
+// touching real system state. The OVN nb client is a fake so the final
+// RemoveManagedNBEntries call uses the in-memory rows.
+func TestCleanupRunsShutdownPipeline(t *testing.T) {
+	rm := &RouteManager{
+		bridgeDev:   "br-ex",
+		vrfName:     "vrf-provider",
+		vethNexthop: "169.254.0.1",
+		dryRun:      true,
+	}
+	c, _, _ := newOVNClientWithFakes(t, "host-a")
+	a := &Agent{
+		cfg:     Config{BridgeIP: "169.254.169.254"},
+		ovn:     c,
+		routing: rm,
+	}
+	// Must not panic; all sub-calls are dry-run no-ops or interact with the
+	// fake OVN client (no in-memory routers → RemoveManagedNBEntries early returns).
+	a.cleanup()
+}
+
+// TestCleanupStaleChassis_TracksAndPrunes verifies the full tracking flow:
+// (1) a chassis referenced by a managed route but missing from allChassis is
+// added to missingChassis; (2) a chassis that returns is removed; (3) a
+// chassis no longer referenced is pruned without waiting for grace.
+func TestCleanupStaleChassis_TracksAndPrunes(t *testing.T) {
+	c, nb, _ := newOVNClientWithFakes(t, "host-a")
+	nb.setRows("Logical_Router_Static_Route",
+		&NBLogicalRouterStaticRoute{
+			UUID: "r-dead",
+			ExternalIDs: map[string]string{
+				"ovn-network-agent":         "managed",
+				"ovn-network-agent-chassis": "host-gone",
+			},
+		},
+		&NBLogicalRouterStaticRoute{
+			UUID: "r-alive",
+			ExternalIDs: map[string]string{
+				"ovn-network-agent":         "managed",
+				"ovn-network-agent-chassis": "host-a",
+			},
+		},
+	)
+
+	a := &Agent{
+		cfg:            Config{StaleChassisGracePeriod: 5 * time.Minute},
+		ovn:            c,
+		missingChassis: make(map[string]time.Time),
+	}
+
+	// First call: host-gone is missing, host-a is alive.
+	a.cleanupStaleChassis(context.Background(), map[string]bool{"host-a": true})
+	if _, tracked := a.missingChassis["host-gone"]; !tracked {
+		t.Errorf("expected host-gone to be tracked as missing, got %v", a.missingChassis)
+	}
+	if _, tracked := a.missingChassis["host-a"]; tracked {
+		t.Errorf("host-a is alive and must not be tracked as missing")
+	}
+
+	// Second call: host-gone returns; it must be removed from tracking.
+	a.cleanupStaleChassis(context.Background(), map[string]bool{"host-a": true, "host-gone": true})
+	if _, tracked := a.missingChassis["host-gone"]; tracked {
+		t.Error("host-gone returned and must be removed from missingChassis")
+	}
+
+	// Third call: nb has only routes for host-a (host-gone route was deleted
+	// elsewhere). missingChassis must be pruned even though grace would still apply.
+	nb.setRows("Logical_Router_Static_Route", &NBLogicalRouterStaticRoute{
+		UUID: "r-alive",
+		ExternalIDs: map[string]string{
+			"ovn-network-agent":         "managed",
+			"ovn-network-agent-chassis": "host-a",
+		},
+	})
+	a.missingChassis["stale-record"] = time.Now() // synthetic stale entry
+	a.cleanupStaleChassis(context.Background(), map[string]bool{"host-a": true})
+	if _, tracked := a.missingChassis["stale-record"]; tracked {
+		t.Error("stale-record is unreferenced and must be pruned")
+	}
+}
+
+// TestCleanupStaleChassis_TriggersCleanupAfterGrace verifies that a chassis
+// missing for longer than the configured grace period causes the agent to
+// call CleanupStaleChassisManagedEntries against the OVN client.
+func TestCleanupStaleChassis_TriggersCleanupAfterGrace(t *testing.T) {
+	c, nb, _ := newOVNClientWithFakes(t, "host-a")
+	nb.setRows("Logical_Router", &NBLogicalRouter{
+		UUID: "lr-1", Name: "router1", StaticRoutes: []string{"r-stale"},
+	})
+	nb.setRows("Logical_Router_Static_Route", &NBLogicalRouterStaticRoute{
+		UUID: "r-stale",
+		ExternalIDs: map[string]string{
+			"ovn-network-agent":         "managed",
+			"ovn-network-agent-chassis": "host-gone",
+		},
+	})
+
+	a := &Agent{
+		cfg:            Config{StaleChassisGracePeriod: time.Millisecond},
+		ovn:            c,
+		missingChassis: make(map[string]time.Time),
+	}
+	// Pre-seed the tracker so the grace period has already elapsed.
+	a.missingChassis["host-gone"] = time.Now().Add(-time.Hour)
+
+	a.cleanupStaleChassis(context.Background(), map[string]bool{"host-a": true})
+
+	tx := nb.recordedTransacts()
+	if len(tx) == 0 {
+		t.Fatal("expected CleanupStaleChassisManagedEntries to issue at least one transact")
+	}
+	// host-gone should be removed from the tracker after successful cleanup.
+	if _, tracked := a.missingChassis["host-gone"]; tracked {
+		t.Error("host-gone should be removed from missingChassis after grace-period cleanup")
+	}
+}
+
+// TestCleanupStaleChassis_BailsOnListError verifies that an OVN list error
+// short-circuits cleanupStaleChassis: it returns early and does not mutate
+// missingChassis state.
+func TestCleanupStaleChassis_BailsOnListError(t *testing.T) {
+	c, nb, _ := newOVNClientWithFakes(t, "host-a")
+	nb.listErr = errors.New("connection refused")
+
+	a := &Agent{
+		cfg:            Config{StaleChassisGracePeriod: time.Minute},
+		ovn:            c,
+		missingChassis: make(map[string]time.Time),
+	}
+	a.cleanupStaleChassis(context.Background(), map[string]bool{"host-a": true})
+	if len(a.missingChassis) != 0 {
+		t.Errorf("missingChassis should not be mutated on list error, got %v", a.missingChassis)
 	}
 }
 
