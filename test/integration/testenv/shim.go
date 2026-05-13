@@ -114,11 +114,13 @@ if [ -s "$MATCH" ]; then
     case "$joined" in
         *"$pattern"*) ;;
         *)
+            printf '%%s\n' "  match=skip pattern=$pattern joined=$joined" >>"$INVOKE" 2>/dev/null || true
             PATH="$(strip_path)" exec "$REAL" "$@"
             ;;
     esac
 fi
-remaining=$(cat "$COUNTER" 2>/dev/null || echo 0)
+remaining=$(cat "$COUNTER" 2>/dev/null || echo MISSING)
+printf '%%s\n' "  counter_raw=$remaining counter_file=$COUNTER" >>"$INVOKE" 2>/dev/null || true
 case "$remaining" in
     ''|*[!0-9]*) remaining=0 ;;
 esac
