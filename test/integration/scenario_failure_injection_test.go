@@ -128,6 +128,16 @@ func TestScenario_FailureInjection_NftConflict(t *testing.T) {
 	// Wait for the agent to attempt the re-apply and fail at least once.
 	// Capture the log marker the shim writes so a regression that doesn't
 	// hit the failure path cannot pass silently.
+	//
+	// On timeout, dump the shim's invocation log: a non-empty log proves
+	// the shim is on PATH and being reached (so the bug is in the
+	// arm/counter logic), an empty log says PATH override never landed
+	// (the env-propagation path is the suspect).
+	t.Cleanup(func() {
+		if t.Failed() {
+			t.Logf("nft shim invocation log:\n%s", shim.InvocationLog())
+		}
+	})
 	testenv.Eventually(t, func() bool {
 		return strings.Contains(a.LogTail(100000), "test shim: forced failure of nft")
 	}, 15*time.Second, 200*time.Millisecond, "agent must hit at least one forced nft failure")

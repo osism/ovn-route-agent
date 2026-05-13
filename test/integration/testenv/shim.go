@@ -24,6 +24,7 @@ type FailingToolShim struct {
 	armPath     string
 	counterPath string
 	matchPath   string
+	invokePath  string
 	failCount   int
 	t           *testing.T
 }
@@ -65,6 +66,7 @@ func WithFailingTool(t *testing.T, tool string, failCount int) *FailingToolShim 
 		armPath:     filepath.Join(dir, tool+".armed"),
 		counterPath: filepath.Join(dir, tool+".remaining"),
 		matchPath:   filepath.Join(dir, tool+".match"),
+		invokePath:  filepath.Join(dir, tool+".invocations"),
 		failCount:   failCount,
 		t:           t,
 	}
@@ -86,6 +88,11 @@ COUNTER=%q
 MATCH=%q
 REAL=%q
 SHIM_DIR=%q
+INVOKE=%q
+# Append one line per invocation so the test can verify the shim was on
+# the agent's PATH even when no failure was injected. Best-effort; loss
+# of this line never breaks the pass-through path.
+printf '%%s\n' "invoked: $*" >>"$INVOKE" 2>/dev/null || true
 strip_path() {
     # Strip the shim directory from PATH so the real binary lookup
     # resolves to the system install, not back to us.
@@ -115,7 +122,7 @@ if [ "$remaining" -gt 0 ]; then
     exit 1
 fi
 PATH="$(strip_path)" exec "$REAL" "$@"
-`, shim.armPath, shim.counterPath, shim.matchPath, realPath, dir, tool)
+`, shim.armPath, shim.counterPath, shim.matchPath, realPath, dir, shim.invokePath, tool)
 	if err := os.WriteFile(filepath.Join(dir, tool), []byte(script), 0o755); err != nil {
 		t.Fatalf("WithFailingTool: write shim: %v", err)
 	}
@@ -173,6 +180,24 @@ func (s *FailingToolShim) Disarm() {
 	if err := os.Remove(s.armPath); err != nil && !os.IsNotExist(err) {
 		s.t.Fatalf("FailingToolShim.Disarm: %v", err)
 	}
+}
+
+// InvocationLog returns the contents of the shim's invocation log — one line
+// per call ("invoked: <argv>") the agent made through the shim. Tests use
+// this as a diagnostic when a forced-failure assertion times out: a non-empty
+// log proves the shim is on PATH and being reached, narrowing the failure
+// down to the arm/counter logic rather than a missing PATH override.
+func (s *FailingToolShim) InvocationLog() string {
+	s.t.Helper()
+	data, err := os.ReadFile(s.invokePath)
+	if err != nil {
+		if os.IsNotExist(err) {
+			return ""
+		}
+		s.t.Logf("FailingToolShim.InvocationLog: read %s: %v", s.invokePath, err)
+		return ""
+	}
+	return string(data)
 }
 
 // Remaining returns the number of failures left in the current arm window.
