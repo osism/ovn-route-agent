@@ -24,7 +24,9 @@ test:
 	go test -v ./...
 
 # Integration tests exercise the agent against a real OVN/OVS/FRR/nftables
-# stack. They require Linux + root (CAP_NET_ADMIN). See test/integration/README.md
+# stack. They require Linux + root (CAP_NET_ADMIN). See
+# docs/contributing/integration-tests.md (published at
+# https://osism.github.io/ovn-network-agent/contributing/integration-tests)
 # for local-run prerequisites.
 test-integration: build
 	OVN_AGENT_BINARY=$(CURDIR)/$(BINARY) go test -tags=integration -v -count=1 ./test/integration/...
