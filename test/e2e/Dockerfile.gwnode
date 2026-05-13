@@ -85,10 +85,12 @@ RUN chmod 0755 /usr/local/bin/gwnode-entrypoint.sh \
                /usr/local/bin/ovn-network-agent
 
 # Healthcheck per issue #44: OVS responsive + ovn-controller and the agent
-# both running.
+# both running. `pgrep -x` matches against /proc/<pid>/comm, which Linux
+# truncates to 15 chars — "ovn-network-agent" is 17, so the agent has to
+# be matched via the full cmdline with `pgrep -f`.
 HEALTHCHECK --interval=10s --timeout=5s --start-period=30s --retries=5 \
     CMD ovs-vsctl show >/dev/null 2>&1 \
         && pgrep -x ovn-controller >/dev/null \
-        && pgrep -x ovn-network-agent >/dev/null
+        && pgrep -f /usr/local/bin/ovn-network-agent >/dev/null
 
 ENTRYPOINT ["/usr/local/bin/gwnode-entrypoint.sh"]
