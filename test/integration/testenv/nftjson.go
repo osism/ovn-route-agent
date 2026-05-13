@@ -440,6 +440,19 @@ func AssertNftChainExists(t *testing.T, table, chain string, timeout time.Durati
 	}, timeout, fmt.Sprintf("chain %s/%s should exist", table, chain))
 }
 
+// AssertNftChainAbsent fails the test if the named chain is still present
+// after timeout. Used by scenarios (e.g. #88 item 4) that pin the agent's
+// conditional-chain emission contract: a chain that only materialises in
+// the presence of a specific upstream input must not appear when the input
+// is absent.
+func AssertNftChainAbsent(t *testing.T, table, chain string, timeout time.Duration) {
+	t.Helper()
+	EventuallyNft(t, func(d NftDump) bool {
+		_, ok := d.Chain(table, chain)
+		return !ok
+	}, timeout, fmt.Sprintf("chain %s/%s should be absent", table, chain))
+}
+
 // =============================================================================
 // JSON value comparison helpers
 // =============================================================================
