@@ -28,9 +28,13 @@ log_level: "info"
 # container restart does not require re-bootstrapping the NB DB.
 cleanup_on_shutdown: false
 
-# Drain is exercised explicitly in scenarios; default to off so a plain
-# `containerlab destroy` returns quickly.
-drain_on_shutdown: false
+# Drain is on so the drain-hitless scenario (issue #113) can measure
+# the hitless gain — `DrainGateways` must run before the agent exits
+# for the graceful arm to differ from the hard-kill control arm.
+# `containerlab destroy --cleanup` sends SIGTERM via `docker stop`
+# (10 s default) before SIGKILL, so the worst-case teardown delay is
+# bounded by docker's own timeout, not the agent's 60 s drain timeout.
+drain_on_shutdown: true
 
 # Reconcile cadence — tighter than the 60s production default so the
 # stale-chassis cleanup (which only triggers on a reconcile tick) lands
