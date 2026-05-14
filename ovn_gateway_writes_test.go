@@ -433,18 +433,23 @@ func TestEnsureActivePriorityLead(t *testing.T) {
 			}
 
 			tx := nb.recordedTransacts()
+			var updates []ovsdb.Operation
+			for _, batch := range tx {
+				for _, op := range batch {
+					if op.Op == ovsdb.OperationUpdate && op.Table == "Gateway_Chassis" {
+						updates = append(updates, op)
+					}
+				}
+			}
 			if len(tt.wantBoosts) == 0 {
-				if len(tx) != 0 {
-					t.Fatalf("expected no transacts, got %d: %+v", len(tx), tx)
+				if len(updates) != 0 {
+					t.Fatalf("expected no Gateway_Chassis updates, got %d: %+v", len(updates), updates)
 				}
 				return
 			}
 
-			if len(tx) != 1 {
-				t.Fatalf("expected one batched transact, got %d: %+v", len(tx), tx)
-			}
-			if len(tx[0]) != len(tt.wantBoosts) {
-				t.Fatalf("expected %d update ops, got %d: %+v", len(tt.wantBoosts), len(tx[0]), tx[0])
+			if len(updates) != len(tt.wantBoosts) {
+				t.Fatalf("expected %d update ops, got %d: %+v", len(tt.wantBoosts), len(updates), updates)
 			}
 			// Map each local UUID back to its LRP so we can assert the
 			// computed priority for each update op.
@@ -458,11 +463,7 @@ func TestEnsureActivePriorityLead(t *testing.T) {
 					lrpByLocalUUID[e.UUID] = lrp
 				}
 			}
-			for _, op := range tx[0] {
-				if op.Op != ovsdb.OperationUpdate || op.Table != "Gateway_Chassis" {
-					t.Errorf("unexpected op: %+v", op)
-					continue
-				}
+			for _, op := range updates {
 				lrp, ok := lrpByLocalUUID[op.UUID]
 				if !ok {
 					t.Errorf("update on unexpected UUID %q", op.UUID)
@@ -482,6 +483,52 @@ func TestEnsureActivePriorityLead(t *testing.T) {
 				t.Errorf("expected updates for local UUIDs %v but they were not issued", lrpByLocalUUID)
 			}
 		})
+	}
+}
+
+// TestEnsureActivePriorityLead_FallsBackToServerSelectOnCacheMiss covers the
+// issue #115 race in the active-lead reconciler: with the local row missing
+// from the cache, EnsureActivePriorityLead must recover it via a direct NB
+// select and still boost the priority above the peer instead of silently
+// skipping.
+func TestEnsureActivePriorityLead_FallsBackToServerSelectOnCacheMiss(t *testing.T) {
+	c, nb, _ := newOVNClientWithFakes(t, "host-a")
+
+	// Cache only has the peer row — the local Gateway_Chassis INSERT was
+	// dropped between server and client.
+	nb.setRows("Gateway_Chassis",
+		&NBGatewayChassis{UUID: "g2", Name: "lrp-a_host-b", ChassisName: "host-b", Priority: 5},
+	)
+	nb.setSelectRows("Gateway_Chassis", ovsdb.Row{
+		"_uuid":        ovsdb.UUID{GoUUID: "g1"},
+		"name":         "lrp-a_host-a",
+		"chassis_name": "host-a",
+		"priority":     float64(1),
+	})
+
+	err := c.EnsureActivePriorityLead(context.Background(),
+		[]LocalRouterInfo{{LRPName: "lrp-a"}}, "host-a")
+	if err != nil {
+		t.Fatalf("EnsureActivePriorityLead: %v", err)
+	}
+
+	tx := nb.recordedTransacts()
+	var updates []ovsdb.Operation
+	for _, batch := range tx {
+		for _, op := range batch {
+			if op.Op == ovsdb.OperationUpdate && op.Table == "Gateway_Chassis" {
+				updates = append(updates, op)
+			}
+		}
+	}
+	if len(updates) != 1 {
+		t.Fatalf("expected one priority boost after select fallback, got %d: %+v", len(updates), updates)
+	}
+	if updates[0].UUID != "g1" {
+		t.Errorf("update should target the recovered local row (g1), got %q", updates[0].UUID)
+	}
+	if got, ok := updates[0].Row["priority"].(int); !ok || got != 6 {
+		t.Errorf("expected boost to 6 (max peer 5 + 1), got %#v", updates[0].Row["priority"])
 	}
 }
 
