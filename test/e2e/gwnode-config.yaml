@@ -31,3 +31,16 @@ cleanup_on_shutdown: false
 # Drain is exercised explicitly in scenarios; default to off so a plain
 # `containerlab destroy` returns quickly.
 drain_on_shutdown: false
+
+# Reconcile cadence — tighter than the 60s production default so the
+# stale-chassis cleanup (which only triggers on a reconcile tick) lands
+# within the per-scenario CI budget. The baseline and failover scenarios
+# poll for ≤30s anyway, so a faster reconcile only helps them too.
+reconcile_interval: "5s"
+
+# Stale-chassis grace period — held well below the production default
+# (5m) so the stale-chassis scenario can complete inside the 5-min CI
+# budget without hiding a default-value regression. Set explicitly per
+# issue #111 so a change to the default does not silently affect the
+# scenario's wall-clock budget.
+stale_chassis_grace_period: "30s"
