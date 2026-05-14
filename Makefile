@@ -3,7 +3,7 @@ VERSION   ?= $(shell git describe --tags --always --dirty 2>/dev/null || echo "d
 LDFLAGS   := -s -w -X main.version=$(VERSION)
 GOFLAGS   := -trimpath
 
-.PHONY: all build build-static clean fmt vet test test-integration install docs-gen docs-gen-check e2e-images e2e-up e2e-down e2e-install-tools e2e-baseline e2e-failover e2e-hairpin e2e-stale-chassis
+.PHONY: all build build-static clean fmt vet test test-integration install docs-gen docs-gen-check e2e-images e2e-up e2e-down e2e-install-tools e2e-baseline e2e-failover e2e-hairpin e2e-pf-external e2e-stale-chassis
 
 # Containerlab E2E harness. See test/e2e/README.md for the topology and
 # acceptance criteria (issue #44).
@@ -12,6 +12,7 @@ E2E_BOOTSTRAP   := test/e2e/bootstrap.sh
 E2E_BASELINE    := test/e2e/scenarios/baseline.sh
 E2E_FAILOVER    := test/e2e/scenarios/failover.sh
 E2E_HAIRPIN     := test/e2e/scenarios/hairpin.sh
+E2E_PF_EXTERNAL := test/e2e/scenarios/pf-external.sh
 E2E_STALE       := test/e2e/scenarios/stale-chassis.sh
 E2E_GWNODE_TAG  := ovn-network-agent/gwnode:e2e
 E2E_CENTRAL_TAG := ovn-network-agent/central:e2e
@@ -146,6 +147,18 @@ e2e-failover:
 # `make e2e-baseline` works without tearing the lab down.
 e2e-hairpin:
 	$(E2E_HAIRPIN)
+
+# Run the port-forward / DNAT scenario (issue #109) against a lab
+# that is already up. Adds an OVN Load_Balancer for 192.0.2.50:80 →
+# ls0-vm1:8080 on lr0, starts a tiny HTTP backend in the existing vm1
+# netns, curls the VIP from client-1, and asserts the backend log
+# records client-1's underlay IP — i.e. OVN performed pure DNAT with
+# no SNAT on the way in. Mirrors the step the CI workflow runs; the
+# scenario's own EXIT trap removes the Load_Balancer, the per-chassis
+# kernel route, the upstream static route, and the backend process,
+# so a subsequent `make e2e-baseline` keeps passing.
+e2e-pf-external:
+	$(E2E_PF_EXTERNAL)
 
 # Run the stale-chassis cleanup scenario (issue #111) against a lab
 # that is already up. Hard-kills the priority-30 chassis (SIGKILL, no
