@@ -14,5 +14,6 @@ Quick reference:
 make e2e-install-tools   # one-time, installs containerlab on Linux
 make e2e-up              # build images, deploy topology, seed OVN NB
 make e2e-baseline        # run the baseline reachability scenario
+make e2e-failover        # run the HA failover scenario (master chassis loss)
 make e2e-down            # destroy the lab
 ```

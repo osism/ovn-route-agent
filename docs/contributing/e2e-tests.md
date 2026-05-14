@@ -17,6 +17,10 @@ The harness has two layers:
    was added by
    [#45](https://github.com/osism/ovn-network-agent/issues/45) together
    with the CI workflow that runs it.
+   [`failover.sh`](https://github.com/osism/ovn-network-agent/blob/main/test/e2e/scenarios/failover.sh)
+   ([#105](https://github.com/osism/ovn-network-agent/issues/105))
+   builds on the baseline and exercises HA re-election by stopping the
+   priority-30 chassis.
 
 ## Layout
 
@@ -31,6 +35,7 @@ test/e2e/
   bootstrap.sh              — idempotent OVN NB seed (1 LS, 1 LR with 2 FIPs, HA across 3 chassis)
   scenarios/
     baseline.sh             — baseline reachability scenario (issue #45)
+    failover.sh             — HA failover scenario, master chassis loss (issue #105)
     collect-artifacts.sh    — dump lab state for offline triage
 ```
 
@@ -152,11 +157,17 @@ the lab in three layers:
   neighbor pushed by `gwnode-entrypoint.sh` (`192.0.2.1`) is
   replaced by `bootstrap.sh` once the underlay is up.
 - `client-1`: `10.0.0.2/24` on `eth1`, default route via `10.0.0.1`.
-- `gateway-1` (the priority-30 chassis): a veth pair
+- `gateway-3` (the priority-10 chassis): a veth pair
   `vm1-host` ↔ `vm1-eth0` — the host side is bound to `br-int` with
   `external_ids:iface-id=ls0-vm1`, the peer side lives inside a `vm1`
   network namespace configured with `192.168.10.10/24` and a default
   route via `192.168.10.1`. This is the responder behind the FIP.
+  The workload sits on `gateway-3` (not the master) so failover
+  scenarios that stop the master chassis do not also take out the
+  responder — see issue
+  [#105](https://github.com/osism/ovn-network-agent/issues/105). As a
+  side effect, the baseline exercises cross-chassis geneve
+  (master `gateway-1` ↔ workload host `gateway-3`).
 
 ## Running locally
 
@@ -165,6 +176,7 @@ From the repository root:
 ```sh
 make e2e-up          # build images + containerlab deploy + bootstrap
 make e2e-baseline    # run the baseline reachability scenario
+make e2e-failover    # run the HA failover scenario (master chassis loss)
 make e2e-down        # containerlab destroy
 ```
 
@@ -174,6 +186,33 @@ to 30s for the agent's reconcile loop to install the routes. The exit
 code mirrors `ping`'s — any packet loss fails the scenario. Override
 `FIP`, `RECONCILE_TIMEOUT`, `PING_COUNT` or `PING_TIMEOUT` in the
 environment when triaging.
+
+`make e2e-failover` invokes `test/e2e/scenarios/failover.sh`, which
+runs the baseline first as a sanity gate (disable with
+`SANITY_GATE=0`), simulates chassis loss by stopping `ovn-controller`
+on `gateway-1` via `ovn-ctl stop_controller` (clean SIGTERM,
+ovn-controller releases its claim on `cr-lr0-public`, OVN re-elects
+to the priority-20 chassis), and polls reachability through the FIP
+until the new master answers. The deadline is `FAILOVER_TIMEOUT`
+(default 30s); after recovery the scenario asserts that
+`cr-lr0-public` actually migrated away from `MASTER` (guarding
+against a false pass where OVS keeps executing stale flows), then
+runs a 5-packet final probe that must return 100% success. An EXIT
+trap then starts `ovn-controller` again via `ovn-ctl start_controller`
+and waits up to `FAILBACK_TIMEOUT` (default 60s) for `cr-lr0-public`
+to bind back **and** for `client-1 → FIP` reachability to come back,
+leaving the lab at baseline state. Override `MASTER`, `FIP`,
+`FAILOVER_TIMEOUT`, `FAILBACK_TIMEOUT` or `SANITY_GATE` when
+triaging.
+
+The scenario stops just `ovn-controller` rather than the whole
+container because containerlab wires the per-gateway underlay
+(`gateway-N:eth1 ↔ upstream:ethN`) as veth pairs at deploy time and
+does not re-establish them on container restart — `docker stop` /
+`docker start` would leave the master with no underlay and no BGP
+session, so the lab could not be returned to baseline. The OVN HA
+mechanism under test (re-election of `cr-lr0-public` after the
+priority-30 chassis's claim goes away) is the same either way.
 
 Equivalent manual sequence (useful for triage):
 
@@ -227,20 +266,19 @@ The workflow does **not** run on pull requests: spinning the lab up
 adds ~10 minutes to CI on a green run, which is too coarse for the
 per-PR feedback loop the rest of the workflows target.
 
-The job:
+Two jobs run in sequence:
 
-1. installs containerlab via the upstream one-liner installer,
-2. runs `make e2e-up` to build the images, deploy the topology and
-   seed the NB DB,
-3. runs `test/e2e/scenarios/baseline.sh`,
-4. on failure: dumps lab state via
-   `test/e2e/scenarios/collect-artifacts.sh` and uploads the result
-   as an artifact named `e2e-artifacts-<run id>-<attempt>`,
-5. always runs `make e2e-down` so containers and docker networks do
-   not leak between runs.
+- **`baseline`** — installs containerlab, runs `make e2e-up`, executes
+  `test/e2e/scenarios/baseline.sh`, dumps + uploads artifacts on
+  failure (`e2e-artifacts-<run id>-<attempt>`), and always tears the
+  lab down.
+- **`failover`** (`needs: baseline`) — same shape as baseline, but
+  executes `test/e2e/scenarios/failover.sh`. On failure the artifact
+  bundle is uploaded as `e2e-artifacts-failover-<run id>-<attempt>`.
 
-The whole job is capped at 15 minutes — matching the budget in issue
-[#45](https://github.com/osism/ovn-network-agent/issues/45).
+Both jobs are capped at 15 minutes — matching the budgets in issues
+[#45](https://github.com/osism/ovn-network-agent/issues/45) and
+[#105](https://github.com/osism/ovn-network-agent/issues/105).
 
 ### Triaging a failed run
 
