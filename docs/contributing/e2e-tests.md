@@ -25,6 +25,11 @@ The harness has two layers:
    ([#111](https://github.com/osism/ovn-network-agent/issues/111))
    hard-kills the priority-30 chassis and asserts that NB rows owned
    by the dead chassis are garbage-collected by surviving peers.
+   [`hairpin.sh`](https://github.com/osism/ovn-network-agent/blob/main/test/e2e/scenarios/hairpin.sh)
+   ([#108](https://github.com/osism/ovn-network-agent/issues/108))
+   adds a second FIP backend co-located with the existing one on the
+   active master and exercises the agent's `cookie=0x998`
+   `actions=output:in_port` hairpin rule on `br-ex` end-to-end.
 
 ## Layout
 
@@ -40,6 +45,7 @@ test/e2e/
   scenarios/
     baseline.sh             — baseline reachability scenario (issue #45)
     failover.sh             — HA failover scenario, master chassis loss (issue #105)
+    hairpin.sh              — same-chassis hairpin scenario, two FIPs on master (issue #108)
     stale-chassis.sh        — stale chassis cleanup scenario, hard kill (issue #111)
     collect-artifacts.sh    — dump lab state for offline triage
 ```
@@ -182,6 +188,7 @@ From the repository root:
 make e2e-up             # build images + containerlab deploy + bootstrap
 make e2e-baseline       # run the baseline reachability scenario
 make e2e-failover       # run the HA failover scenario (master chassis loss)
+make e2e-hairpin        # run the same-chassis hairpin scenario (two FIPs on master)
 make e2e-stale-chassis  # run the stale-chassis cleanup scenario (hard kill)
 make e2e-down           # containerlab destroy
 ```
@@ -219,6 +226,50 @@ does not re-establish them on container restart — `docker stop` /
 session, so the lab could not be returned to baseline. The OVN HA
 mechanism under test (re-election of `cr-lr0-public` after the
 priority-30 chassis's claim goes away) is the same either way.
+
+`make e2e-hairpin` invokes `test/e2e/scenarios/hairpin.sh`, which
+exercises the agent's same-chassis hairpin OpenFlow rule (`cookie=0x998`,
+`actions=output:in_port`) on `br-ex`. The baseline lab seeds a single
+FIP-with-backend on `lr0` (`192.0.2.10` → `192.168.10.10` on `vm1`,
+hosted on `gateway-3`); the hairpin path can only fire when a second
+FIP backend co-located on the same active master exists. The scenario
+runs the baseline first as a sanity gate (disable with `SANITY_GATE=0`),
+then adds — scenario-locally — a second FIP `192.0.2.12` on `lr0` with
+a backing LSP `ls0-vm2` (`192.168.10.12`, MAC `02:00:00:00:0a:0b`) and
+a `vm2` netns + veth on `gateway-3` so the new FIP has a real
+responder. It polls `gateway-1` for the new hairpin flow on `br-ex`
+(default `RECONCILE_TIMEOUT=30s`), asserts that **both** FIPs have a
+`cookie=0x998` flow with `actions=output:in_port` (matching the issue's
+acceptance criterion of "at least one matching rule per FIP on the
+chassis"), and finally runs the probe: `ping -c 5 -W 2 192.0.2.12`
+from inside the existing `vm1` netns on `gateway-3`. The probe's exit
+code is the scenario's exit code — any packet loss fails the run. The
+EXIT trap removes the LSP, NAT, host-side veth and netns added for
+the second FIP, returning the lab to baseline so a subsequent
+`make e2e-baseline` keeps passing.
+
+The scenario uses **option (2)** from issue #108 (scenario-local
+addition of the second FIP) rather than (1) (a third FIP baked into
+`bootstrap.sh`). Keeping the baseline minimal means failover and
+stale-chassis still observe the same lab the original issues
+specified, and the hairpin scenario remains self-contained — its
+teardown leaves nothing behind for other scenarios to trip over.
+
+The probe runs from inside `vm1` (the existing FIP_A workload) and
+targets FIP_B's external IP. The expected packet flow on a green
+run: `vm1` (`192.168.10.10` on `gateway-3`) → geneve → `br-int` on
+`gateway-1` → `lr0` pipeline (egress SNAT to `192.0.2.10`, route to
+the connected `192.0.2.0/24` via `lr0-public`) → `cr-lr0-public` on
+`gateway-1` → `ls-public` localnet → `br-ex`. There the agent's
+`cookie=0x998` flow on `gateway-1` matches `ip_dst=192.0.2.12` and
+reflects the packet back via `output:in_port` into OVN, where the
+LR pipeline now ingresses on the external port, applies DNAT
+(`192.0.2.12` → `192.168.10.12`), and forwards through `lr0-ls0` to
+`vm2` on `gateway-3`. Without the hairpin flow OVS drops
+`output:in_port` by default and the second-hop DNAT never fires,
+which is what makes a regression in `ReconcileOVSHairpinFlows`
+visible end-to-end. Override `FIP_B`, `FIP_B_INTERNAL`, `MASTER`,
+`WORKLOAD_HOST`, `RECONCILE_TIMEOUT` or `SANITY_GATE` when triaging.
 
 `make e2e-stale-chassis` invokes `test/e2e/scenarios/stale-chassis.sh`,
 which exercises the agent's garbage-collection path for managed NB
@@ -354,7 +405,8 @@ The workflow does **not** run on pull requests: spinning the lab up
 adds ~10 minutes to CI on a green run, which is too coarse for the
 per-PR feedback loop the rest of the workflows target.
 
-Three jobs run in sequence:
+Four jobs run, each on its own runner so a regression in one
+scenario is reported in isolation:
 
 - **`baseline`** — installs containerlab, runs `make e2e-up`, executes
   `test/e2e/scenarios/baseline.sh`, dumps + uploads artifacts on
@@ -363,6 +415,12 @@ Three jobs run in sequence:
 - **`failover`** (`needs: baseline`) — same shape as baseline, but
   executes `test/e2e/scenarios/failover.sh`. On failure the artifact
   bundle is uploaded as `e2e-artifacts-failover-<run id>-<attempt>`.
+- **`hairpin`** (`needs: baseline`, runs in parallel with `failover`)
+  — same shape, but executes `test/e2e/scenarios/hairpin.sh`. The
+  job points the scenario's `ARTIFACTS_DIR` at the same artifact
+  root so the before/after `cookie=0x998` `dump-flows` snapshots are
+  bundled with the lab-state dump. On failure the artifact bundle
+  is uploaded as `e2e-artifacts-hairpin-<run id>-<attempt>`.
 - **`stale-chassis`** (`needs: failover`) — same shape, but executes
   `test/e2e/scenarios/stale-chassis.sh`. The job points the
   scenario's `ARTIFACTS_DIR` at the same artifact root so the
@@ -370,10 +428,11 @@ Three jobs run in sequence:
   bundled with the lab-state dump. On failure the artifact bundle is
   uploaded as `e2e-artifacts-stale-chassis-<run id>-<attempt>`.
 
-All three jobs are capped at 15 minutes — matching the budgets in
+All four jobs are capped at 15 minutes — matching the budgets in
 issues
 [#45](https://github.com/osism/ovn-network-agent/issues/45),
-[#105](https://github.com/osism/ovn-network-agent/issues/105), and
+[#105](https://github.com/osism/ovn-network-agent/issues/105),
+[#108](https://github.com/osism/ovn-network-agent/issues/108), and
 [#111](https://github.com/osism/ovn-network-agent/issues/111).
 
 ### Triaging a failed run
@@ -396,6 +455,8 @@ writes:
   frr/<gateway>-bgp-summary.txt    — `vtysh -c "show bgp summary"`
   kernel/<gateway>-ip-route.txt    — `ip route show table all`
   agent/<gateway>.log              — copy of the gateway container's stdout
+  hairpin/hairpin-flows-before.txt — `cookie=0x998` flows on master:br-ex before adding FIP_B (hairpin only)
+  hairpin/hairpin-flows-after.txt  — `cookie=0x998` flows on master:br-ex after adding FIP_B (hairpin only)
   stale-chassis/nb-before-kill.txt — NB rows tagged for the killed chassis pre-kill (stale-chassis only)
   stale-chassis/nb-after-kill.txt  — NB rows still tagged for the killed chassis after the cleanup deadline (stale-chassis only)
   stale-chassis/peer-cleanup.log   — surviving peer's `stale chassis route removed` line (stale-chassis only)
