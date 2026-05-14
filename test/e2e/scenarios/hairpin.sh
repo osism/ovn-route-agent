@@ -232,13 +232,20 @@ wait_for_hairpin_flow() {
     local target="$1"
     local deadline
     deadline=$(( $(date +%s) + RECONCILE_TIMEOUT ))
-    log "waiting up to ${RECONCILE_TIMEOUT}s for hairpin flow ip_dst=${target} on ${MASTER}:br-ex"
+    log "waiting up to ${RECONCILE_TIMEOUT}s for hairpin flow dst=${target} on ${MASTER}:br-ex"
     while (( $(date +%s) < deadline )); do
-        if dump_hairpin_flows | grep -q "ip_dst=${target}"; then
+        # OVS dumps the L3 destination match as either `nw_dst=` (legacy
+        # form, what the OVS shipped with Ubuntu 24.04 cloud-archive
+        # flamingo emits) or `ip_dst=` (OXM-style, newer OVS). Accept
+        # both so the match does not depend on which OVS the gwnode
+        # image happens to bundle.
+        if dump_hairpin_flows | grep -Eq "(nw_dst|ip_dst)=${target}([^0-9]|$)"; then
             return 0
         fi
         sleep 2
     done
+    log "no hairpin flow appeared within ${RECONCILE_TIMEOUT}s; current cookie=0x998 dump:"
+    dump_hairpin_flows | sed 's/^/    /' >&2
     return 1
 }
 
@@ -263,9 +270,15 @@ verify_hairpin_flows() {
         # Match on the destination-IP hint and on the action so a
         # priority-tweak, MAC-tweak collision, or accidental drop
         # rewrite of the same cookie can't pass for a hairpin.
+        # The destination match is dumped as `nw_dst=` (legacy) or
+        # `ip_dst=` (OXM) depending on OVS version; the action is
+        # dumped as the OVS-canonical `IN_PORT` shorthand for the
+        # `output:in_port` form the agent installs. Accept both
+        # spellings on each side so a future OVS bump does not
+        # silently turn this assertion into a no-op.
         if ! printf '%s\n' "${flows}" \
-                | grep -E "ip_dst=${fip}(/32)?" \
-                | grep -q 'actions=.*output:in_port'; then
+                | grep -E "(nw_dst|ip_dst)=${fip}([^0-9]|$)" \
+                | grep -Eq 'actions=.*(IN_PORT|output:in_port)'; then
             missing="${missing} ${fip}"
         fi
     done
