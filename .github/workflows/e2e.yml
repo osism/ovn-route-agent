@@ -1,13 +1,17 @@
 name: E2E
 
-# Per issue #45, the E2E workflow does not run on pull requests: the
-# containerlab harness boots three OVN+OVS+FRR gateway containers plus
-# a central node and clients, and even on the green path eats ~10 min
-# of runner time. Reserving it for `main` pushes and explicit
-# `workflow_dispatch` keeps PR feedback fast while still proving the
-# topology before a release.
+# The containerlab harness boots three OVN+OVS+FRR gateway containers
+# plus a central node and clients, and even on the green path eats
+# ~10 min of runner time. We still run it on every push to `main` and
+# on `workflow_dispatch`, but also on pull requests so authors can
+# debug topology-level regressions on the same runners CI uses — the
+# GHA environment differs enough from local Docker hosts (kernel,
+# resource limits, image caches) that lab-up failures often only
+# reproduce here.
 on:
   push:
+    branches: [main]
+  pull_request:
     branches: [main]
   workflow_dispatch:
 
