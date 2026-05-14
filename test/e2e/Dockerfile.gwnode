@@ -40,6 +40,19 @@ RUN CGO_ENABLED=0 GOOS=linux GOARCH=${TARGETARCH:-amd64} \
         -ldflags "-s -w -X main.version=${VERSION}" \
         -o /out/ovn-network-agent .
 
+# pf-backend is the tiny HTTP responder driven by the port-forward E2E
+# scenario (test/e2e/scenarios/pf-external.sh, issue #109). It logs the
+# source IP of each accepted connection so the scenario can assert that
+# OVN's DNAT data path preserved the client's underlay IP end-to-end.
+# Built here in the same stage as the agent so the runtime image keeps
+# every test helper as a static binary instead of pulling Python /
+# netcat / socat into the gwnode image (the 600 MB image budget in
+# docs/contributing/e2e-tests.md leaves no room for a Python install).
+RUN CGO_ENABLED=0 GOOS=linux GOARCH=${TARGETARCH:-amd64} \
+    go build -trimpath \
+        -ldflags "-s -w" \
+        -o /out/pf-backend ./test/e2e/pf-backend
+
 # ---------------------------------------------------------------------------
 # Runtime stage — Ubuntu 24.04 + OVS + ovn-host + FRR + the agent.
 # ---------------------------------------------------------------------------
@@ -79,10 +92,12 @@ RUN sed -i 's/^bgpd=no/bgpd=yes/' /etc/frr/daemons \
  && grep -q '^bgpd=yes' /etc/frr/daemons
 
 COPY --from=build /out/ovn-network-agent /usr/local/bin/ovn-network-agent
+COPY --from=build /out/pf-backend        /usr/local/bin/pf-backend
 COPY test/e2e/gwnode-entrypoint.sh /usr/local/bin/gwnode-entrypoint.sh
 COPY test/e2e/gwnode-config.yaml   /etc/ovn-network-agent/config.yaml
 RUN chmod 0755 /usr/local/bin/gwnode-entrypoint.sh \
-               /usr/local/bin/ovn-network-agent
+               /usr/local/bin/ovn-network-agent \
+               /usr/local/bin/pf-backend
 
 # Healthcheck per issue #44: OVS responsive + ovn-controller and the agent
 # both running. `pgrep -x` matches against /proc/<pid>/comm, which Linux
