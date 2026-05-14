@@ -3,7 +3,7 @@ VERSION   ?= $(shell git describe --tags --always --dirty 2>/dev/null || echo "d
 LDFLAGS   := -s -w -X main.version=$(VERSION)
 GOFLAGS   := -trimpath
 
-.PHONY: all build build-static clean fmt vet test test-integration install docs-gen docs-gen-check e2e-images e2e-up e2e-down e2e-install-tools e2e-baseline e2e-failover e2e-stale-chassis
+.PHONY: all build build-static clean fmt vet test test-integration install docs-gen docs-gen-check e2e-images e2e-up e2e-down e2e-install-tools e2e-baseline e2e-failover e2e-hairpin e2e-stale-chassis
 
 # Containerlab E2E harness. See test/e2e/README.md for the topology and
 # acceptance criteria (issue #44).
@@ -11,6 +11,7 @@ E2E_TOPOLOGY    := test/e2e/topology.clab.yml
 E2E_BOOTSTRAP   := test/e2e/bootstrap.sh
 E2E_BASELINE    := test/e2e/scenarios/baseline.sh
 E2E_FAILOVER    := test/e2e/scenarios/failover.sh
+E2E_HAIRPIN     := test/e2e/scenarios/hairpin.sh
 E2E_STALE       := test/e2e/scenarios/stale-chassis.sh
 E2E_GWNODE_TAG  := ovn-network-agent/gwnode:e2e
 E2E_CENTRAL_TAG := ovn-network-agent/central:e2e
@@ -134,6 +135,17 @@ e2e-baseline:
 # tearing the lab down.
 e2e-failover:
 	$(E2E_FAILOVER)
+
+# Run the same-chassis hairpin scenario (issue #108) against a lab
+# that is already up. Adds a second FIP backend (ls0-vm2 / 192.0.2.12)
+# co-located on the active master, asserts the agent installs the
+# OpenFlow hairpin rule (cookie 0x998) on br-ex for both FIPs, and
+# pings the new FIP from the existing workload netns to exercise the
+# hairpin data path end-to-end. Mirrors the step the CI workflow runs;
+# the scenario's own EXIT trap removes the second FIP so a subsequent
+# `make e2e-baseline` works without tearing the lab down.
+e2e-hairpin:
+	$(E2E_HAIRPIN)
 
 # Run the stale-chassis cleanup scenario (issue #111) against a lab
 # that is already up. Hard-kills the priority-30 chassis (SIGKILL, no
