@@ -21,6 +21,10 @@ The harness has two layers:
    ([#105](https://github.com/osism/ovn-network-agent/issues/105))
    builds on the baseline and exercises HA re-election by stopping the
    priority-30 chassis.
+   [`stale-chassis.sh`](https://github.com/osism/ovn-network-agent/blob/main/test/e2e/scenarios/stale-chassis.sh)
+   ([#111](https://github.com/osism/ovn-network-agent/issues/111))
+   hard-kills the priority-30 chassis and asserts that NB rows owned
+   by the dead chassis are garbage-collected by surviving peers.
 
 ## Layout
 
@@ -36,6 +40,7 @@ test/e2e/
   scenarios/
     baseline.sh             — baseline reachability scenario (issue #45)
     failover.sh             — HA failover scenario, master chassis loss (issue #105)
+    stale-chassis.sh        — stale chassis cleanup scenario, hard kill (issue #111)
     collect-artifacts.sh    — dump lab state for offline triage
 ```
 
@@ -174,10 +179,11 @@ the lab in three layers:
 From the repository root:
 
 ```sh
-make e2e-up          # build images + containerlab deploy + bootstrap
-make e2e-baseline    # run the baseline reachability scenario
-make e2e-failover    # run the HA failover scenario (master chassis loss)
-make e2e-down        # containerlab destroy
+make e2e-up             # build images + containerlab deploy + bootstrap
+make e2e-baseline       # run the baseline reachability scenario
+make e2e-failover       # run the HA failover scenario (master chassis loss)
+make e2e-stale-chassis  # run the stale-chassis cleanup scenario (hard kill)
+make e2e-down           # containerlab destroy
 ```
 
 `make e2e-baseline` invokes `test/e2e/scenarios/baseline.sh`, which
@@ -213,6 +219,88 @@ does not re-establish them on container restart — `docker stop` /
 session, so the lab could not be returned to baseline. The OVN HA
 mechanism under test (re-election of `cr-lr0-public` after the
 priority-30 chassis's claim goes away) is the same either way.
+
+`make e2e-stale-chassis` invokes `test/e2e/scenarios/stale-chassis.sh`,
+which exercises the agent's garbage-collection path for managed NB
+rows after a peer chassis disappears WITHOUT a graceful shutdown. It
+runs the baseline first as a sanity gate (disable with
+`SANITY_GATE=0`), seeds a sentinel managed static route on `lr0`
+tagged with `external_ids:ovn-network-agent-chassis=<MASTER>`, then:
+
+1. **Hard-kills `gateway-1`** with `docker kill -s KILL` — the
+   agent's SIGTERM handler is intentionally skipped, so the dead
+   chassis leaves no trace cleaned up by itself.
+2. **Drains the dead chassis in NB** with
+   `ovn-nbctl lrp-set-gateway-chassis lr0-public <MASTER> 0` — the
+   same mutation the agent's own `DrainGateways` writes on graceful
+   shutdown ([ovn_gateway.go:589](https://github.com/osism/ovn-network-agent/blob/main/ovn_gateway.go#L589)).
+   We run it externally because the killed agent never got to do
+   it; in production an HA orchestrator (BFD monitor / Pacemaker /
+   neutron-ovn-agent) is responsible for this step.
+3. **Removes the SB Chassis row** with `ovn-sbctl chassis-del` —
+   simulates the external reaper (neutron-ovn-agent on
+   `chassis-down`, ovn-northd's own stale-chassis sweeper on recent
+   OVN versions, or an HA orchestrator observing the node down).
+   A killed ovn-controller does not remove its own SB row, so
+   without this surviving agents would keep seeing the dead chassis
+   as alive and the cleanup loop would never fire.
+
+Surviving agents on `gateway-2` and `gateway-3` then notice that
+the chassis row is gone from SB, wait `stale_chassis_grace_period`
+(configured to `30s` in the gwnode E2E config so the scenario stays
+inside its CI budget), and remove the rows tagged for the dead
+chassis via `CleanupStaleChassisManagedEntries`. The scenario polls
+NB for up to `STALE_TIMEOUT` (default 150s) and additionally greps
+the surviving agents' `docker logs` for the
+`stale chassis route removed` line referencing `chassis=<MASTER>` —
+both signals must fire to prove the cleanup was deliberate. On exit
+the killed chassis is restarted with `docker start` (so the
+artifact collector can still `docker exec` into it) and the
+residual sentinel route is removed. Override `MASTER`, `PEERS`,
+`STALE_TIMEOUT`, `SENTINEL_PREFIX`, `LR_PUBLIC_PORT` or
+`SANITY_GATE` when triaging.
+
+Because the scenario externally drains `gateway-1`'s
+`Gateway_Chassis` priority to 0 after the kill, OVN does **not**
+re-elect `gateway-1` on `docker start` and `gateway-2` stays master.
+`make e2e-baseline` against the same lab keeps passing —
+reachability via the new master is intact. The lab is, however,
+HA-asymmetric afterwards (single-master, `gateway-1` permanently
+drained at priority 0), so `make e2e-failover` against the same lab
+has no priority-30 master left to fail and will misbehave. Chain
+`make e2e-down && make e2e-up` between destructive scenarios when
+running locally. CI handles this automatically through the
+workflow's `make e2e-down` step, which runs with `if: always()`
+regardless of the scenario outcome.
+
+The explicit `chassis-del` after the kill simulates the external
+reaper that would remove a dead chassis row in production
+(neutron-ovn-agent on `chassis-down`, ovn-northd's own stale-chassis
+sweeper on recent OVN versions, or an HA orchestrator observing the
+node down). A killed ovn-controller does **not** remove its own SB
+row — the row is only released on graceful shutdown — so without
+the explicit deletion, surviving agents would keep seeing the dead
+chassis as alive and the cleanup loop would never fire. The path
+under test is what the agent does after the row disappears, not how
+the row disappears.
+
+A sentinel managed route is needed because the production code path
+that the cleanup loop targets (managed static routes tagged with a
+chassis name) is not exercised by the baseline lab on its own: the
+agent only creates a default route via the virtual gateway IP, and
+the new master re-tags that row instead of leaving an orphan for the
+cleanup loop to find (see `ensureDefaultRoute` in `ovn_gateway.go`).
+Seeding a unique sentinel prefix gives the cleanup loop a row that no
+surviving agent will reclaim, so its deletion is unambiguous evidence
+of the stale-chassis path running.
+
+Why a hard kill (and not `docker stop` or `ovn-ctl stop_controller`):
+`docker stop` delivers SIGTERM, which the agent traps to run its
+graceful-shutdown path — that case is what the failover scenario
+already covers. The stale-chassis path is specifically for the
+non-graceful death case where surviving peers are the only ones that
+can clean up. `docker kill -s KILL` skips every signal handler in the
+container.
 
 Equivalent manual sequence (useful for triage):
 
@@ -266,7 +354,7 @@ The workflow does **not** run on pull requests: spinning the lab up
 adds ~10 minutes to CI on a green run, which is too coarse for the
 per-PR feedback loop the rest of the workflows target.
 
-Two jobs run in sequence:
+Three jobs run in sequence:
 
 - **`baseline`** — installs containerlab, runs `make e2e-up`, executes
   `test/e2e/scenarios/baseline.sh`, dumps + uploads artifacts on
@@ -275,10 +363,18 @@ Two jobs run in sequence:
 - **`failover`** (`needs: baseline`) — same shape as baseline, but
   executes `test/e2e/scenarios/failover.sh`. On failure the artifact
   bundle is uploaded as `e2e-artifacts-failover-<run id>-<attempt>`.
+- **`stale-chassis`** (`needs: failover`) — same shape, but executes
+  `test/e2e/scenarios/stale-chassis.sh`. The job points the
+  scenario's `ARTIFACTS_DIR` at the same artifact root so the
+  before/after NB snapshots and the peer cleanup-log capture are
+  bundled with the lab-state dump. On failure the artifact bundle is
+  uploaded as `e2e-artifacts-stale-chassis-<run id>-<attempt>`.
 
-Both jobs are capped at 15 minutes — matching the budgets in issues
-[#45](https://github.com/osism/ovn-network-agent/issues/45) and
-[#105](https://github.com/osism/ovn-network-agent/issues/105).
+All three jobs are capped at 15 minutes — matching the budgets in
+issues
+[#45](https://github.com/osism/ovn-network-agent/issues/45),
+[#105](https://github.com/osism/ovn-network-agent/issues/105), and
+[#111](https://github.com/osism/ovn-network-agent/issues/111).
 
 ### Triaging a failed run
 
@@ -300,6 +396,9 @@ writes:
   frr/<gateway>-bgp-summary.txt    — `vtysh -c "show bgp summary"`
   kernel/<gateway>-ip-route.txt    — `ip route show table all`
   agent/<gateway>.log              — copy of the gateway container's stdout
+  stale-chassis/nb-before-kill.txt — NB rows tagged for the killed chassis pre-kill (stale-chassis only)
+  stale-chassis/nb-after-kill.txt  — NB rows still tagged for the killed chassis after the cleanup deadline (stale-chassis only)
+  stale-chassis/peer-cleanup.log   — surviving peer's `stale chassis route removed` line (stale-chassis only)
 ```
 
 You can reproduce the same dump on a local lab with:
