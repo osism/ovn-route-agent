@@ -116,3 +116,59 @@ jobs:
       - name: Tear the lab down
         if: always()
         run: make e2e-down
+
+  stale-chassis:
+    name: Stale-chassis cleanup (hard kill)
+    runs-on: ubuntu-latest
+    # Runs after the failover job on its own runner so a stale-cleanup
+    # regression is reported in isolation. Same 15-minute budget — the
+    # scenario adds at most ~150s of wait time (grace + jitter +
+    # reconcile + safety) on top of the baseline gate. The reduced
+    # stale_chassis_grace_period (30s) is set in
+    # test/e2e/gwnode-config.yaml per issue #111 so this job stays well
+    # inside the 5-minute target.
+    needs: failover
+    timeout-minutes: 15
+
+    env:
+      E2E_TOPOLOGY: test/e2e/topology.clab.yml
+      LAB: ovn-e2e
+
+    steps:
+      - uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6
+
+      - name: Install containerlab
+        run: bash -c "$(curl -sL https://get.containerlab.dev)"
+
+      - name: Load openvswitch kernel module
+        run: sudo modprobe openvswitch
+
+      - name: Bring the lab up
+        run: make e2e-up
+
+      - name: Run stale-chassis scenario
+        # Direct the scenario's NB-snapshot + peer-cleanup-log captures
+        # into the same artifact root so collect-artifacts.sh and the
+        # uploader both pick them up. `runner.temp` is only available
+        # at step scope, not the job-level env block.
+        env:
+          ARTIFACTS_DIR: ${{ runner.temp }}/e2e-artifacts/stale-chassis
+        run: ./test/e2e/scenarios/stale-chassis.sh
+
+      - name: Collect failure artifacts
+        if: failure()
+        run: |
+          ./test/e2e/scenarios/collect-artifacts.sh "${RUNNER_TEMP}/e2e-artifacts"
+
+      - name: Upload failure artifacts
+        if: failure()
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7
+        with:
+          name: e2e-artifacts-stale-chassis-${{ github.run_id }}-${{ github.run_attempt }}
+          path: ${{ runner.temp }}/e2e-artifacts
+          if-no-files-found: warn
+          retention-days: 7
+
+      - name: Tear the lab down
+        if: always()
+        run: make e2e-down
