@@ -31,7 +31,12 @@
 #              192.0.2.10 → 192.168.10.10
 #              192.0.2.11 → 192.168.10.11
 #        * Workload LSP on ls0: 192.168.10.10 / 02:00:00:00:0a:0a
-#          (hosted by gateway-1 — the priority-30 chassis).
+#          (hosted by gateway-3 — the priority-10 chassis). Keeping
+#          the responder off the master chassis is what makes
+#          single-chassis failover scenarios (#105) testable: stopping
+#          the master never takes out the workload at the same time,
+#          and the baseline already exercises cross-chassis geneve
+#          (master gateway-1 ↔ workload host gateway-3).
 #   2. Per-gateway underlay
 #        * eth1 moves out of br-ex into vrf-provider; gateway-N gets
 #          100.64.N.2/30 on eth1.
@@ -49,7 +54,7 @@
 #          upstream learns where the FIPs live.
 #   5. Client-1 container
 #        * eth1 = 10.0.0.2/24, default route via 10.0.0.1.
-#   6. Kernel-side workload on gateway-1
+#   6. Kernel-side workload on gateway-3
 #        * veth pair `vm1-host`↔`vm1-eth0`, host side bound to br-int
 #          with `external_ids:iface-id=ls0-vm1`, peer side moved into a
 #          `vm1` netns with 192.168.10.10/24 + default route via
@@ -111,7 +116,7 @@ CLIENT_NODE="clab-${LAB_NAME}-${CLIENT_NAME}"
 CLIENT_CIDR="${CLIENT_CIDR:-10.0.0.2/24}"
 CLIENT_GW="${CLIENT_GW:-10.0.0.1}"
 
-WORKLOAD_HOST="${WORKLOAD_HOST:-gateway-1}"
+WORKLOAD_HOST="${WORKLOAD_HOST:-gateway-3}"
 WORKLOAD_NETNS="${WORKLOAD_NETNS:-vm1}"
 WORKLOAD_LSP="${WORKLOAD_LSP:-${LS_NAME}-vm1}"
 WORKLOAD_MAC="${WORKLOAD_MAC:-02:00:00:00:0a:0a}"
