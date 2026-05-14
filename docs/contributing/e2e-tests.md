@@ -30,6 +30,13 @@ The harness has two layers:
    adds a second FIP backend co-located with the existing one on the
    active master and exercises the agent's `cookie=0x998`
    `actions=output:in_port` hairpin rule on `br-ex` end-to-end.
+   [`pf-external.sh`](https://github.com/osism/ovn-network-agent/blob/main/test/e2e/scenarios/pf-external.sh)
+   ([#109](https://github.com/osism/ovn-network-agent/issues/109))
+   seeds an OVN Load_Balancer (port-forward / DNAT) on `lr0`, drives
+   it with `curl` from `client-1`, and asserts the backend log records
+   the client's underlay IP — i.e. no SNAT on the way in. The
+   conceptual model the scenario exercises is documented in
+   [Port forwarding (DNAT)](../explanation/port-forwarding.md).
 
 ## Layout
 
@@ -46,8 +53,13 @@ test/e2e/
     baseline.sh             — baseline reachability scenario (issue #45)
     failover.sh             — HA failover scenario, master chassis loss (issue #105)
     hairpin.sh              — same-chassis hairpin scenario, two FIPs on master (issue #108)
+    pf-external.sh          — port-forward / DNAT scenario, source IP preserved (issue #109)
     stale-chassis.sh        — stale chassis cleanup scenario, hard kill (issue #111)
     collect-artifacts.sh    — dump lab state for offline triage
+  pf-backend/
+    main.go                 — tiny HTTP responder shipped at /usr/local/bin/pf-backend
+                              in the gwnode image; logs each connection's source IP
+                              for the port-forward scenario's assertion.
 ```
 
 ## Prerequisites
@@ -189,6 +201,7 @@ make e2e-up             # build images + containerlab deploy + bootstrap
 make e2e-baseline       # run the baseline reachability scenario
 make e2e-failover       # run the HA failover scenario (master chassis loss)
 make e2e-hairpin        # run the same-chassis hairpin scenario (two FIPs on master)
+make e2e-pf-external    # run the port-forward / DNAT scenario (source IP preserved)
 make e2e-stale-chassis  # run the stale-chassis cleanup scenario (hard kill)
 make e2e-down           # containerlab destroy
 ```
@@ -270,6 +283,47 @@ LR pipeline now ingresses on the external port, applies DNAT
 which is what makes a regression in `ReconcileOVSHairpinFlows`
 visible end-to-end. Override `FIP_B`, `FIP_B_INTERNAL`, `MASTER`,
 `WORKLOAD_HOST`, `RECONCILE_TIMEOUT` or `SANITY_GATE` when triaging.
+
+`make e2e-pf-external` invokes `test/e2e/scenarios/pf-external.sh`,
+which exercises OVN's port-forward / DNAT data path with traffic
+from an external client and asserts the backend observes the
+client's original source IP end-to-end — the "no SNAT on the way
+in" property OpenStack tenants rely on for source-IP-based access
+control. The conceptual model is documented in
+[Port forwarding (DNAT)](../explanation/port-forwarding.md).
+
+The scenario runs the baseline first as a sanity gate (disable with
+`SANITY_GATE=0`), then adds — scenario-locally — an OVN
+`Load_Balancer` row (`pf-external`) mapping `192.0.2.50:80` to
+`192.168.10.10:8080/tcp` and attaches it to `lr0`. A static route on
+`upstream` (`192.0.2.50/32 via 100.64.1.2`) and a scope-link route
+on `gateway-1` (`192.0.2.50/32 dev br-ex`) plumb the VIP into the
+forward path — the agent does not yet propagate Load_Balancer VIPs
+into vrf-provider / br-ex (a follow-up to #109), so the scenario
+seeds those routes itself. A tiny Go HTTP responder
+(`/usr/local/bin/pf-backend`, built in the same Dockerfile stage as
+the agent) is started inside the existing `vm1` netns on
+`gateway-3` and logs the source IP of each accepted connection. The
+scenario then `curl`s `http://192.0.2.50/` from `client-1` (polled
+for up to `RECONCILE_TIMEOUT=60s`) and asserts the backend log
+records a `peer=<client-1-eth1-IP>:*` line — a stray SNAT step on
+the way in (LR internal address, gateway chassis address, …) would
+substitute a different IP here and fail the grep. The EXIT trap
+removes the `Load_Balancer`, both kernel routes and the responder,
+returning the lab to baseline so a subsequent `make e2e-baseline`
+keeps passing. Override `VIP`, `VIP_PORT`, `BACKEND_IP`,
+`BACKEND_PORT`, `MASTER`, `MASTER_UNDERLAY`, `RECONCILE_TIMEOUT` or
+`SANITY_GATE` when triaging.
+
+Why a `Load_Balancer` (and not a `dnat_and_snat` NAT row): the latter
+performs SNAT on the way in, which is exactly the property the
+scenario is meant to disprove. Pure-DNAT NAT rows (`type=dnat`) do
+not carry a port-mapping, so they cannot express the `:80 → :8080`
+translation the issue asks for. `Load_Balancer` is the canonical
+OVN port-forward primitive — the same `lr-lb-add` path
+`neutron-ovn-agent` and `kube-ovn` use in production — and is the
+only ovn-nbctl primitive that combines pure DNAT with a per-port
+mapping today.
 
 `make e2e-stale-chassis` invokes `test/e2e/scenarios/stale-chassis.sh`,
 which exercises the agent's garbage-collection path for managed NB
@@ -405,7 +459,7 @@ The workflow does **not** run on pull requests: spinning the lab up
 adds ~10 minutes to CI on a green run, which is too coarse for the
 per-PR feedback loop the rest of the workflows target.
 
-Four jobs run, each on its own runner so a regression in one
+Five jobs run, each on its own runner so a regression in one
 scenario is reported in isolation:
 
 - **`baseline`** — installs containerlab, runs `make e2e-up`, executes
@@ -421,6 +475,13 @@ scenario is reported in isolation:
   root so the before/after `cookie=0x998` `dump-flows` snapshots are
   bundled with the lab-state dump. On failure the artifact bundle
   is uploaded as `e2e-artifacts-hairpin-<run id>-<attempt>`.
+- **`pf-external`** (`needs: baseline`, runs in parallel with
+  `failover` and `hairpin`) — same shape, but executes
+  `test/e2e/scenarios/pf-external.sh`. The job points the scenario's
+  `ARTIFACTS_DIR` at the same artifact root so the backend
+  source-IP log is bundled with the lab-state dump on failure (per
+  issue #109's acceptance criterion). On failure the artifact
+  bundle is uploaded as `e2e-artifacts-pf-external-<run id>-<attempt>`.
 - **`stale-chassis`** (`needs: failover`) — same shape, but executes
   `test/e2e/scenarios/stale-chassis.sh`. The job points the
   scenario's `ARTIFACTS_DIR` at the same artifact root so the
@@ -428,11 +489,12 @@ scenario is reported in isolation:
   bundled with the lab-state dump. On failure the artifact bundle is
   uploaded as `e2e-artifacts-stale-chassis-<run id>-<attempt>`.
 
-All four jobs are capped at 15 minutes — matching the budgets in
+All five jobs are capped at 15 minutes — matching the budgets in
 issues
 [#45](https://github.com/osism/ovn-network-agent/issues/45),
 [#105](https://github.com/osism/ovn-network-agent/issues/105),
-[#108](https://github.com/osism/ovn-network-agent/issues/108), and
+[#108](https://github.com/osism/ovn-network-agent/issues/108),
+[#109](https://github.com/osism/ovn-network-agent/issues/109), and
 [#111](https://github.com/osism/ovn-network-agent/issues/111).
 
 ### Triaging a failed run
@@ -457,6 +519,7 @@ writes:
   agent/<gateway>.log              — copy of the gateway container's stdout
   hairpin/hairpin-flows-before.txt — `cookie=0x998` flows on master:br-ex before adding FIP_B (hairpin only)
   hairpin/hairpin-flows-after.txt  — `cookie=0x998` flows on master:br-ex after adding FIP_B (hairpin only)
+  pf-external/pf-backend.log       — per-connection source-IP log from the workload-side HTTP responder (pf-external only)
   stale-chassis/nb-before-kill.txt — NB rows tagged for the killed chassis pre-kill (stale-chassis only)
   stale-chassis/nb-after-kill.txt  — NB rows still tagged for the killed chassis after the cleanup deadline (stale-chassis only)
   stale-chassis/peer-cleanup.log   — surviving peer's `stale chassis route removed` line (stale-chassis only)
