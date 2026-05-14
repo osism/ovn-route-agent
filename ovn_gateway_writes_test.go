@@ -5,6 +5,7 @@ import (
 	"errors"
 	"fmt"
 	"reflect"
+	"strings"
 	"testing"
 	"time"
 
@@ -806,6 +807,126 @@ func TestDrainGateways_TimeoutReturnsNilWithRemainingPorts(t *testing.T) {
 	tx := nb.recordedTransacts()
 	if len(tx) != 1 || len(tx[0]) != 1 {
 		t.Errorf("expected one batched priority update before timeout, got %+v", tx)
+	}
+}
+
+// TestDrainGateways_FallsBackToServerSelectOnCacheMiss exercises the
+// issue #115 race: the NB monitor cache is missing the local Gateway_Chassis
+// row, so the cache scan finds nothing to drain. DrainGateways must fall
+// back to a direct OVSDB select (which sees the server-side row) and lower
+// the priority instead of silently no-op'ing.
+func TestDrainGateways_FallsBackToServerSelectOnCacheMiss(t *testing.T) {
+	c, nb, sb := newOVNClientWithFakes(t, "host-a")
+
+	// Cache has only peer entries — no row for host-a (the missed INSERT).
+	nb.setRows("Gateway_Chassis",
+		&NBGatewayChassis{UUID: "g2", Name: "lrp-a_host-b", ChassisName: "host-b", Priority: 20},
+		&NBGatewayChassis{UUID: "g3", Name: "lrp-a_host-c", ChassisName: "host-c", Priority: 10},
+	)
+	// Server-side state (visible to OperationSelect) still has the local row.
+	nb.setSelectRows("Gateway_Chassis", ovsdb.Row{
+		"_uuid":        ovsdb.UUID{GoUUID: "g1"},
+		"name":         "lrp-a_host-a",
+		"chassis_name": "host-a",
+		// JSON-RPC numbers arrive as float64; reproduce that here so the
+		// row decoder is exercised on the real wire shape.
+		"priority": float64(30),
+	})
+	sb.setRows("Chassis", &SBChassis{UUID: "ch-a", Name: "ch-a", Hostname: "host-a"})
+
+	if err := c.DrainGateways(context.Background(), "host-a"); err != nil {
+		t.Fatalf("DrainGateways: %v", err)
+	}
+
+	tx := nb.recordedTransacts()
+	if len(tx) != 2 {
+		t.Fatalf("expected two transacts (select fallback + priority update), got %d: %+v", len(tx), tx)
+	}
+	// First transact is the OperationSelect against Gateway_Chassis.
+	if len(tx[0]) != 1 || tx[0][0].Op != ovsdb.OperationSelect || tx[0][0].Table != "Gateway_Chassis" {
+		t.Fatalf("expected first transact to be select on Gateway_Chassis, got %+v", tx[0])
+	}
+	if len(tx[0][0].Where) != 1 || tx[0][0].Where[0].Column != "chassis_name" || tx[0][0].Where[0].Value != "host-a" {
+		t.Errorf("select must filter on chassis_name == host-a, got %+v", tx[0][0].Where)
+	}
+	// Second transact lowers the recovered row's priority to 0.
+	updates := findOps(t, tx, 1, ovsdb.OperationUpdate, "Gateway_Chassis")
+	if len(updates) != 1 {
+		t.Fatalf("expected one priority update from the fallback, got %d: %+v", len(updates), tx[1])
+	}
+	if updates[0].UUID != "g1" {
+		t.Errorf("update should target the row recovered from the server (g1), got %q", updates[0].UUID)
+	}
+	if got, ok := updates[0].Row["priority"].(int); !ok || got != 0 {
+		t.Errorf("drain op must set priority=0, got %#v", updates[0].Row["priority"])
+	}
+}
+
+// TestDrainGateways_NoFallbackWhenLocalRowPresentAtZero asserts that an
+// already-drained local row (priority 0) does NOT trigger the select
+// fallback. The cache contains the row, so the existing "nothing to drain"
+// fast path runs and no extra OVSDB chatter is emitted.
+func TestDrainGateways_NoFallbackWhenLocalRowPresentAtZero(t *testing.T) {
+	c, nb, _ := newOVNClientWithFakes(t, "host-a")
+	nb.setRows("Gateway_Chassis",
+		&NBGatewayChassis{UUID: "g1", Name: "lrp-a_host-a", ChassisName: "host-a", Priority: 0},
+	)
+
+	if err := c.DrainGateways(context.Background(), "host-a"); err != nil {
+		t.Fatalf("DrainGateways: %v", err)
+	}
+	if got := nb.recordedTransacts(); len(got) != 0 {
+		t.Errorf("expected no transacts (cache has the row), got %+v", got)
+	}
+}
+
+// TestDrainGateways_FallbackReturnsErrorOnTransactFailure ensures the drain
+// surfaces server-side errors from the select fallback instead of swallowing
+// them silently — the caller (shutdown path) needs to record the failure.
+func TestDrainGateways_FallbackReturnsErrorOnTransactFailure(t *testing.T) {
+	c, nb, _ := newOVNClientWithFakes(t, "host-a")
+	// Cache has no local row, forcing the fallback.
+	nb.setRows("Gateway_Chassis",
+		&NBGatewayChassis{UUID: "g2", Name: "lrp-a_host-b", ChassisName: "host-b", Priority: 20},
+	)
+	nb.transactErr = errors.New("connection refused")
+
+	err := c.DrainGateways(context.Background(), "host-a")
+	if err == nil || !strings.Contains(err.Error(), "NB select fallback failed") {
+		t.Errorf("expected fallback error to be surfaced, got %v", err)
+	}
+}
+
+// TestSelectLocalGatewayChassis_DecodesRowFields covers the rowToGatewayChassis
+// decoder for the priority types it must accept: float64 (JSON wire format)
+// and int (in-process fakes / mappers).
+func TestSelectLocalGatewayChassis_DecodesRowFields(t *testing.T) {
+	c, nb, _ := newOVNClientWithFakes(t, "host-a")
+	nb.setSelectRows("Gateway_Chassis",
+		ovsdb.Row{
+			"_uuid":        ovsdb.UUID{GoUUID: "g-float"},
+			"name":         "lrp-a_host-a",
+			"chassis_name": "host-a",
+			"priority":     float64(7),
+		},
+		ovsdb.Row{
+			"_uuid":        ovsdb.UUID{GoUUID: "g-int"},
+			"name":         "lrp-b_host-a",
+			"chassis_name": "host-a",
+			"priority":     3,
+		},
+	)
+
+	got, err := c.selectLocalGatewayChassis(context.Background(), "host-a")
+	if err != nil {
+		t.Fatalf("selectLocalGatewayChassis: %v", err)
+	}
+	want := []NBGatewayChassis{
+		{UUID: "g-float", Name: "lrp-a_host-a", ChassisName: "host-a", Priority: 7},
+		{UUID: "g-int", Name: "lrp-b_host-a", ChassisName: "host-a", Priority: 3},
+	}
+	if !reflect.DeepEqual(got, want) {
+		t.Errorf("decoded rows mismatch:\n  got:  %+v\n  want: %+v", got, want)
 	}
 }
 

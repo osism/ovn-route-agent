@@ -597,6 +597,11 @@ func (o *OVNClient) CleanupStaleChassisManagedEntries(ctx context.Context, stale
 // EnsureActivePriorityLead prevents reverse failover by ensuring the
 // active chassis always has priority >= minActivePriority (currently 2),
 // which is strictly above the restore level of 1.
+//
+// The NB monitor cache occasionally drops Gateway_Chassis INSERTs delivered
+// shortly after the agent's initial subscription (see issue #115). When the
+// cache shows no row at all for the local chassis, fall back to a direct
+// OVSDB select so the drain does not silently no-op.
 func (o *OVNClient) DrainGateways(ctx context.Context, localChassisName string) error {
 	// Step 1: Find all Gateway_Chassis entries for this chassis with priority > 0.
 	var gwChassisList []NBGatewayChassis
@@ -604,15 +609,29 @@ func (o *OVNClient) DrainGateways(ctx context.Context, localChassisName string) 
 		return fmt.Errorf("list gateway chassis: %w", err)
 	}
 
-	var toDrain []NBGatewayChassis
-	for _, gwc := range gwChassisList {
-		if gwc.ChassisName == localChassisName && gwc.Priority > 0 {
-			toDrain = append(toDrain, gwc)
+	toDrain, hasLocalRow := filterDrainCandidates(gwChassisList, localChassisName)
+
+	// Cache may be missing the local row entirely if the Gateway_Chassis
+	// INSERT update was not delivered to this client. Confirm by reading
+	// directly from the NB server before silently skipping the drain.
+	if !hasLocalRow {
+		slog.Warn("drain: cache has no Gateway_Chassis row for this chassis, querying NB directly",
+			"local_chassis_name", localChassisName,
+			"cache_count", len(gwChassisList))
+		serverList, err := o.selectLocalGatewayChassis(ctx, localChassisName)
+		if err != nil {
+			return fmt.Errorf("drain: cache miss + NB select fallback failed: %w", err)
+		}
+		toDrain, _ = filterDrainCandidates(serverList, localChassisName)
+		if len(toDrain) > 0 {
+			slog.Info("drain: NB select recovered Gateway_Chassis rows hidden by the cache",
+				"local_chassis_name", localChassisName, "recovered", len(toDrain))
 		}
 	}
 
 	if len(toDrain) == 0 {
-		slog.Info("drain: no gateway chassis entries to drain on this chassis")
+		slog.Info("drain: no gateway chassis entries to drain on this chassis",
+			"local_chassis_name", localChassisName)
 		return nil
 	}
 
@@ -698,6 +717,83 @@ func (o *OVNClient) RestoreDrainedGateways(ctx context.Context, localChassisName
 	if err := o.transactOps(ctx, allOps); err != nil {
 		slog.Error("restore-drain: failed to restore gateway chassis priorities", "error", err)
 	}
+}
+
+// filterDrainCandidates returns the Gateway_Chassis rows that must have
+// their priority lowered to drain this chassis and reports whether the input
+// contained any row at all for localChassisName. The "row present at all"
+// signal lets the caller distinguish "nothing to drain because already
+// drained" (cache has rows at priority 0) from "nothing to drain because
+// the local row is absent" (cache is incomplete).
+func filterDrainCandidates(gwChassisList []NBGatewayChassis, localChassisName string) (toDrain []NBGatewayChassis, hasLocalRow bool) {
+	for _, gwc := range gwChassisList {
+		if gwc.ChassisName != localChassisName {
+			continue
+		}
+		hasLocalRow = true
+		if gwc.Priority > 0 {
+			toDrain = append(toDrain, gwc)
+		}
+	}
+	return toDrain, hasLocalRow
+}
+
+// selectLocalGatewayChassis performs a direct OVSDB select on Gateway_Chassis
+// for entries with chassis_name == localChassisName, bypassing the libovsdb
+// monitor cache. Used as the fallback path when the cache appears to have
+// missed an INSERT (see issue #115).
+func (o *OVNClient) selectLocalGatewayChassis(ctx context.Context, localChassisName string) ([]NBGatewayChassis, error) {
+	selectOp := ovsdb.Operation{
+		Op:    ovsdb.OperationSelect,
+		Table: "Gateway_Chassis",
+		Where: []ovsdb.Condition{{
+			Column:   "chassis_name",
+			Function: ovsdb.ConditionEqual,
+			Value:    localChassisName,
+		}},
+	}
+	results, err := o.nbClient.Transact(ctx, selectOp)
+	if err != nil {
+		return nil, fmt.Errorf("transact select: %w", err)
+	}
+	if _, err := ovsdb.CheckOperationResults(results, []ovsdb.Operation{selectOp}); err != nil {
+		return nil, fmt.Errorf("select result: %w", err)
+	}
+	if len(results) == 0 {
+		return nil, nil
+	}
+	out := make([]NBGatewayChassis, 0, len(results[0].Rows))
+	for _, row := range results[0].Rows {
+		out = append(out, rowToGatewayChassis(row))
+	}
+	return out, nil
+}
+
+// rowToGatewayChassis decodes the columns of a raw OVSDB Gateway_Chassis row
+// into the NBGatewayChassis fields the drain fallback consumes. Only the
+// subset of columns needed by the caller is read; everything else is left
+// at the zero value.
+func rowToGatewayChassis(row ovsdb.Row) NBGatewayChassis {
+	var gwc NBGatewayChassis
+	if u, ok := row["_uuid"].(ovsdb.UUID); ok {
+		gwc.UUID = u.GoUUID
+	}
+	if s, ok := row["name"].(string); ok {
+		gwc.Name = s
+	}
+	if s, ok := row["chassis_name"].(string); ok {
+		gwc.ChassisName = s
+	}
+	// JSON-RPC delivers integers as float64; an in-process fake may pass int.
+	switch p := row["priority"].(type) {
+	case float64:
+		gwc.Priority = int(p)
+	case int:
+		gwc.Priority = p
+	case int64:
+		gwc.Priority = int(p)
+	}
+	return gwc
 }
 
 // countLocalCRPorts returns the number of chassisredirect ports currently
