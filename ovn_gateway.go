@@ -659,8 +659,18 @@ func (o *OVNClient) DrainGateways(ctx context.Context, localChassisName string) 
 	}
 
 	if len(toDrain) == 0 {
+		// Surface what the cache actually contained so a "no entries"
+		// log does not end the triage trail. Useful when an empty match
+		// is caused by a chassis-name mismatch or a monitor that did
+		// not pick up the row (rather than a genuinely empty NB).
+		seen := make([]string, 0, len(gwChassisList))
+		for _, gwc := range gwChassisList {
+			seen = append(seen, fmt.Sprintf("%s/%s/%d", gwc.Name, gwc.ChassisName, gwc.Priority))
+		}
 		slog.Info("drain: no gateway chassis entries to drain on this chassis",
-			"local_chassis_name", localChassisName)
+			"local_chassis_name", localChassisName,
+			"cache_count", len(gwChassisList),
+			"cache_entries", seen)
 		return nil
 	}
 

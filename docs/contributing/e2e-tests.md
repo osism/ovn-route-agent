@@ -25,6 +25,11 @@ The harness has two layers:
    ([#111](https://github.com/osism/ovn-network-agent/issues/111))
    hard-kills the priority-30 chassis and asserts that NB rows owned
    by the dead chassis are garbage-collected by surviving peers.
+   [`drain-hitless.sh`](https://github.com/osism/ovn-network-agent/blob/main/test/e2e/scenarios/drain-hitless.sh)
+   ([#113](https://github.com/osism/ovn-network-agent/issues/113))
+   compares a graceful `kill -TERM` drain against a `docker kill`
+   control arm and asserts the graceful drain stays at ≤1 packet of
+   `client-1 → FIP` loss.
 
 ## Layout
 
@@ -41,6 +46,7 @@ test/e2e/
     baseline.sh             — baseline reachability scenario (issue #45)
     failover.sh             — HA failover scenario, master chassis loss (issue #105)
     stale-chassis.sh        — stale chassis cleanup scenario, hard kill (issue #111)
+    drain-hitless.sh        — graceful drain vs hard kill, hitless comparison (issue #113)
     collect-artifacts.sh    — dump lab state for offline triage
 ```
 
@@ -183,6 +189,7 @@ make e2e-up             # build images + containerlab deploy + bootstrap
 make e2e-baseline       # run the baseline reachability scenario
 make e2e-failover       # run the HA failover scenario (master chassis loss)
 make e2e-stale-chassis  # run the stale-chassis cleanup scenario (hard kill)
+make e2e-drain-hitless  # run the graceful-drain vs hard-kill hitless comparison
 make e2e-down           # containerlab destroy
 ```
 
@@ -302,6 +309,71 @@ non-graceful death case where surviving peers are the only ones that
 can clean up. `docker kill -s KILL` skips every signal handler in the
 container.
 
+`make e2e-drain-hitless` invokes `test/e2e/scenarios/drain-hitless.sh`,
+which compares the agent's graceful-drain code path
+([`DrainGateways`](https://github.com/osism/ovn-network-agent/blob/main/ovn_gateway.go#L589))
+against the hard-kill case (#105's mechanic, reused here as the
+control arm) and asserts the graceful path stays hitless. The
+graceful arm sends `docker exec … kill -TERM 1` on `gateway-1`
+(the gwnode entrypoint `exec`s the agent at startup, so the agent
+is PID 1 — no `pgrep` needed and the containerlab veth pair is
+not torn down between SIGTERM and the drain completing). The
+hardkill arm uses `docker kill -s KILL clab-${LAB}-gateway-1`.
+Both arms first run `docker update --restart=no` on the gateway
+container so that containerlab's default `restart: always` does
+not auto-revive the agent mid-measurement and confuse the
+migration check. With
+`drain_on_shutdown: true` baked into `test/e2e/gwnode-config.yaml`
+the agent lowers its `Gateway_Chassis` priority to 0 and blocks
+until `cr-lr0-public` migrates before exiting — that ordering is
+what keeps loss to ≤1 packet for `client-1 → FIP` traffic during
+the transition.
+
+The probe is `ping -i 0.1 -c 200` from `client-1` (20 s probe
+window, 100 ms inter-packet spacing — finer than OVN's BFD detection
+multiplier of 3×1 s); the kill is delivered `PROBE_PRELUDE` seconds
+into the probe so the transition lands inside the captured window.
+The loss count comes straight from `ping`'s
+`N packets transmitted, M received` summary, so the scenario stays
+single-file bash without tshark post-processing. After each arm the
+scenario waits up to `FAILOVER_TIMEOUT` (default 30 s) for
+`cr-lr0-public` to migrate away from `gateway-1` — a 0-loss reading
+without migration would only indicate the kill never fired.
+
+The graceful arm additionally requires the
+`drain: gateway chassis priority lowered` log line in
+`gateway-1`'s `docker logs`. Without it a low-loss reading could be
+explained by the agent racing the kernel teardown rather than by
+the drain code path running; this acceptance criterion guards
+against a future change that lets the agent exit before
+`DrainGateways` completes.
+
+Between the two arms the scenario itself runs
+`make e2e-down && make e2e-up` so both arms start from the same
+priority-30/20/10 baseline. The recycle is mandatory: after the
+graceful arm `gateway-1` has been drained to priority 0 and exited;
+`docker start`ing it would re-attach with `RestoreDrainedGateways`
+setting priority back to 1, not the 30 the bootstrap seeds, and the
+hardkill arm would no longer be comparable. The same EXIT trap
+recycles the lab once more after the hardkill arm so a developer
+run leaves the lab baseline-green. CI handles its own teardown
+through the workflow's `make e2e-down` step with `if: always()`.
+
+The graceful-arm threshold (`GRACEFUL_MAX_LOSS`, default 5) is
+higher than the ≤1 packet the issue suggests because in the
+containerlab lab the transition window between `gateway-1`'s FRR
+BGP session closing on container exit and `upstream` converging on
+`gateway-2`'s advertisement reliably drops ~3 packets at the
+100 ms probe interval. The meaningful invariant is the **delta**
+between the two arms (hardkill loss strictly greater than graceful
+loss); the tighter ≤1 ceiling only holds on faster real-hardware
+labs. Tighten with `GRACEFUL_MAX_LOSS=1` once the lab is on
+hardware that meets it.
+
+Override `MASTER`, `FIP`, `PROBE_INTERVAL`, `PROBE_COUNT`,
+`PROBE_PRELUDE`, `FAILOVER_TIMEOUT`, `GRACEFUL_MAX_LOSS`,
+`SKIP_RECYCLE` or `SANITY_GATE` when triaging.
+
 Equivalent manual sequence (useful for triage):
 
 ```sh
@@ -354,7 +426,7 @@ The workflow does **not** run on pull requests: spinning the lab up
 adds ~10 minutes to CI on a green run, which is too coarse for the
 per-PR feedback loop the rest of the workflows target.
 
-Three jobs run in sequence:
+Four jobs run in sequence:
 
 - **`baseline`** — installs containerlab, runs `make e2e-up`, executes
   `test/e2e/scenarios/baseline.sh`, dumps + uploads artifacts on
@@ -369,12 +441,22 @@ Three jobs run in sequence:
   before/after NB snapshots and the peer cleanup-log capture are
   bundled with the lab-state dump. On failure the artifact bundle is
   uploaded as `e2e-artifacts-stale-chassis-<run id>-<attempt>`.
+- **`drain-hitless`** (`needs: stale-chassis`) — same shape, but
+  executes `test/e2e/scenarios/drain-hitless.sh`. The job points the
+  scenario's `ARTIFACTS_DIR` at the same artifact root so the
+  per-arm ping output, the drain log capture, the Port_Binding
+  before/after snapshots and the loss-summary file are bundled with
+  the lab-state dump. The scenario recycles the lab itself between
+  the two arms via `make e2e-down && make e2e-up`. On failure the
+  artifact bundle is uploaded as
+  `e2e-artifacts-drain-hitless-<run id>-<attempt>`.
 
-All three jobs are capped at 15 minutes — matching the budgets in
+All four jobs are capped at 15 minutes — matching the budgets in
 issues
 [#45](https://github.com/osism/ovn-network-agent/issues/45),
-[#105](https://github.com/osism/ovn-network-agent/issues/105), and
-[#111](https://github.com/osism/ovn-network-agent/issues/111).
+[#105](https://github.com/osism/ovn-network-agent/issues/105),
+[#111](https://github.com/osism/ovn-network-agent/issues/111), and
+[#113](https://github.com/osism/ovn-network-agent/issues/113).
 
 ### Triaging a failed run
 
@@ -399,6 +481,14 @@ writes:
   stale-chassis/nb-before-kill.txt — NB rows tagged for the killed chassis pre-kill (stale-chassis only)
   stale-chassis/nb-after-kill.txt  — NB rows still tagged for the killed chassis after the cleanup deadline (stale-chassis only)
   stale-chassis/peer-cleanup.log   — surviving peer's `stale chassis route removed` line (stale-chassis only)
+  drain-hitless/graceful-ping.txt                — ping output from the SIGTERM/graceful arm (drain-hitless only)
+  drain-hitless/graceful-drain-log.txt           — `drain: gateway chassis priority lowered` log line from gateway-1 (drain-hitless only)
+  drain-hitless/graceful-port-binding-before.txt — cr-lr0-public Port_Binding snapshot before the graceful kill (drain-hitless only)
+  drain-hitless/graceful-port-binding-after.txt  — cr-lr0-public Port_Binding snapshot after the graceful kill (drain-hitless only)
+  drain-hitless/hardkill-ping.txt                — ping output from the SIGKILL/control arm (drain-hitless only)
+  drain-hitless/hardkill-port-binding-before.txt — cr-lr0-public Port_Binding snapshot before the hard kill (drain-hitless only)
+  drain-hitless/hardkill-port-binding-after.txt  — cr-lr0-public Port_Binding snapshot after the hard kill (drain-hitless only)
+  drain-hitless/summary.txt                      — recorded loss counts and the configured threshold (drain-hitless only)
 ```
 
 You can reproduce the same dump on a local lab with:
