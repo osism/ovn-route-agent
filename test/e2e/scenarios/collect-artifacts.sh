@@ -20,9 +20,18 @@ set -u
 
 LAB="${LAB:-ovn-e2e}"
 TOPOLOGY="${TOPOLOGY:-test/e2e/topology.clab.yml}"
-GATEWAYS=("${GATEWAYS[@]:-gateway-1 gateway-2 gateway-3}")
+# Default node lists. The previous `("${GATEWAYS[@]:-a b c}")` form
+# collapsed the default into a single array element, so per-node
+# captures ran `docker logs clab-ovn-e2e-gateway-1 gateway-2 gateway-3`
+# once and only produced one bogus output file. Env-override is kept by
+# only applying the default when the array is unset.
+if [ -z "${GATEWAYS+x}" ]; then
+    GATEWAYS=(gateway-1 gateway-2 gateway-3)
+fi
+if [ -z "${CLIENTS+x}" ]; then
+    CLIENTS=(client-1 client-2)
+fi
 CENTRAL="${CENTRAL:-central}"
-CLIENTS=("${CLIENTS[@]:-client-1 client-2}")
 UPSTREAM="${UPSTREAM:-upstream}"
 OUT_DIR="${1:-}"
 
