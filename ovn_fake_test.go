@@ -37,6 +37,14 @@ type fakeOVSDBClient struct {
 	// via ovsdb.CheckOperationResults.
 	opResults []ovsdb.OperationResult
 
+	// selectRows, when non-nil, supplies rows for OperationSelect ops keyed
+	// by table name, bypassing the cache view exposed via setRows/List. The
+	// drain fallback path uses Transact(OperationSelect) to read directly
+	// from the NB server when the cache appears incomplete (issue #115);
+	// tests populate this to simulate the "server has the row, cache does
+	// not" race.
+	selectRows map[string][]ovsdb.Row
+
 	// onTransact is invoked synchronously for each Transact call (after the
 	// op has been recorded). Used by drain tests to mutate rows mid-poll so
 	// countLocalCRPorts can converge.
@@ -176,6 +184,7 @@ func (f *fakeOVSDBClient) Transact(_ context.Context, ops ...ovsdb.Operation) ([
 	f.mu.Lock()
 	f.transacts = append(f.transacts, append([]ovsdb.Operation(nil), ops...))
 	hook := f.onTransact
+	selectRows := f.selectRows
 	f.mu.Unlock()
 
 	if hook != nil {
@@ -188,7 +197,28 @@ func (f *fakeOVSDBClient) Transact(_ context.Context, ops ...ovsdb.Operation) ([
 		return f.opResults, nil
 	}
 	results := make([]ovsdb.OperationResult, len(ops))
+	for i, op := range ops {
+		if op.Op == ovsdb.OperationSelect {
+			results[i].Rows = append([]ovsdb.Row(nil), selectRows[op.Table]...)
+		}
+	}
 	return results, nil
+}
+
+// setSelectRows registers rows returned by Transact(OperationSelect) for the
+// given table. The rows reflect the server-side view, which may differ from
+// the cache view set via setRows.
+func (f *fakeOVSDBClient) setSelectRows(table string, rows ...ovsdb.Row) {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	if f.selectRows == nil {
+		f.selectRows = make(map[string][]ovsdb.Row)
+	}
+	if len(rows) == 0 {
+		delete(f.selectRows, table)
+		return
+	}
+	f.selectRows[table] = append([]ovsdb.Row(nil), rows...)
 }
 
 // --- ConditionalAPI surface --------------------------------------------------
