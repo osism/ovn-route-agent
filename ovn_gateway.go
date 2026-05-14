@@ -96,10 +96,39 @@ const minActivePriority = 2
 // prevents reverse failovers when a drained chassis restores to priority 1
 // and the active chassis is also at 1 (because it never boosted while the
 // peer was at 0).
+//
+// The NB monitor cache occasionally drops Gateway_Chassis INSERTs (see
+// issue #115); when no row for the local chassis is in the cache despite
+// having locally-active routers, fall back to a direct NB select so the
+// boost is not silently skipped.
 func (o *OVNClient) EnsureActivePriorityLead(ctx context.Context, localRouters []LocalRouterInfo, localChassisName string) error {
+	if len(localRouters) == 0 {
+		return nil
+	}
+
 	var gwChassisList []NBGatewayChassis
 	if err := o.nbClient.List(ctx, &gwChassisList); err != nil {
 		return fmt.Errorf("list gateway chassis: %w", err)
+	}
+
+	hasLocalRow := false
+	for _, gwc := range gwChassisList {
+		if gwc.ChassisName == localChassisName {
+			hasLocalRow = true
+			break
+		}
+	}
+	if !hasLocalRow {
+		slog.Warn("active-lead: cache has no Gateway_Chassis row for this chassis, querying NB directly",
+			"local_chassis_name", localChassisName,
+			"cache_count", len(gwChassisList))
+		serverList, err := o.selectLocalGatewayChassis(ctx, localChassisName)
+		if err != nil {
+			return fmt.Errorf("active-lead: cache miss + NB select fallback failed: %w", err)
+		}
+		// Merge the recovered local rows into the cache snapshot. Peer rows
+		// from the cache (other chassis) are still needed to compute maxPeer.
+		gwChassisList = append(gwChassisList, serverList...)
 	}
 
 	// Build set of locally-active LRP names.
