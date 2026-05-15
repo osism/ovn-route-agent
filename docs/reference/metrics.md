@@ -33,6 +33,7 @@ regenerate it with `go generate ./...`.
 | `ovn_network_agent_effective_networks` | gauge | — | Number of effective network filters (manual config or auto-discovered). |
 | `ovn_network_agent_route_readds_total` | counter (vec) | `plane`={`kernel`,`frr`} | Total routes re-added by post-change verification, labelled by route plane. |
 | `ovn_network_agent_consecutive_readds` | gauge | — | Number of consecutive reconcile cycles that required route re-adds. Sustained non-zero indicates persistent route instability. |
+| `ovn_network_agent_inactive_routes` | gauge | — | Number of desired FIP/VIP routes that exist as FRR static routes but are not selected/installed — i.e. not advertised via BGP. Non-zero means those FIPs are unreachable from outside. |
 | `ovn_network_agent_ovn_connection_state` | gauge (vec) | `database`={`nb`,`sb`} | 1 when the named OVN database client is connected, 0 otherwise. |
 | `ovn_network_agent_drain_duration_seconds` | histogram | — | Duration of a gateway drain operation in seconds. |
 | `ovn_network_agent_drain_total` | counter (vec) | `outcome`={`completed`,`timeout`,`error`,`noop`} | Total drain operations, labelled by outcome (completed, timeout, error, noop). |
@@ -46,5 +47,8 @@ regenerate it with `go generate ./...`.
 - `ovn_connection_state{database="nb"} == 0` for >2m — NB DB unreachable;
   agent cannot write OVN state.
 - `rate(route_readds_total[10m]) > 0` — flapping routes.
+- `inactive_routes > 0` for >2m — FIP `/32`s configured in FRR but not
+  advertised via BGP (e.g. an unresolvable next-hop); those FIPs are
+  unreachable from outside.
 - `histogram_quantile(0.95, rate(reconcile_duration_seconds_bucket[5m])) > 5`
   — slow reconciles.

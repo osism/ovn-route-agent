@@ -56,6 +56,7 @@ func TestNewMetricsRegistryRegistersAllCollectors(t *testing.T) {
 		"ovn_network_agent_local_routers",
 		"ovn_network_agent_route_readds_total",
 		"ovn_network_agent_consecutive_readds",
+		"ovn_network_agent_inactive_routes",
 		"ovn_network_agent_ovn_connection_state",
 		"ovn_network_agent_drain_duration_seconds",
 		"ovn_network_agent_drain_total",
@@ -294,6 +295,21 @@ func TestSetConsecutiveReAddsSetsGauge(t *testing.T) {
 		}
 		if v := mf.GetMetric()[0].GetGauge().GetValue(); v != 4 {
 			t.Errorf("consecutive_readds = %v, want 4", v)
+		}
+	}
+}
+
+func TestSetInactiveRoutesSetsGauge(t *testing.T) {
+	m := withTestMetrics(t)
+	setInactiveRoutes(3)
+
+	got, _ := m.registry.Gather()
+	for _, mf := range got {
+		if mf.GetName() != "ovn_network_agent_inactive_routes" {
+			continue
+		}
+		if v := mf.GetMetric()[0].GetGauge().GetValue(); v != 3 {
+			t.Errorf("inactive_routes = %v, want 3", v)
 		}
 	}
 }
