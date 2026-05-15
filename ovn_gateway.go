@@ -101,6 +101,14 @@ const minActivePriority = 2
 // issue #115); when no row for the local chassis is in the cache despite
 // having locally-active routers, fall back to a direct NB select so the
 // boost is not silently skipped.
+//
+// Before issuing a boost, the chassisredirect binding for each LRP is
+// re-confirmed against the SB server. localRouters is a reconcile snapshot,
+// and a boost is a priority write: if OVN has already migrated the port to a
+// peer, boosting a no-longer-active chassis would raise it into — or above —
+// a priority tie, which is exactly the ovn-northd flapping this function is
+// meant to prevent. A boost is skipped when SB positively shows the port
+// bound elsewhere.
 func (o *OVNClient) EnsureActivePriorityLead(ctx context.Context, localRouters []LocalRouterInfo, localChassisName string) error {
 	if len(localRouters) == 0 {
 		return nil
@@ -165,6 +173,19 @@ func (o *OVNClient) EnsureActivePriorityLead(ctx context.Context, localRouters [
 		}
 	}
 
+	// Confirm, with a fresh SB read, that this chassis still owns each LRP's
+	// chassisredirect port before boosting. A failed lookup degrades to
+	// trusting the snapshot so a transient SB blip cannot stall the boost.
+	crChassis, crErr := o.selectCRPortChassis(ctx)
+	if crErr != nil {
+		slog.Warn("active-lead: chassisredirect binding check failed, trusting reconcile snapshot",
+			"error", crErr)
+	}
+	crPortByLRP := make(map[string]string, len(localRouters))
+	for _, lr := range localRouters {
+		crPortByLRP[lr.LRPName] = lr.CRPort
+	}
+
 	var allOps []ovsdb.Operation
 	for lrpName, g := range groups {
 		if g.local == nil || g.maxPeer < 0 {
@@ -172,6 +193,13 @@ func (o *OVNClient) EnsureActivePriorityLead(ctx context.Context, localRouters [
 		}
 		if g.local.Priority > g.maxPeer && g.local.Priority >= minActivePriority {
 			continue // Already has the lead with safe margin
+		}
+		if crErr == nil {
+			if boundTo, known := crChassis[crPortByLRP[lrpName]]; known && boundTo != localChassisName {
+				slog.Info("active-lead: skipping priority boost, chassisredirect bound to another chassis",
+					"lrp", lrpName, "bound_to", boundTo, "local_chassis_name", localChassisName)
+				continue
+			}
 		}
 		newPriority := g.maxPeer + 1
 		if newPriority < minActivePriority {
@@ -917,4 +945,52 @@ func (o *OVNClient) countLocalCRPorts(ctx context.Context, localChassisName stri
 		}
 	}
 	return count, nil
+}
+
+// selectCRPortChassis returns, for every chassisredirect Port_Binding, the
+// hostname of the chassis it is currently bound to, read directly from the SB
+// server so the answer is not a monitor-cache snapshot. EnsureActivePriorityLead
+// uses it to confirm — at write time — that this chassis still owns a router's
+// gateway before boosting its priority. A port that is bound nowhere is left
+// out of the map: that is an in-progress election, where a boost is harmless.
+func (o *OVNClient) selectCRPortChassis(ctx context.Context) (map[string]string, error) {
+	chassisRows, err := directSelect(ctx, o.sbClient, "Chassis", []string{"_uuid", "name", "hostname"})
+	if err != nil {
+		return nil, fmt.Errorf("select chassis: %w", err)
+	}
+	hostByRef := make(map[string]string, len(chassisRows)*2)
+	for _, row := range chassisRows {
+		ch := decodeSBChassis(row)
+		hostByRef[ch.UUID] = ch.Hostname
+		hostByRef[ch.Name] = ch.Hostname
+	}
+
+	pbOp := ovsdb.Operation{
+		Op:      ovsdb.OperationSelect,
+		Table:   "Port_Binding",
+		Columns: []string{"_uuid", "type", "logical_port", "chassis"},
+		Where: []ovsdb.Condition{{
+			Column:   "type",
+			Function: ovsdb.ConditionEqual,
+			Value:    "chassisredirect",
+		}},
+	}
+	results, err := o.sbClient.Transact(ctx, pbOp)
+	if err != nil {
+		return nil, fmt.Errorf("select chassisredirect port bindings: %w", err)
+	}
+	if _, err := ovsdb.CheckOperationResults(results, []ovsdb.Operation{pbOp}); err != nil {
+		return nil, fmt.Errorf("select chassisredirect port bindings: %w", err)
+	}
+	bound := make(map[string]string)
+	if len(results) > 0 {
+		for _, row := range results[0].Rows {
+			pb := decodeSBPortBinding(row)
+			if pb.Type != "chassisredirect" || pb.Chassis == nil || *pb.Chassis == "" {
+				continue
+			}
+			bound[pb.LogicalPort] = hostByRef[*pb.Chassis]
+		}
+	}
+	return bound, nil
 }
