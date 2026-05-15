@@ -5,12 +5,26 @@
 #
 # Usage:
 #   ovn-network-agent --config /etc/ovn-network-agent/config.yaml
+#
+# Operating mode is derived from configuration presence:
+#   - both OVN remotes set            -> full mode (synchronise FIP routes,
+#                                        gateway routing, port forwarding)
+#   - both OVN remotes empty +        -> port-forward-only mode: run as a
+#     port_forwards configured           standalone VIP service, no OVN
+#                                        connection (see the port forwarding
+#                                        section at the bottom of this file)
+#   - both OVN remotes empty +        -> error (nothing to do)
+#     no port_forwards
+#   - exactly one OVN remote set      -> error (incomplete OVN configuration)
 
-# OVN Southbound DB remote (required)
-# Comma-separated for clustered setups (failover).
+# OVN Southbound DB remote.
+# Required for full mode; leave unset (together with ovn_nb_remote) for
+# port-forward-only mode. Comma-separated for clustered setups (failover).
 ovn_sb_remote: "tcp:10.10.0.1:6642,tcp:10.10.0.2:6642,tcp:10.10.0.3:6642"
 
-# OVN Northbound DB remote (required)
+# OVN Northbound DB remote.
+# Required for full mode; leave unset (together with ovn_sb_remote) for
+# port-forward-only mode.
 ovn_nb_remote: "tcp:10.10.0.1:6641,tcp:10.10.0.2:6641,tcp:10.10.0.3:6641"
 
 # Provider bridge device for kernel routes (default: br-ex)
@@ -128,6 +142,13 @@ ovn_nb_remote: "tcp:10.10.0.1:6641,tcp:10.10.0.2:6641,tcp:10.10.0.3:6641"
 # policy routing through the veth pair.
 #
 # Requires: veth_leak_enabled: true, nft binary in PATH.
+#
+# Port-forward-only mode: when port_forwards is configured but both OVN
+# remotes are left unset, the agent runs purely as a VIP service — it manages
+# the VIPs (DNAT rules, VIP addresses, return routing, FRR routes) and never
+# connects to OVN. In this mode router_masquerade is rejected (router SNAT IPs
+# come from OVN), and hairpin_masquerade requires an explicit network_cidr
+# (provider CIDRs are otherwise auto-discovered from OVN).
 #
 # Device for VIP addresses in VRF (default: "loopback1")
 # port_forward_dev: "loopback1"

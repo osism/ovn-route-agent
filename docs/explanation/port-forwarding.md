@@ -364,3 +364,50 @@ locally (INPUT chain), and the reply originates from the OUTPUT hook. The
          External client
          (client IP preserved end-to-end)
 ```
+
+## Running as a standalone VIP service (port-forward-only mode)
+
+Port forwarding does not depend on OVN. The DNAT rules, the VIP addresses,
+the connmark-based return routing, and the FRR static routes that announce
+the VIPs are all managed independently of any OVN gateway state — the
+reconcile loop already asserts them regardless of local router presence.
+
+That makes it useful to run the agent as a *pure* VIP service on a node
+that is **not** an OVN gateway chassis at all: a node hosting DNS
+resolvers, monitoring collectors, or API proxies that should be reachable
+via anycast VIPs, but that has no Floating IPs, no chassisredirect ports,
+and no gateway routing to maintain.
+
+When `port_forwards` is configured but both OVN remotes (`ovn_sb_remote`
+and `ovn_nb_remote`) are left unset, the agent starts in
+**port-forward-only mode**. It manages only the VIPs and never opens an OVN
+connection — removing an operational dependency and the spurious
+`failed to connect to OVN, retrying` logging that an unreachable OVN
+endpoint would otherwise produce.
+
+What still runs in this mode:
+
+- `SetupPortForward` / `ReconcilePortForward` / `TeardownPortForward` — the
+  DNAT rules, VIP addresses, conntrack zones, and policy routing described
+  above.
+- The veth pair between the default VRF and `vrf-provider`, used by the
+  DNAT return path.
+- FRR static routes for the VIP addresses, so BGP announces them.
+- The periodic reconcile ticker, which re-asserts the VIP and DNAT state.
+
+What is skipped, because it is OVN-specific:
+
+- The OVN SB/NB connection and the entire OVN client lifecycle.
+- Gateway routing, OVS hairpin/MAC-tweak flows, stale chassis cleanup,
+  drain-on-shutdown, and FIP/SNAT-IP route management.
+- Provider-bridge setup (`br-ex`). A pure VIP-service node need not have
+  `br-ex`: no `<vip>/32` kernel route is installed on it, the VIP is
+  reachable as a local address on `port_forward_dev`, and the FRR static
+  route carries the BGP announcement.
+
+Because router SNAT IPs and provider CIDRs are normally discovered from
+OVN, the two source-selective masquerade options that rely on them are
+constrained in this mode (see
+[Configure the agent](../guides/configuration#port-forward-only-mode)):
+`router_masquerade` is rejected outright, and `hairpin_masquerade`
+requires an explicit `network_cidr`.

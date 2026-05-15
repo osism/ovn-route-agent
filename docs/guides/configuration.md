@@ -42,14 +42,69 @@ ovn-network-agent --config /etc/ovn-network-agent/config.yaml --log-level debug 
 
 CLI flags take precedence over values in the config file.
 
+## Operating modes
+
+The agent runs in one of two modes, derived automatically from the
+configuration — there is no mode flag:
+
+| `ovn_sb_remote` / `ovn_nb_remote` | `port_forwards` | Mode |
+|---|---|---|
+| both set | any | **full mode** |
+| both empty | non-empty | **port-forward-only mode** |
+| both empty | empty | error — nothing to do |
+| exactly one set | any | error — incomplete OVN configuration |
+
+The active mode is logged in the startup banner (`mode=full` or
+`mode=port-forward-only`).
+
+### Full mode
+
+The default. The agent connects to the OVN Southbound and Northbound
+databases, synchronises Floating IP routes, manages gateway routing, and
+also serves any configured `port_forwards`.
+
+### Port-forward-only mode
+
+When `port_forwards` is configured but **both** OVN remotes are left unset,
+the agent runs as a standalone VIP service: it manages only the configured
+port-forward VIPs — DNAT rules, VIP addresses, connmark return routing, and
+FRR static routes for BGP announcement — and never connects to OVN.
+
+Use this for a node that should only expose configured VIPs (for example a
+DNS resolver, monitoring collector, or API proxy) and is not an OVN gateway
+chassis. Such a node needs no provider bridge (`br-ex`), no FIPs, and no
+gateway routing.
+
+Two masquerade options depend on OVN-derived state and are therefore
+rejected at startup in port-forward-only mode:
+
+- `router_masquerade` — router SNAT IPs are discovered from OVN; without an
+  OVN connection there is no source for them.
+- `hairpin_masquerade` — requires an explicit `network_cidr`, because
+  provider CIDRs are normally auto-discovered from OVN.
+
+```yaml
+# Port-forward-only config: no OVN remotes, only port_forwards.
+port_forwards:
+  - vip: "198.51.100.10"
+    manage_vip: true
+    rules:
+      - proto: tcp
+        port: 443
+        dest_addr: "10.0.0.100"
+```
+
+Switching modes at runtime is not supported — it requires a restart.
+
 ## Prerequisites
 
-- **OVN**: TCP access to OVN Southbound and Northbound databases on the
-  control nodes (the agent runs on network/gateway nodes where no local DB
-  sockets exist).
+- **OVN** (full mode only): TCP access to OVN Southbound and Northbound
+  databases on the control nodes (the agent runs on network/gateway nodes
+  where no local DB sockets exist). Not needed in port-forward-only mode.
 - **FRR**: `vtysh` must be available and the VRF + BGP configuration must
   already exist.
-- **Linux**: provider bridge (e.g. `br-ex`) must exist.
+- **Linux**: provider bridge (e.g. `br-ex`) must exist in full mode;
+  port-forward-only mode does not use it.
 - **VRF route leaking**: the agent automatically creates and manages a veth
   pair connecting the default VRF to `vrf-provider` (enabled by default via
   `--veth-leak-enabled`). Per-network routes are reconciled dynamically based
