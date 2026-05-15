@@ -192,6 +192,9 @@ func renderMetrics(info *sourceInfo) string {
 	b.WriteString("- `ovn_connection_state{database=\"nb\"} == 0` for >2m — NB DB unreachable;\n")
 	b.WriteString("  agent cannot write OVN state.\n")
 	b.WriteString("- `rate(route_readds_total[10m]) > 0` — flapping routes.\n")
+	b.WriteString("- `inactive_routes > 0` for >2m — FIP `/32`s configured in FRR but not\n")
+	b.WriteString("  advertised via BGP (e.g. an unresolvable next-hop); those FIPs are\n")
+	b.WriteString("  unreachable from outside.\n")
 	b.WriteString("- `histogram_quantile(0.95, rate(reconcile_duration_seconds_bucket[5m])) > 5`\n")
 	b.WriteString("  — slow reconciles.\n")
 

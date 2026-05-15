@@ -601,6 +601,87 @@ func TestListFRRRoutes_PropagatesVtyshError(t *testing.T) {
 	}
 }
 
+func TestInactiveFRRRoutes(t *testing.T) {
+	const cmd = "show ip route vrf vrf-provider static json"
+
+	t.Run("all selected and installed are active", func(t *testing.T) {
+		j := `{
+  "198.51.100.10/32": [{"prefix":"198.51.100.10/32","protocol":"static","selected":true,"installed":true}],
+  "198.51.100.11/32": [{"prefix":"198.51.100.11/32","protocol":"static","selected":true,"installed":true}]
+}`
+		rec := newVtyshRecorder()
+		rec.on([]string{"vtysh", "-c", cmd}, j, nil)
+		rm := &RouteManager{vrfName: "vrf-provider", execVtyshHook: rec.hook()}
+		got, err := rm.InactiveFRRRoutes([]string{"198.51.100.10", "198.51.100.11"})
+		if err != nil {
+			t.Fatalf("InactiveFRRRoutes: %v", err)
+		}
+		if len(got) != 0 {
+			t.Errorf("got %v, want no inactive routes", got)
+		}
+	})
+
+	t.Run("reports configured-but-inactive, ignores absent", func(t *testing.T) {
+		// .10 active; .11 configured but neither selected nor installed;
+		// .12 not configured at all (absent → not this check's concern).
+		j := `{
+  "198.51.100.10/32": [{"prefix":"198.51.100.10/32","protocol":"static","selected":true,"installed":true}],
+  "198.51.100.11/32": [{"prefix":"198.51.100.11/32","protocol":"static"}]
+}`
+		rec := newVtyshRecorder()
+		rec.on([]string{"vtysh", "-c", cmd}, j, nil)
+		rm := &RouteManager{vrfName: "vrf-provider", execVtyshHook: rec.hook()}
+		got, err := rm.InactiveFRRRoutes([]string{"198.51.100.10", "198.51.100.11", "198.51.100.12"})
+		if err != nil {
+			t.Fatalf("InactiveFRRRoutes: %v", err)
+		}
+		if !reflect.DeepEqual(got, []string{"198.51.100.11"}) {
+			t.Errorf("got %v, want [198.51.100.11]", got)
+		}
+	})
+
+	t.Run("selected but not installed is inactive", func(t *testing.T) {
+		j := `{"198.51.100.11/32":[{"prefix":"198.51.100.11/32","protocol":"static","selected":true}]}`
+		rec := newVtyshRecorder()
+		rec.on([]string{"vtysh", "-c", cmd}, j, nil)
+		rm := &RouteManager{vrfName: "vrf-provider", execVtyshHook: rec.hook()}
+		got, _ := rm.InactiveFRRRoutes([]string{"198.51.100.11"})
+		if !reflect.DeepEqual(got, []string{"198.51.100.11"}) {
+			t.Errorf("got %v, want [198.51.100.11]", got)
+		}
+	})
+
+	t.Run("empty body means nothing configured", func(t *testing.T) {
+		rec := newVtyshRecorder()
+		rec.on([]string{"vtysh", "-c", cmd}, "", nil)
+		rm := &RouteManager{vrfName: "vrf-provider", execVtyshHook: rec.hook()}
+		got, err := rm.InactiveFRRRoutes([]string{"198.51.100.10"})
+		if err != nil || got != nil {
+			t.Errorf("got (%v, %v), want (nil, nil)", got, err)
+		}
+	})
+
+	t.Run("vtysh error propagates", func(t *testing.T) {
+		rec := newVtyshRecorder()
+		rec.on([]string{"vtysh", "-c", cmd}, "boom", errors.New("exit 1"))
+		rm := &RouteManager{vrfName: "vrf-provider", execVtyshHook: rec.hook()}
+		if _, err := rm.InactiveFRRRoutes([]string{"198.51.100.10"}); err == nil {
+			t.Fatal("expected error when vtysh fails")
+		}
+	})
+
+	t.Run("dry-run and empty input short-circuit", func(t *testing.T) {
+		rmDry := &RouteManager{vrfName: "vrf-provider", dryRun: true}
+		if got, err := rmDry.InactiveFRRRoutes([]string{"198.51.100.10"}); got != nil || err != nil {
+			t.Errorf("dry-run: got (%v, %v), want (nil, nil)", got, err)
+		}
+		rm := &RouteManager{vrfName: "vrf-provider"}
+		if got, err := rm.InactiveFRRRoutes(nil); got != nil || err != nil {
+			t.Errorf("empty input: got (%v, %v), want (nil, nil)", got, err)
+		}
+	})
+}
+
 func TestAddFRRRoutesBatchesVtyshCommands(t *testing.T) {
 	rec := newVtyshRecorder()
 	rm := &RouteManager{

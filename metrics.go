@@ -34,6 +34,7 @@ type metricsRegistry struct {
 	// Route stability metrics
 	routeReAddsTotal  *prometheus.CounterVec
 	consecutiveReAdds prometheus.Gauge
+	inactiveRoutes    prometheus.Gauge
 
 	// OVN connection state
 	ovnConnectionState *prometheus.GaugeVec
@@ -117,6 +118,12 @@ func newMetricsRegistry() *metricsRegistry {
 			Help:      "Number of consecutive reconcile cycles that required route re-adds. Sustained non-zero indicates persistent route instability.",
 		}),
 
+		inactiveRoutes: prometheus.NewGauge(prometheus.GaugeOpts{
+			Namespace: metricsNamespace,
+			Name:      "inactive_routes",
+			Help:      "Number of desired FIP/VIP routes that exist as FRR static routes but are not selected/installed — i.e. not advertised via BGP. Non-zero means those FIPs are unreachable from outside.",
+		}),
+
 		ovnConnectionState: prometheus.NewGaugeVec(prometheus.GaugeOpts{
 			Namespace: metricsNamespace,
 			Name:      "ovn_connection_state",
@@ -158,6 +165,7 @@ func newMetricsRegistry() *metricsRegistry {
 		m.effectiveNetworks,
 		m.routeReAddsTotal,
 		m.consecutiveReAdds,
+		m.inactiveRoutes,
 		m.ovnConnectionState,
 		m.drainDuration,
 		m.drainTotal,
@@ -281,6 +289,13 @@ func setConsecutiveReAdds(n int) {
 		return
 	}
 	metrics.consecutiveReAdds.Set(float64(n))
+}
+
+func setInactiveRoutes(n int) {
+	if metrics == nil {
+		return
+	}
+	metrics.inactiveRoutes.Set(float64(n))
 }
 
 func setOVNConnectionState(database string, connected bool) {

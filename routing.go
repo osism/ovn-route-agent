@@ -1,10 +1,12 @@
 package main
 
 import (
+	"encoding/json"
 	"fmt"
 	"log/slog"
 	"net"
 	"os/exec"
+	"sort"
 	"strconv"
 	"strings"
 )
@@ -234,6 +236,62 @@ func (rm *RouteManager) ListFRRRoutes() ([]string, error) {
 		}
 	}
 	return ips, nil
+}
+
+// frrRouteEntry is the subset of an FRR `show ip route ... json` route object
+// that the agent inspects. A static route is only advertised via BGP once it
+// is both selected (FRR's best route for the prefix) and installed (present in
+// the kernel FIB); FRR omits these keys when false, so the zero value is the
+// correct default.
+type frrRouteEntry struct {
+	Selected  bool `json:"selected"`
+	Installed bool `json:"installed"`
+}
+
+// InactiveFRRRoutes returns, from the given /32 IPs, those whose static route
+// exists in the VRF but is not selected and installed by FRR — i.e. configured
+// but not actually advertised (typically an unresolvable next-hop). IPs with no
+// static route at all are not reported: that case is a plain "missing route"
+// handled by ensureRoutes. ListFRRRoutes cannot tell the two apart because it
+// matches any configured route, which is why this distinct check exists.
+func (rm *RouteManager) InactiveFRRRoutes(ips []string) ([]string, error) {
+	if rm.dryRun || len(ips) == 0 {
+		return nil, nil
+	}
+	output, err := rm.runVtysh("-c", fmt.Sprintf("show ip route vrf %s static json", rm.vrfName))
+	if err != nil {
+		return nil, fmt.Errorf("vtysh list routes json: %w (output: %s)", err, strings.TrimSpace(string(output)))
+	}
+	// FRR emits an empty body rather than "{}" when the VRF has no static
+	// routes; treat that as "nothing configured".
+	trimmed := strings.TrimSpace(string(output))
+	if trimmed == "" {
+		return nil, nil
+	}
+	var routes map[string][]frrRouteEntry
+	if err := json.Unmarshal([]byte(trimmed), &routes); err != nil {
+		return nil, fmt.Errorf("parse vtysh route json: %w", err)
+	}
+
+	var inactive []string
+	for _, ip := range ips {
+		entries, ok := routes[ip+"/32"]
+		if !ok {
+			continue // not configured at all — not this check's concern
+		}
+		active := false
+		for _, e := range entries {
+			if e.Selected && e.Installed {
+				active = true
+				break
+			}
+		}
+		if !active {
+			inactive = append(inactive, ip)
+		}
+	}
+	sort.Strings(inactive)
+	return inactive, nil
 }
 
 // RefreshBGP triggers an outbound BGP soft-refresh so that peers learn about

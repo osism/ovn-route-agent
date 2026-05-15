@@ -367,6 +367,10 @@ func (a *Agent) reconcile(ctx context.Context, trigger string) {
 		a.removeAllRoutes("no locally active routers and no port forward VIPs")
 	}
 
+	// Surface desired routes that are configured in FRR but not actually
+	// advertised via BGP — ensureRoutes alone cannot detect this.
+	a.checkFRRRouteActivity(desiredIPs)
+
 	// Check for stale chassis entries from dead nodes (runs on every agent).
 	// This runs after gateway routing reconciliation so that a surviving agent
 	// creates its own routes before removing entries from dead chassis.
@@ -746,6 +750,27 @@ func (a *Agent) verifyRoutes(desiredIPs []string) int {
 	setConsecutiveReAdds(a.consecutiveReAdds)
 
 	return totalReAdds
+}
+
+// checkFRRRouteActivity surfaces desired routes that exist as FRR static
+// routes but are not selected/installed, and therefore not advertised via BGP.
+// Such a route is invisible to ensureRoutes — ListFRRRoutes still reports it as
+// present — yet leaves the FIP unreachable from outside. Re-adding would not
+// help (the route already exists; the next-hop is the fault), so the condition
+// is reported loudly and exposed through the inactive_routes metric for
+// alerting. A failed check leaves the metric at its previous value rather than
+// falsely resetting it to zero.
+func (a *Agent) checkFRRRouteActivity(desiredIPs []string) {
+	inactive, err := a.routing.InactiveFRRRoutes(desiredIPs)
+	if err != nil {
+		slog.Warn("could not verify FRR route activity", "error", err)
+		return
+	}
+	setInactiveRoutes(len(inactive))
+	if len(inactive) > 0 {
+		slog.Error("FRR static routes are configured but inactive — these FIPs are not advertised via BGP",
+			"count", len(inactive), "ips", inactive, "vrf", a.cfg.VRFName)
+	}
 }
 
 // isManaged returns true if the IP is within any of the effective network CIDRs.
