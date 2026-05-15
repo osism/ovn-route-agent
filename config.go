@@ -127,7 +127,15 @@ type Config struct {
 	CleanupOnShutdown bool
 	DrainOnShutdown   bool
 	DrainTimeout      time.Duration
-	FRRPrefixList     string // FRR prefix-list name to manage dynamically (e.g. ANNOUNCED-NETWORKS)
+
+	// DrainSettleDelay is how long to keep advertising FIP routes after
+	// the drain confirms all chassisredirect ports have migrated away,
+	// before cleanup withdraws them. The hold gives the takeover chassis
+	// time to finish OVN programming and BGP advertisement so external
+	// traffic is not blackholed. 0 = no hold.
+	DrainSettleDelay time.Duration
+
+	FRRPrefixList string // FRR prefix-list name to manage dynamically (e.g. ANNOUNCED-NETWORKS)
 
 	// Stale chassis cleanup: grace period before removing OVN NB entries
 	// from chassis that have disappeared from the SB Chassis table.
@@ -176,6 +184,7 @@ type configFile struct {
 	CleanupOnShutdown *bool         `yaml:"cleanup_on_shutdown"`
 	DrainOnShutdown   *bool         `yaml:"drain_on_shutdown"`
 	DrainTimeout      string        `yaml:"drain_timeout"`
+	DrainSettleDelay  string        `yaml:"drain_settle_delay"`
 
 	FRRPrefixList string `yaml:"frr_prefix_list"`
 
@@ -219,6 +228,7 @@ func loadConfig(args []string) (Config, error) {
 		fCleanupOnShutdown = fs.Bool("cleanup-on-shutdown", true, "Remove all managed routes on shutdown (SIGINT/SIGTERM)")
 		fDrainOnShutdown   = fs.Bool("drain-on-shutdown", true, "Drain HA gateways before shutdown by lowering Gateway_Chassis priority")
 		fDrainTimeout      = fs.String("drain-timeout", "", "Max time to wait for gateway drain (e.g. 60s)")
+		fDrainSettleDelay  = fs.String("drain-settle-delay", "", "Hold time after gateway drain before cleanup so the takeover chassis can finish coming up (e.g. 3s)")
 
 		fFRRPrefixList        = fs.String("frr-prefix-list", "", "FRR prefix-list name to manage dynamically (default: ANNOUNCED-NETWORKS)")
 		fStaleGrace           = fs.String("stale-chassis-grace-period", "", "Grace period before cleaning up entries from missing chassis (e.g. 5m, 0 to disable)")
@@ -254,6 +264,7 @@ func loadConfig(args []string) (Config, error) {
 		CleanupOnShutdown:       true,
 		DrainOnShutdown:         true,
 		DrainTimeout:            60 * time.Second,
+		DrainSettleDelay:        3 * time.Second,
 		FRRPrefixList:           "ANNOUNCED-NETWORKS",
 		StaleChassisGracePeriod: 5 * time.Minute,
 		VethLeakEnabled:         true,
@@ -314,6 +325,10 @@ func loadConfig(args []string) (Config, error) {
 		case "drain-timeout":
 			if d, err := time.ParseDuration(*fDrainTimeout); err == nil {
 				cfg.DrainTimeout = d
+			}
+		case "drain-settle-delay":
+			if d, err := time.ParseDuration(*fDrainSettleDelay); err == nil {
+				cfg.DrainSettleDelay = d
 			}
 		case "frr-prefix-list":
 			cfg.FRRPrefixList = *fFRRPrefixList
@@ -436,6 +451,9 @@ func validateConfig(cfg *Config) error {
 	}
 	if cfg.DrainOnShutdown && cfg.DrainTimeout == 0 {
 		return fmt.Errorf("drain-on-shutdown requires a positive drain-timeout")
+	}
+	if cfg.DrainSettleDelay < 0 {
+		return fmt.Errorf("invalid drain-settle-delay: must be non-negative")
 	}
 
 	if cfg.StaleChassisGracePeriod < 0 {
@@ -651,6 +669,13 @@ func applyFileConfig(cfg *Config, fc *configFile) {
 			slog.Warn("ignoring invalid drain_timeout in config file", "value", fc.DrainTimeout, "error", err)
 		}
 	}
+	if fc.DrainSettleDelay != "" {
+		if d, err := time.ParseDuration(fc.DrainSettleDelay); err == nil {
+			cfg.DrainSettleDelay = d
+		} else {
+			slog.Warn("ignoring invalid drain_settle_delay in config file", "value", fc.DrainSettleDelay, "error", err)
+		}
+	}
 	if fc.FRRPrefixList != "" {
 		cfg.FRRPrefixList = fc.FRRPrefixList
 	}
@@ -749,6 +774,13 @@ func applyEnvConfig(cfg *Config) {
 			cfg.DrainTimeout = d
 		} else {
 			slog.Warn("ignoring invalid OVN_NETWORK_DRAIN_TIMEOUT env var", "value", v, "error", err)
+		}
+	}
+	if v := os.Getenv("OVN_NETWORK_DRAIN_SETTLE_DELAY"); v != "" {
+		if d, err := time.ParseDuration(v); err == nil {
+			cfg.DrainSettleDelay = d
+		} else {
+			slog.Warn("ignoring invalid OVN_NETWORK_DRAIN_SETTLE_DELAY env var", "value", v, "error", err)
 		}
 	}
 	if v := os.Getenv("OVN_NETWORK_FRR_PREFIX_LIST"); v != "" {
