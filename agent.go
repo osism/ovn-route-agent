@@ -194,6 +194,17 @@ func (a *Agent) Run(ctx context.Context) error {
 					recordDrain("completed", drainElapsed)
 				}
 				drainCancel()
+
+				// The OVN refresh loop stopped the moment ctx was cancelled,
+				// so o.state has been frozen since before the drain — it still
+				// lists the routers that have just migrated away. Refresh it
+				// once now, with a fresh context, so the RemoveManagedNBEntries
+				// call inside cleanup() sees the post-drain reality and does
+				// not delete the default routes and MAC bindings that the
+				// chassis taking over now depends on.
+				refreshCtx, refreshCancel := context.WithTimeout(context.Background(), 10*time.Second)
+				a.ovn.refreshState(refreshCtx)
+				refreshCancel()
 			}
 			if a.cfg.CleanupOnShutdown {
 				slog.Info("shutting down, cleaning up routes")
