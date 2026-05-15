@@ -93,6 +93,22 @@ func (f *fakeOVSDBClient) recordedTransacts() [][]ovsdb.Operation {
 	return out
 }
 
+// writeTransacts returns the recorded transactions that contain at least one
+// non-select operation. cachedList issues read-only OperationSelect probes for
+// its consistency check; tests asserting on writes filter those out.
+func (f *fakeOVSDBClient) writeTransacts() [][]ovsdb.Operation {
+	var out [][]ovsdb.Operation
+	for _, batch := range f.recordedTransacts() {
+		for _, op := range batch {
+			if op.Op != ovsdb.OperationSelect {
+				out = append(out, batch)
+				break
+			}
+		}
+	}
+	return out
+}
+
 func (f *fakeOVSDBClient) tableForType(t reflect.Type) string {
 	for table, mt := range f.dbm.Types() {
 		if mt == t {

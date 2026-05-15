@@ -46,11 +46,13 @@ import (
 // selects exactly these — keeping the common in-sync round-trip cheap — and
 // the matching keyOf* helper must read only the model fields they back.
 var (
-	pbCheckColumns  = []string{"_uuid", "type", "chassis", "nat_addresses"}
-	chCheckColumns  = []string{"_uuid", "hostname"}
-	lrCheckColumns  = []string{"_uuid", "ports", "nat"}
-	lrpCheckColumns = []string{"_uuid", "mac", "networks"}
-	natCheckColumns = []string{"_uuid", "type", "external_ip"}
+	pbCheckColumns   = []string{"_uuid", "type", "chassis", "nat_addresses"}
+	chCheckColumns   = []string{"_uuid", "hostname"}
+	lrCheckColumns   = []string{"_uuid", "ports", "nat", "static_routes"}
+	lrpCheckColumns  = []string{"_uuid", "mac", "networks"}
+	natCheckColumns  = []string{"_uuid", "type", "external_ip"}
+	lrsrCheckColumns = []string{"_uuid", "ip_prefix", "nexthop", "output_port", "external_ids"}
+	smbCheckColumns  = []string{"_uuid", "logical_port", "ip", "mac"}
 )
 
 func keyOfSBPortBinding(p SBPortBinding) string {
@@ -66,7 +68,7 @@ func keyOfSBChassis(c SBChassis) string {
 }
 
 func keyOfNBLogicalRouter(r NBLogicalRouter) string {
-	return contentKey(r.UUID, sortedJoin(r.Ports), sortedJoin(r.Nat))
+	return contentKey(r.UUID, sortedJoin(r.Ports), sortedJoin(r.Nat), sortedJoin(r.StaticRoutes))
 }
 
 func keyOfNBLogicalRouterPort(p NBLogicalRouterPort) string {
@@ -75,6 +77,19 @@ func keyOfNBLogicalRouterPort(p NBLogicalRouterPort) string {
 
 func keyOfNBNAT(n NBNAT) string {
 	return contentKey(n.UUID, n.Type, n.ExternalIP)
+}
+
+func keyOfNBLogicalRouterStaticRoute(r NBLogicalRouterStaticRoute) string {
+	outputPort := ""
+	if r.OutputPort != nil {
+		outputPort = *r.OutputPort
+	}
+	// fmt %v renders a map with its keys sorted, so the key stays stable.
+	return contentKey(r.UUID, r.IPPrefix, r.Nexthop, outputPort, fmt.Sprintf("%v", r.ExternalIDs))
+}
+
+func keyOfNBStaticMACBinding(b NBStaticMACBinding) string {
+	return contentKey(b.UUID, b.LogicalPort, b.IP, b.MAC)
 }
 
 // contentKey joins row attributes into a single comparison key. The unit
@@ -259,10 +274,11 @@ func decodeNBNAT(row ovsdb.Row) NBNAT {
 
 func decodeNBLogicalRouter(row ovsdb.Row) NBLogicalRouter {
 	return NBLogicalRouter{
-		UUID:  rowUUID(row),
-		Name:  rowString(row, "name"),
-		Ports: rowStringSet(row, "ports"),
-		Nat:   rowStringSet(row, "nat"),
+		UUID:         rowUUID(row),
+		Name:         rowString(row, "name"),
+		Ports:        rowStringSet(row, "ports"),
+		Nat:          rowStringSet(row, "nat"),
+		StaticRoutes: rowStringSet(row, "static_routes"),
 	}
 }
 
@@ -272,6 +288,25 @@ func decodeNBLogicalRouterPort(row ovsdb.Row) NBLogicalRouterPort {
 		Name:     rowString(row, "name"),
 		MAC:      rowString(row, "mac"),
 		Networks: rowStringSet(row, "networks"),
+	}
+}
+
+func decodeNBLogicalRouterStaticRoute(row ovsdb.Row) NBLogicalRouterStaticRoute {
+	return NBLogicalRouterStaticRoute{
+		UUID:        rowUUID(row),
+		IPPrefix:    rowString(row, "ip_prefix"),
+		Nexthop:     rowString(row, "nexthop"),
+		OutputPort:  rowOptString(row, "output_port"),
+		ExternalIDs: rowStringMap(row, "external_ids"),
+	}
+}
+
+func decodeNBStaticMACBinding(row ovsdb.Row) NBStaticMACBinding {
+	return NBStaticMACBinding{
+		UUID:        rowUUID(row),
+		LogicalPort: rowString(row, "logical_port"),
+		IP:          rowString(row, "ip"),
+		MAC:         rowString(row, "mac"),
 	}
 }
 

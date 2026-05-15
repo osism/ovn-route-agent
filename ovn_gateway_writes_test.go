@@ -580,7 +580,7 @@ func TestRemoveManagedNBEntries_DeletesManagedRouteAndMACBinding(t *testing.T) {
 		t.Fatalf("RemoveManagedNBEntries: %v", err)
 	}
 
-	tx := nb.recordedTransacts()
+	tx := nb.writeTransacts()
 	// Expect: one transact for the route (mutate + delete), one for the local MAC binding.
 	if len(tx) != 2 {
 		t.Fatalf("expected 2 transacts, got %d: %+v", len(tx), tx)
@@ -638,7 +638,7 @@ func TestRemoveManagedNBEntries_SkipsManagedRouteOnNonLocalRouter(t *testing.T) 
 	if err := c.RemoveManagedNBEntries(context.Background()); err != nil {
 		t.Fatalf("RemoveManagedNBEntries: %v", err)
 	}
-	if got := nb.recordedTransacts(); len(got) != 0 {
+	if got := nb.writeTransacts(); len(got) != 0 {
 		t.Errorf("must not touch routes on non-local routers, got %+v", got)
 	}
 }
@@ -673,7 +673,7 @@ func TestCleanupStale_DeletesRouteAndCorrelatedMACBinding(t *testing.T) {
 		t.Fatalf("CleanupStaleChassisManagedEntries: %v", err)
 	}
 
-	tx := nb.recordedTransacts()
+	tx := nb.writeTransacts()
 	if len(tx) != 2 {
 		t.Fatalf("expected 2 transacts (route + mac), got %d: %+v", len(tx), tx)
 	}
@@ -719,7 +719,7 @@ func TestCleanupStale_PreservesMACBindingWhenLiveChassisOwnsSamePort(t *testing.
 		t.Fatalf("CleanupStaleChassisManagedEntries: %v", err)
 	}
 
-	tx := nb.recordedTransacts()
+	tx := nb.writeTransacts()
 	// Stale route is deleted; MAC binding is preserved because lrp-abc is still live.
 	if len(tx) != 1 {
 		t.Fatalf("expected only the route-delete transact (no MAC binding delete), got %d: %+v", len(tx), tx)
@@ -743,7 +743,7 @@ func TestCleanupStale_SkipsLegacyRouteWithoutChassisTag(t *testing.T) {
 	if err := c.CleanupStaleChassisManagedEntries(context.Background(), map[string]bool{"host-gone": true}); err != nil {
 		t.Fatalf("CleanupStaleChassisManagedEntries: %v", err)
 	}
-	if got := nb.recordedTransacts(); len(got) != 0 {
+	if got := nb.writeTransacts(); len(got) != 0 {
 		t.Errorf("legacy untagged routes must be left alone, got %+v", got)
 	}
 }
@@ -765,7 +765,7 @@ func TestCleanupStale_SkipsUnmanagedRoutes(t *testing.T) {
 	if err := c.CleanupStaleChassisManagedEntries(context.Background(), map[string]bool{"host-gone": true}); err != nil {
 		t.Fatalf("CleanupStaleChassisManagedEntries: %v", err)
 	}
-	if got := nb.recordedTransacts(); len(got) != 0 {
+	if got := nb.writeTransacts(); len(got) != 0 {
 		t.Errorf("unmanaged routes must be left alone, got %+v", got)
 	}
 }
@@ -1234,6 +1234,49 @@ func TestListManagedRouteChassis_ListErrorReturnsNil(t *testing.T) {
 	nb.listErr = errors.New("connection refused")
 	if got := c.ListManagedRouteChassis(context.Background()); got != nil {
 		t.Errorf("expected nil on list error, got %v", got)
+	}
+}
+
+// TestListManagedRouteChassis_RecoversDroppedRouteFromCache exercises the
+// consistency guard on the stale-chassis scan: the monitor cache dropped a
+// managed route, so its chassis tag would be missed. cachedList must detect
+// the gap against the server and recover the route.
+func TestListManagedRouteChassis_RecoversDroppedRouteFromCache(t *testing.T) {
+	c, nb, _ := newOVNClientWithFakes(t, "host-a")
+
+	// Cache knows only the host-a route; the host-b route's INSERT was dropped.
+	nb.setRows("Logical_Router_Static_Route", &NBLogicalRouterStaticRoute{
+		UUID:     "r1",
+		IPPrefix: "0.0.0.0/0",
+		ExternalIDs: map[string]string{
+			"ovn-network-agent":         "managed",
+			"ovn-network-agent-chassis": "host-a",
+		},
+	})
+	// The server has both routes.
+	nb.setSelectRows("Logical_Router_Static_Route",
+		ovsdb.Row{
+			"_uuid":     ovsdb.UUID{GoUUID: "r1"},
+			"ip_prefix": "0.0.0.0/0",
+			"external_ids": ovsdb.OvsMap{GoMap: map[any]any{
+				"ovn-network-agent":         "managed",
+				"ovn-network-agent-chassis": "host-a",
+			}},
+		},
+		ovsdb.Row{
+			"_uuid":     ovsdb.UUID{GoUUID: "r2"},
+			"ip_prefix": "0.0.0.0/0",
+			"external_ids": ovsdb.OvsMap{GoMap: map[any]any{
+				"ovn-network-agent":         "managed",
+				"ovn-network-agent-chassis": "host-b",
+			}},
+		},
+	)
+
+	got := c.ListManagedRouteChassis(context.Background())
+	want := map[string]bool{"host-a": true, "host-b": true}
+	if !reflect.DeepEqual(got, want) {
+		t.Errorf("ListManagedRouteChassis() = %v, want %v (dropped route not recovered)", got, want)
 	}
 }
 
