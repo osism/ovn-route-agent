@@ -269,6 +269,73 @@ jobs:
         if: always()
         run: make e2e-down
 
+  pf-hairpin:
+    name: Port-forward hairpin (masquerade flag)
+    runs-on: ubuntu-latest
+    # Runs in parallel with failover, hairpin, and pf-external (all
+    # four gate on baseline) so a hairpin-masquerade regression is
+    # reported in isolation. 15-minute budget like the others — the
+    # scenario adds the cost of one bootstrap, the baseline gate, two
+    # `docker restart` cycles of gateway-1 and one ≤30s reconcile-and-
+    # probe window per phase, which fits inside the 7-minute target in
+    # issue #110.
+    needs: baseline
+    timeout-minutes: 15
+
+    env:
+      E2E_TOPOLOGY: test/e2e/topology.clab.yml
+      LAB: ovn-e2e
+
+    steps:
+      - uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6
+
+      - name: Install containerlab
+        run: bash -c "$(curl -sL https://get.containerlab.dev)"
+
+      # See the baseline job for the rationale; same modules required.
+      - name: Load required kernel modules
+        run: |
+          set -euo pipefail
+          sudo modprobe openvswitch
+          if ! sudo modprobe vrf 2>/dev/null; then
+            sudo apt-get update -qq
+            sudo apt-get install -y "linux-modules-extra-$(uname -r)"
+            sudo modprobe vrf
+          fi
+
+      - name: Bring the lab up
+        run: make e2e-up
+
+      - name: Run port-forward hairpin scenario
+        # Direct the scenario's nft snapshots (phase1-off / phase2-on /
+        # teardown) into the artifact root so collect-artifacts.sh and
+        # the uploader both pick them up — per issue #110's
+        # "`nft list table inet ovn-network-agent` output is captured
+        # in the artifact bundle on failure" acceptance criterion.
+        # `runner.temp` is only available at step scope, not the
+        # job-level env block.
+        env:
+          ARTIFACTS_DIR: ${{ runner.temp }}/e2e-artifacts/pf-hairpin
+        run: ./test/e2e/scenarios/pf-hairpin.sh
+
+      - name: Collect failure artifacts
+        if: failure()
+        run: |
+          ./test/e2e/scenarios/collect-artifacts.sh "${RUNNER_TEMP}/e2e-artifacts"
+
+      - name: Upload failure artifacts
+        if: failure()
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7
+        with:
+          name: e2e-artifacts-pf-hairpin-${{ github.run_id }}-${{ github.run_attempt }}
+          path: ${{ runner.temp }}/e2e-artifacts
+          if-no-files-found: warn
+          retention-days: 7
+
+      - name: Tear the lab down
+        if: always()
+        run: make e2e-down
+
   stale-chassis:
     name: Stale-chassis cleanup (hard kill)
     runs-on: ubuntu-latest
