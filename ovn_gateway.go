@@ -380,14 +380,18 @@ func (o *OVNClient) RemoveManagedNBEntries(ctx context.Context) error {
 		return nil
 	}
 
-	// Remove managed static routes on locally-active routers.
-	var routes []NBLogicalRouterStaticRoute
-	if err := o.nbClient.List(ctx, &routes); err != nil {
+	// Remove managed static routes on locally-active routers. Read through the
+	// consistency guard: a stale cache could otherwise hide a managed route
+	// (leaving an orphan) or a router's static_routes linkage.
+	routes, err := cachedList(ctx, o.nbClient, "Logical_Router_Static_Route",
+		lrsrCheckColumns, keyOfNBLogicalRouterStaticRoute, decodeNBLogicalRouterStaticRoute)
+	if err != nil {
 		return fmt.Errorf("list static routes: %w", err)
 	}
 
-	var routers []NBLogicalRouter
-	if err := o.nbClient.List(ctx, &routers); err != nil {
+	routers, err := cachedList(ctx, o.nbClient, "Logical_Router",
+		lrCheckColumns, keyOfNBLogicalRouter, decodeNBLogicalRouter)
+	if err != nil {
 		return fmt.Errorf("list routers: %w", err)
 	}
 
@@ -437,8 +441,9 @@ func (o *OVNClient) RemoveManagedNBEntries(ctx context.Context) error {
 	}
 
 	// Remove static MAC bindings on locally-active router ports.
-	var bindings []NBStaticMACBinding
-	if err := o.nbClient.List(ctx, &bindings); err != nil {
+	bindings, err := cachedList(ctx, o.nbClient, "Static_MAC_Binding",
+		smbCheckColumns, keyOfNBStaticMACBinding, decodeNBStaticMACBinding)
+	if err != nil {
 		return fmt.Errorf("list static MAC bindings: %w", err)
 	}
 
@@ -464,8 +469,9 @@ func (o *OVNClient) RemoveManagedNBEntries(ctx context.Context) error {
 // ListManagedRouteChassis returns the set of chassis names referenced in
 // ExternalIDs["ovn-network-agent-chassis"] of all managed static routes.
 func (o *OVNClient) ListManagedRouteChassis(ctx context.Context) map[string]bool {
-	var routes []NBLogicalRouterStaticRoute
-	if err := o.nbClient.List(ctx, &routes); err != nil {
+	routes, err := cachedList(ctx, o.nbClient, "Logical_Router_Static_Route",
+		lrsrCheckColumns, keyOfNBLogicalRouterStaticRoute, decodeNBLogicalRouterStaticRoute)
+	if err != nil {
 		slog.Error("failed to list static routes for chassis scan", "error", err)
 		return nil
 	}
@@ -493,13 +499,15 @@ type staleMACBindingKey struct {
 // Only entries with ExternalIDs["ovn-network-agent"] == "managed" and a matching
 // chassis tag are removed. Neutron-created entries are never touched.
 func (o *OVNClient) CleanupStaleChassisManagedEntries(ctx context.Context, staleChassis map[string]bool) error {
-	var routes []NBLogicalRouterStaticRoute
-	if err := o.nbClient.List(ctx, &routes); err != nil {
+	routes, err := cachedList(ctx, o.nbClient, "Logical_Router_Static_Route",
+		lrsrCheckColumns, keyOfNBLogicalRouterStaticRoute, decodeNBLogicalRouterStaticRoute)
+	if err != nil {
 		return fmt.Errorf("list static routes: %w", err)
 	}
 
-	var routers []NBLogicalRouter
-	if err := o.nbClient.List(ctx, &routers); err != nil {
+	routers, err := cachedList(ctx, o.nbClient, "Logical_Router",
+		lrCheckColumns, keyOfNBLogicalRouter, decodeNBLogicalRouter)
+	if err != nil {
 		return fmt.Errorf("list routers: %w", err)
 	}
 
@@ -588,8 +596,9 @@ func (o *OVNClient) CleanupStaleChassisManagedEntries(ctx context.Context, stale
 
 	// Delete MAC bindings that match the exact (LogicalPort, IP) pairs from stale routes.
 	if len(staleBindingKeys) > 0 {
-		var bindings []NBStaticMACBinding
-		if err := o.nbClient.List(ctx, &bindings); err != nil {
+		bindings, err := cachedList(ctx, o.nbClient, "Static_MAC_Binding",
+			smbCheckColumns, keyOfNBStaticMACBinding, decodeNBStaticMACBinding)
+		if err != nil {
 			return fmt.Errorf("list static MAC bindings: %w", err)
 		}
 		for _, b := range bindings {
@@ -872,13 +881,19 @@ func rowToGatewayChassis(row ovsdb.Row) NBGatewayChassis {
 // countLocalCRPorts returns the number of chassisredirect ports currently
 // bound to the given chassis hostname in the SB Port_Binding table.
 func (o *OVNClient) countLocalCRPorts(ctx context.Context, localChassisName string) (int, error) {
-	var portBindings []SBPortBinding
-	if err := o.sbClient.List(ctx, &portBindings); err != nil {
+	// countLocalCRPorts drives the drain poll loop: a stale SB cache here makes
+	// the drain converge on the wrong answer (hang until timeout, or finish
+	// early while ports are still bound). Read through the consistency guard
+	// so a dropped INSERT or a stale chassis column is corrected.
+	portBindings, err := cachedList(ctx, o.sbClient, "Port_Binding",
+		pbCheckColumns, keyOfSBPortBinding, decodeSBPortBinding)
+	if err != nil {
 		return 0, fmt.Errorf("list port bindings: %w", err)
 	}
 
-	var chassis []SBChassis
-	if err := o.sbClient.List(ctx, &chassis); err != nil {
+	chassis, err := cachedList(ctx, o.sbClient, "Chassis",
+		chCheckColumns, keyOfSBChassis, decodeSBChassis)
+	if err != nil {
 		return 0, fmt.Errorf("list chassis: %w", err)
 	}
 
