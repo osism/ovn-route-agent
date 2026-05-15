@@ -960,6 +960,96 @@ func TestValidateConfigStaleChassisGracePeriodNegative(t *testing.T) {
 	}
 }
 
+func TestLoadConfigDrainSettleDelayDefault(t *testing.T) {
+	cfg, err := loadConfig(fullModeArgs())
+	if err != nil {
+		t.Fatalf("loadConfig() error: %v", err)
+	}
+	if cfg.DrainSettleDelay != 3*time.Second {
+		t.Errorf("DrainSettleDelay = %v, want %v", cfg.DrainSettleDelay, 3*time.Second)
+	}
+}
+
+func TestLoadConfigDrainSettleDelayCLI(t *testing.T) {
+	cfg, err := loadConfig(fullModeArgs("--drain-settle-delay", "8s"))
+	if err != nil {
+		t.Fatalf("loadConfig() error: %v", err)
+	}
+	if cfg.DrainSettleDelay != 8*time.Second {
+		t.Errorf("DrainSettleDelay = %v, want %v", cfg.DrainSettleDelay, 8*time.Second)
+	}
+}
+
+func TestLoadConfigDrainSettleDelayDisabled(t *testing.T) {
+	cfg, err := loadConfig(fullModeArgs("--drain-settle-delay", "0s"))
+	if err != nil {
+		t.Fatalf("loadConfig() error: %v", err)
+	}
+	if cfg.DrainSettleDelay != 0 {
+		t.Errorf("DrainSettleDelay = %v, want 0 (disabled)", cfg.DrainSettleDelay)
+	}
+}
+
+func TestApplyEnvConfigDrainSettleDelay(t *testing.T) {
+	cfg := Config{DrainSettleDelay: 3 * time.Second}
+	t.Setenv("OVN_NETWORK_DRAIN_SETTLE_DELAY", "5s")
+	applyEnvConfig(&cfg)
+	if cfg.DrainSettleDelay != 5*time.Second {
+		t.Errorf("DrainSettleDelay = %v, want %v", cfg.DrainSettleDelay, 5*time.Second)
+	}
+}
+
+func TestApplyFileConfigDrainSettleDelay(t *testing.T) {
+	cfg := Config{DrainSettleDelay: 3 * time.Second}
+	fc := configFile{DrainSettleDelay: "10s"}
+	applyFileConfig(&cfg, &fc)
+	if cfg.DrainSettleDelay != 10*time.Second {
+		t.Errorf("DrainSettleDelay = %v, want %v", cfg.DrainSettleDelay, 10*time.Second)
+	}
+}
+
+func TestApplyFileConfigDrainSettleDelayEmpty(t *testing.T) {
+	cfg := Config{DrainSettleDelay: 3 * time.Second}
+	fc := configFile{}
+	applyFileConfig(&cfg, &fc)
+	if cfg.DrainSettleDelay != 3*time.Second {
+		t.Errorf("DrainSettleDelay = %v, want %v (should keep default)", cfg.DrainSettleDelay, 3*time.Second)
+	}
+}
+
+func TestLoadConfigDrainSettleDelayYAML(t *testing.T) {
+	content := `
+ovn_sb_remote: "tcp:10.0.0.1:6642"
+ovn_nb_remote: "tcp:10.0.0.1:6641"
+veth_leak_enabled: false
+drain_settle_delay: "4s"
+`
+	path := filepath.Join(t.TempDir(), "config.yaml")
+	if err := os.WriteFile(path, []byte(content), 0644); err != nil {
+		t.Fatalf("write test config: %v", err)
+	}
+
+	cfg, err := loadConfig([]string{"--config", path})
+	if err != nil {
+		t.Fatalf("loadConfig() error: %v", err)
+	}
+	if cfg.DrainSettleDelay != 4*time.Second {
+		t.Errorf("DrainSettleDelay = %v, want %v", cfg.DrainSettleDelay, 4*time.Second)
+	}
+}
+
+func TestValidateConfigDrainSettleDelayNegative(t *testing.T) {
+	cfg := Config{
+		VethNexthop:      "169.254.0.1",
+		VRFName:          "vrf-provider",
+		DrainSettleDelay: -1 * time.Second,
+	}
+	err := validateConfig(&cfg)
+	if err == nil {
+		t.Error("expected error for negative drain-settle-delay")
+	}
+}
+
 func TestApplyEnvConfigFRRPrefixList(t *testing.T) {
 	cfg := Config{}
 	t.Setenv("OVN_NETWORK_FRR_PREFIX_LIST", "MY-LIST")
