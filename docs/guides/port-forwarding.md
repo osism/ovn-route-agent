@@ -177,6 +177,17 @@ On the very first startup (before OVN discovery completes), the rules are
 absent. They are installed automatically on the first reconciliation cycle
 once OVN reports the provider network CIDRs.
 
+**E2E coverage:** the containerlab harness has an explicit scenario for
+this flag — see
+[`pf-hairpin.sh`](../contributing/e2e-tests.md#running-locally) (issue
+[#110](https://github.com/osism/ovn-network-agent/issues/110)). It
+drives a co-located FIP workload against a port-forwarded VIP twice
+on the same lab: once with `hairpin_masquerade: false` (the TCP probe
+**must** time out, because the reply bypasses the chassis conntrack)
+and once with `hairpin_masquerade: true` (the probe **must** complete
+within the reconcile budget). A regression that accidentally fixes
+the negative case turns CI red.
+
 ### Case 2: instance behind a router without a FIP (`router_masquerade`)
 
 **The problem:** an instance without its own FIP connects to a port-forwarded

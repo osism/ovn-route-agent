@@ -34,8 +34,14 @@ The harness has two layers:
    ([#109](https://github.com/osism/ovn-network-agent/issues/109))
    seeds an OVN Load_Balancer (port-forward / DNAT) on `lr0`, drives
    it with `curl` from `client-1`, and asserts the backend log records
-   the client's underlay IP — i.e. no SNAT on the way in. The
-   conceptual model the scenario exercises is documented in
+   the client's underlay IP — i.e. no SNAT on the way in.
+   [`pf-hairpin.sh`](https://github.com/osism/ovn-network-agent/blob/main/test/e2e/scenarios/pf-hairpin.sh)
+   ([#110](https://github.com/osism/ovn-network-agent/issues/110))
+   exercises the agent's `hairpin_masquerade` flag: with the flag off
+   a co-located workload behind a FIP must time out on the VIP, with
+   the flag on the same probe must complete — the asymmetric reply
+   path is what the masquerade rule fixes. The conceptual model both
+   port-forward scenarios exercise is documented in
    [Port forwarding (DNAT)](../explanation/port-forwarding.md).
 
 ## Layout
@@ -54,6 +60,7 @@ test/e2e/
     failover.sh             — HA failover scenario, master chassis loss (issue #105)
     hairpin.sh              — same-chassis hairpin scenario, two FIPs on master (issue #108)
     pf-external.sh          — port-forward / DNAT scenario, source IP preserved (issue #109)
+    pf-hairpin.sh           — port-forward hairpin masquerade scenario (issue #110)
     stale-chassis.sh        — stale chassis cleanup scenario, hard kill (issue #111)
     collect-artifacts.sh    — dump lab state for offline triage
   pf-backend/
@@ -202,6 +209,7 @@ make e2e-baseline       # run the baseline reachability scenario
 make e2e-failover       # run the HA failover scenario (master chassis loss)
 make e2e-hairpin        # run the same-chassis hairpin scenario (two FIPs on master)
 make e2e-pf-external    # run the port-forward / DNAT scenario (source IP preserved)
+make e2e-pf-hairpin     # run the port-forward hairpin masquerade scenario
 make e2e-stale-chassis  # run the stale-chassis cleanup scenario (hard kill)
 make e2e-down           # containerlab destroy
 ```
@@ -324,6 +332,103 @@ OVN port-forward primitive — the same `lr-lb-add` path
 `neutron-ovn-agent` and `kube-ovn` use in production — and is the
 only ovn-nbctl primitive that combines pure DNAT with a per-port
 mapping today.
+
+`make e2e-pf-hairpin` invokes `test/e2e/scenarios/pf-hairpin.sh`,
+which exercises the agent's `hairpin_masquerade` flag — the
+source-selective SNAT documented in
+[Port forwarding (DNAT)](../explanation/port-forwarding.md). The
+agent performs port-forward DNAT in the chassis kernel (via
+nftables); when a FIP on the same chassis dials the VIP, the
+backend reply traverses OVN directly and bypasses the chassis
+conntrack, so the client sees the backend's tenant IP as the reply
+source and drops the segment. `hairpin_masquerade: true` adds a
+`postrouting_snat` masquerade rule that rewrites the source to the
+chassis IP, so the backend replies through the chassis and conntrack
+reverses both NAT layers.
+
+The scenario runs the baseline first as a sanity gate (disable with
+`SANITY_GATE=0`), then adds — scenario-locally — a new FIP `192.0.2.13`
+on `lr0` (`fip-c`) with a backing LSP `ls0-vmc` (`192.168.10.13`, MAC
+`02:00:00:00:0a:0c`) and a `vmc` netns + veth on `gateway-1` so the
+client behind the new FIP is co-located with the active master.
+Because the agent's port-forward DNAT runs in the chassis kernel and
+the lab does not expose `192.168.10.0/24` to `gateway-1`'s default
+routing table on its own, the scenario also adds an OVS internal port
+`tenant-shim` on `gateway-1:br-int` bound to a new LSP `ls0-shim`
+(`192.168.10.99`, MAC `02:00:00:00:0a:99`, port_security disabled so
+the asymmetric source on the forward leg is allowed through). That
+shim is the route the kernel uses to reach `vm1` on `gateway-3` once
+nftables has rewritten the destination, and the ARP responder for
+its configured address is what lets `vm1` reach the shim when the
+masquerade flag is on. Without it both phases would time out because
+the forward packet would be dropped at `gateway-1` (no route for the
+tenant network in `main`), and the test would not be load-bearing.
+
+The VIP itself is `198.51.100.50` (TEST-NET-2), **not** the
+`192.0.2.50` the issue body names. The agent's port-forward DNAT
+fires in the chassis kernel, so the VIP traffic from `vmc` has to
+leave OVN and transit `gateway-1`'s kernel. `192.0.2.50` is inside
+the provider network `192.0.2.0/24`, which is a connected route on
+`lr0` — OVN would deliver VIP traffic on the public logical switch
+and ARP for it there (nothing answers), and the kernel DNAT would
+never see the packet. A VIP outside every OVN-connected subnet
+follows `lr0`'s default route out through `cr-lr0-public` onto
+`br-ex`, where the agent's MAC-tweak flow hands it to the kernel and
+`prerouting` DNAT catches it in transit.
+
+The two phases share that static topology and only differ in the
+agent's config:
+
+1. **Phase 1 (negative)** — the scenario writes
+   `/etc/ovn-network-agent/config.yaml` on `gateway-1` with the
+   baseline config plus a `port_forwards` entry for
+   `198.51.100.50:53 → 192.168.10.10:53` (`hairpin_masquerade: false`),
+   `docker restart`s the gateway container so the agent reloads the
+   config, waits for the chassis to re-bind `cr-lr0-public` and for
+   the DNAT rule to appear in `nft list table ip ovn-network-agent`,
+   and then probes `198.51.100.50:53` from inside the `vmc` netns using
+   `timeout 5 bash -c '</dev/tcp/198.51.100.50/53'`. The handshake
+   **must** fail; if it succeeds the flag is not load-bearing and
+   the assertion turns the job red.
+2. **Phase 2 (positive)** — the scenario rewrites the config with
+   `hairpin_masquerade: true`, restarts the gateway again, waits for
+   the chassis re-bind and DNAT rule, then polls the same probe for
+   up to `RECONCILE_TIMEOUT` (default 30s). The probe **must**
+   complete, and `nft list table ip ovn-network-agent` on `gateway-1`
+   **must** carry a `ct original daddr 198.51.100.50 ... masquerade`
+   rule. Both `phase1-off` and `phase2-on` nft snapshots are written
+   to `ARTIFACTS_DIR` so a failure shows the exact ruleset that was
+   in effect.
+
+The EXIT trap restores the baseline agent config, restarts
+`gateway-1` once more so the restored config takes effect, and
+removes the FIP, both LSPs, the `vmc` netns, `tenant-shim` and the
+`pf-backend` process — so a subsequent `make e2e-baseline` keeps
+passing. `loopback1` is provisioned unconditionally by
+`gwnode-entrypoint.sh` (`setup_loopback`) on every container start
+because the agent looks the device up as soon as `port_forwards:`
+is present in the config, even when no VIP has `manage_vip: true`,
+and creating it from the scenario would not survive a
+`docker restart`. Override `VIP`, `VIP_PORT`, `BACKEND_IP`,
+`BACKEND_PORT`, `FIP_C`, `FIP_C_INTERNAL`, `MASTER`, `WORKLOAD_HOST`,
+`RECONCILE_TIMEOUT`, `RESTART_TIMEOUT` or `SANITY_GATE` when
+triaging.
+
+Why `docker restart` (and not `systemctl restart ovn-network-agent`
+as the issue body suggests): the gwnode image is not running
+systemd. The entrypoint `exec`s the agent so it becomes PID 1; the
+only way to make the agent re-read its config is to restart the
+whole container. This costs ~20s of OVS / ovn-controller / FRR
+re-init per phase but stays inside the 7-minute CI budget for two
+reconciles.
+
+Why the agent's nftables table is `ip ovn-network-agent` (the issue
+body says `inet ovn-network-agent`): the agent emits its table in
+the `ip` family — see `nftTableName` and the `table ip %s` literal
+in [nftables.go](https://github.com/osism/ovn-network-agent/blob/main/nftables.go#L12).
+The artifact capture and the masquerade-rule assertion both target
+`ip ovn-network-agent`; `NFT_TABLE_FAMILY` and `NFT_TABLE_NAME` are
+exposed as overrides for forward compatibility.
 
 `make e2e-stale-chassis` invokes `test/e2e/scenarios/stale-chassis.sh`,
 which exercises the agent's garbage-collection path for managed NB
