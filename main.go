@@ -30,18 +30,24 @@ func main() {
 
 	setupLogging(cfg.LogLevel)
 
-	if cfg.OVNSBRemote == "" || cfg.OVNNBRemote == "" {
-		slog.Error("OVN database remotes are required, set --ovn-sb-remote / --ovn-nb-remote, OVN_NETWORK_OVN_SB_REMOTE / OVN_NETWORK_OVN_NB_REMOTE, or use a config file (--config)")
-		os.Exit(1)
+	// The OVN-vs-port-forward-only decision is made in config validation
+	// (validateMode); main only reports the resulting mode.
+	mode := "full"
+	if cfg.PortForwardOnly {
+		mode = "port-forward-only"
 	}
 
 	networkMode := "auto-discover from OVN"
-	if len(cfg.NetworkCIDRs) > 0 {
+	switch {
+	case len(cfg.NetworkCIDRs) > 0:
 		networkMode = "manual"
+	case cfg.PortForwardOnly:
+		networkMode = "none (port-forward-only)"
 	}
 
 	slog.Info("ovn-network-agent starting",
 		"version", version,
+		"mode", mode,
 		"dry_run", cfg.DryRun,
 		"cleanup_on_shutdown", cfg.CleanupOnShutdown,
 		"drain_on_shutdown", cfg.DrainOnShutdown,
