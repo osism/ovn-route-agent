@@ -70,7 +70,18 @@ already moved. The result is a hitless shutdown.
                           │
                           ▼
   ┌───────────────────────────────────────────────────────┐
-  │  2. CLEANUP (if cleanup_on_shutdown=true)             │
+  │  2. SETTLE (hold for drain_settle_delay)              │
+  │                                                       │
+  │  Keep advertising FIP /32 routes and OVS flows so     │
+  │  this node still forwards external traffic            │
+  │  (hairpinned to the new gateway chassis) while the    │
+  │  takeover chassis finishes OVN programming, reconcile │
+  │  and BGP advertisement. Skipped if nothing migrated.  │
+  └───────────────────────┬───────────────────────────────┘
+                          │
+                          ▼
+  ┌───────────────────────────────────────────────────────┐
+  │  3. CLEANUP (if cleanup_on_shutdown=true)             │
   │                                                       │
   │  Remove kernel routes, FRR routes, OVS flows,         │
   │  bridge IP, nftables rules                            │
@@ -115,6 +126,48 @@ already moved. The result is a hitless shutdown.
                           ▼
                  Normal reconciliation loop
 ```
+
+## The takeover race and the settle delay
+
+Draining the priority and polling until the chassisredirect port has
+migrated away makes the **OVN-internal** failover hitless. But "the port
+moved" is not the same as "the takeover chassis can forward external
+traffic". The leaving node advertises each FIP as a BGP `/32`; so does the
+takeover node, once it is ready. Between the two events there is a second
+race:
+
+1. The leaving node sees the port migrate and — without a hold — proceeds
+   straight to cleanup, which **withdraws its FIP `/32` routes** from BGP.
+2. The takeover node still has to react to the `Port_Binding` change,
+   reconcile, install OVS flows and kernel routes, advertise its own FIP
+   `/32`s in FRR, and wait for the upstream fabric to reconverge.
+
+If step 1 wins, external traffic has no working path until step 2
+finishes — observed as roughly 5 s of packet loss on a continuous ping
+through a FIP.
+
+Two mechanisms close this race:
+
+- **Post-drain settle delay** (`drain_settle_delay`, default 3 s). After
+  the poll loop confirms the ports have migrated, the leaving node holds
+  before cleanup. During the hold it still advertises its FIP routes and
+  keeps its OVS flows, so it continues forwarding external traffic —
+  hairpinned to the new gateway chassis over the tunnel — while the
+  takeover node comes up. The hold is bounded by `drain_timeout`, so total
+  graceful shutdown never exceeds that budget, and it is skipped when there
+  was nothing to drain.
+- **BGP soft-refresh on the takeover node.** When the takeover node adds
+  FIP `/32`s to FRR, the agent immediately issues `clear ip bgp … soft out`
+  instead of waiting for FRR's normal redistribution timing. The soft
+  refresh only re-evaluates outbound policy and re-sends routes — it never
+  withdraws anything — so it shortens the takeover node's "ready" time
+  (and also speeds up ungraceful failovers) at the cost of a small extra
+  UPDATE burst.
+
+A portion of the remaining gap is OVN-intrinsic (`ovn-northd` /
+`ovn-controller` reprogramming) and cannot be closed from the agent; the
+settle delay only has to cover the takeover node's reconcile and BGP
+advertisement.
 
 ## Priority semantics
 
