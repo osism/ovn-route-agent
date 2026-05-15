@@ -711,7 +711,10 @@ func TestNBEventHandlerOnlyRelevantTablesTriggerDebounce(t *testing.T) {
 	c.ready.Store(true)
 	h := &nbEventHandler{ovn: c}
 
-	tables := []string{"NAT", "Logical_Router", "Logical_Router_Port"}
+	// Gateway_Chassis is included: a peer's drain/restore/boost is a
+	// Gateway_Chassis write, and the agent must wake so the following
+	// reconcile runs EnsureActivePriorityLead and resolves any priority tie.
+	tables := []string{"NAT", "Logical_Router", "Logical_Router_Port", "Gateway_Chassis"}
 	for _, table := range tables {
 		// Drain first so each iteration starts empty.
 		select {

@@ -815,6 +815,18 @@ func (h *nbEventHandler) handleChange(table string) {
 	switch table {
 	case "NAT", "Logical_Router", "Logical_Router_Port":
 		h.ovn.debounceStateRefresh()
+	case "Gateway_Chassis":
+		// refreshState does not read Gateway_Chassis, but a priority change
+		// must still wake the agent: the reconcile that follows the refresh
+		// runs EnsureActivePriorityLead, which is how the active chassis
+		// reacts to a peer draining (priority→0), restoring (→1) or
+		// boosting. Without this trigger a peer's drain/restore is invisible
+		// until the 60s periodic reconcile — long enough for a priority tie
+		// to leave ovn-northd flapping the chassisredirect port and
+		// stranding the FIPs. Rapid stop/start cycles are bursts of
+		// Gateway_Chassis writes, which is why the hang is worst under quick
+		// succession.
+		h.ovn.debounceStateRefresh()
 	}
 }
 
