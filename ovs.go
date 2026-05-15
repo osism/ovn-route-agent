@@ -49,31 +49,15 @@ func (rm *RouteManager) runOVS(binary string, args ...string) ([]byte, error) {
 // integration bridge (via the patch-provnet port) to the bridge device's own
 // MAC, so the kernel can properly receive and route them.
 //
-// Discovery results are cached after the first successful call.
+// The patch port is re-validated on every call via refreshOVSDiscovery.
 func (rm *RouteManager) EnsureOVSFlows() error {
 	if rm.dryRun {
 		slog.Info("[dry-run] would ensure OVS MAC-tweak flows", "dev", rm.bridgeDev)
 		return nil
 	}
 
-	// Use cached values if available; discover on first call.
-	if rm.cachedPatchPort == "" {
-		patchPort, err := rm.discoverPatchPort()
-		if err != nil {
-			return fmt.Errorf("discover patch port on %s: %w", rm.bridgeDev, err)
-		}
-		ofport, err := rm.getOFPort(patchPort)
-		if err != nil {
-			return fmt.Errorf("get ofport for %s: %w", patchPort, err)
-		}
-		mac, err := rm.GetBridgeMAC()
-		if err != nil {
-			return fmt.Errorf("get bridge MAC: %w", err)
-		}
-		rm.cachedPatchPort = patchPort
-		rm.cachedOfport = ofport
-		rm.cachedBridgeMAC = mac.String()
-		slog.Info("OVS discovery complete", "patch_port", patchPort, "ofport", ofport, "mac", rm.cachedBridgeMAC)
+	if err := rm.refreshOVSDiscovery(); err != nil {
+		return err
 	}
 
 	// Delete existing agent-managed flows (idempotent replace).
@@ -94,6 +78,49 @@ func (rm *RouteManager) EnsureOVSFlows() error {
 	}
 
 	slog.Debug("OVS MAC-tweak flows ensured", "dev", rm.bridgeDev)
+	return nil
+}
+
+// refreshOVSDiscovery makes sure cachedPatchPort, cachedOfport and
+// cachedBridgeMAC reflect the current br-ex state.
+//
+// The discovery results cannot be cached for the process lifetime:
+// ovn-controller can delete and recreate the br-ex patch port — on a
+// bridge-mapping change, an OVS resync, or its own restart — which assigns
+// the port a new OpenFlow port number. A stale cached ofport makes every
+// MAC-tweak and hairpin flow match a dead in_port, silently breaking the
+// OVN↔kernel data path until the agent is restarted.
+//
+// The fast path keeps the cache whenever the cached patch port still resolves
+// to the cached ofport; otherwise (first call, or the port was recreated) it
+// rediscovers from scratch.
+func (rm *RouteManager) refreshOVSDiscovery() error {
+	if rm.cachedPatchPort != "" {
+		if ofport, err := rm.getOFPort(rm.cachedPatchPort); err == nil && ofport == rm.cachedOfport {
+			return nil
+		}
+		slog.Info("br-ex patch port changed or gone, rediscovering OVS flow target",
+			"cached_patch_port", rm.cachedPatchPort, "cached_ofport", rm.cachedOfport)
+		rm.cachedPatchPort = ""
+		rm.cachedOfport = ""
+	}
+
+	patchPort, err := rm.discoverPatchPort()
+	if err != nil {
+		return fmt.Errorf("discover patch port on %s: %w", rm.bridgeDev, err)
+	}
+	ofport, err := rm.getOFPort(patchPort)
+	if err != nil {
+		return fmt.Errorf("get ofport for %s: %w", patchPort, err)
+	}
+	mac, err := rm.GetBridgeMAC()
+	if err != nil {
+		return fmt.Errorf("get bridge MAC: %w", err)
+	}
+	rm.cachedPatchPort = patchPort
+	rm.cachedOfport = ofport
+	rm.cachedBridgeMAC = mac.String()
+	slog.Info("OVS discovery complete", "patch_port", patchPort, "ofport", ofport, "mac", rm.cachedBridgeMAC)
 	return nil
 }
 
