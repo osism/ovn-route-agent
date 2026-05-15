@@ -41,10 +41,11 @@ type fakeOVSDBClient struct {
 	// by table name, bypassing the cache view exposed via setRows/List. The
 	// drain fallback and refreshState's cache-consistency guard use
 	// Transact(OperationSelect) to read directly from the server when the
-	// cache appears incomplete (issue #115); tests populate this to simulate
-	// the "server has the row, cache does not" race. When a table has no
-	// entry here, Transact synthesises a minimal _uuid-only row per cached
-	// model, i.e. the server view is modelled as identical to the cache.
+	// cache appears incomplete or stale (issue #115); tests populate this to
+	// simulate a "server has the row, cache does not" or "server has fresh
+	// content, cache is stale" race. When a table has no entry here, Transact
+	// synthesises a full row per cached model via modelToRow, i.e. the server
+	// view is modelled as identical to the cache.
 	selectRows map[string][]ovsdb.Row
 
 	// onTransact is invoked synchronously for each Transact call (after the
@@ -112,6 +113,55 @@ func uuidOfModel(m model.Model) string {
 		return ""
 	}
 	return f.String()
+}
+
+// modelToRow renders a model.Model into the OVSDB wire-ish row shape the
+// decode* helpers in ovn_cache.go consume, so a Transact(select) without an
+// explicit setSelectRows override mirrors the cache exactly — the in-sync
+// case the consistency guard must not flag as drift. Only the field kinds the
+// production decoders read are emitted; anything else is left out of the row.
+func modelToRow(m model.Model) ovsdb.Row {
+	row := ovsdb.Row{}
+	v := reflect.ValueOf(m)
+	if v.Kind() == reflect.Pointer {
+		v = v.Elem()
+	}
+	t := v.Type()
+	for i := 0; i < t.NumField(); i++ {
+		tag := t.Field(i).Tag.Get("ovsdb")
+		if tag == "" {
+			continue
+		}
+		fv := v.Field(i)
+		switch {
+		case tag == "_uuid":
+			row[tag] = ovsdb.UUID{GoUUID: fv.String()}
+		case fv.Kind() == reflect.String:
+			row[tag] = fv.String()
+		case fv.Kind() == reflect.Int:
+			row[tag] = int(fv.Int())
+		case fv.Kind() == reflect.Pointer && fv.Type().Elem().Kind() == reflect.String:
+			// OVSDB encodes an absent optional as an empty set.
+			if fv.IsNil() {
+				row[tag] = ovsdb.OvsSet{}
+			} else {
+				row[tag] = fv.Elem().String()
+			}
+		case fv.Kind() == reflect.Slice && fv.Type().Elem().Kind() == reflect.String:
+			set := make([]any, fv.Len())
+			for j := 0; j < fv.Len(); j++ {
+				set[j] = fv.Index(j).String()
+			}
+			row[tag] = ovsdb.OvsSet{GoSet: set}
+		case fv.Kind() == reflect.Map:
+			gm := make(map[any]any, fv.Len())
+			for iter := fv.MapRange(); iter.Next(); {
+				gm[iter.Key().Interface()] = iter.Value().Interface()
+			}
+			row[tag] = ovsdb.OvsMap{GoMap: gm}
+		}
+	}
+	return row
 }
 
 // --- ovsdbClient surface -----------------------------------------------------
@@ -210,11 +260,11 @@ func (f *fakeOVSDBClient) Transact(_ context.Context, ops ...ovsdb.Operation) ([
 			continue
 		}
 		// No explicit override: model the server view as identical to the
-		// cache. refreshState's consistency check only reads _uuid here, so
-		// one minimal row per cached model is enough to signal "no drift".
+		// cache. The consistency check builds a content key over several
+		// columns, so the synthesised row must mirror the whole model — a
+		// bare _uuid row would read back as drift on every refresh.
 		for _, m := range f.rows[op.Table] {
-			results[i].Rows = append(results[i].Rows,
-				ovsdb.Row{"_uuid": ovsdb.UUID{GoUUID: uuidOfModel(m)}})
+			results[i].Rows = append(results[i].Rows, modelToRow(m))
 		}
 	}
 	return results, nil

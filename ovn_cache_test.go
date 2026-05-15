@@ -9,11 +9,6 @@ import (
 	"github.com/ovn-kubernetes/libovsdb/ovsdb"
 )
 
-// uuidRow builds a minimal select row carrying only the _uuid column.
-func uuidRow(uuid string) ovsdb.Row {
-	return ovsdb.Row{"_uuid": ovsdb.UUID{GoUUID: uuid}}
-}
-
 // TestCachedListNoDrift: when the monitor cache and the server agree, cachedList
 // returns the cache snapshot untouched (no recovery, no decode).
 func TestCachedListNoDrift(t *testing.T) {
@@ -25,7 +20,7 @@ func TestCachedListNoDrift(t *testing.T) {
 	)
 
 	got, err := cachedList(context.Background(), sb, "Port_Binding",
-		func(p SBPortBinding) string { return p.UUID }, decodeSBPortBinding)
+		pbCheckColumns, keyOfSBPortBinding, decodeSBPortBinding)
 	if err != nil {
 		t.Fatalf("cachedList: %v", err)
 	}
@@ -50,7 +45,12 @@ func TestCachedListRecoversDroppedRow(t *testing.T) {
 	)
 	// The server has both rows.
 	sb.setSelectRows("Port_Binding",
-		uuidRow("pb-1"),
+		ovsdb.Row{
+			"_uuid":        ovsdb.UUID{GoUUID: "pb-1"},
+			"logical_port": "cr-lrp-1",
+			"type":         "chassisredirect",
+			"chassis":      ovsdb.UUID{GoUUID: "ch-a"},
+		},
 		ovsdb.Row{
 			"_uuid":        ovsdb.UUID{GoUUID: "pb-2"},
 			"logical_port": "cr-lrp-2",
@@ -60,7 +60,7 @@ func TestCachedListRecoversDroppedRow(t *testing.T) {
 	)
 
 	got, err := cachedList(context.Background(), sb, "Port_Binding",
-		func(p SBPortBinding) string { return p.UUID }, decodeSBPortBinding)
+		pbCheckColumns, keyOfSBPortBinding, decodeSBPortBinding)
 	if err != nil {
 		t.Fatalf("cachedList: %v", err)
 	}
@@ -90,8 +90,8 @@ func TestAuthoritativeListServerSelectErrorTrustsCache(t *testing.T) {
 	sb.transactErr = errors.New("connection refused")
 
 	cached := []SBChassis{{UUID: "ch-1", Name: "ch-1", Hostname: "host-a"}}
-	got := authoritativeList(context.Background(), sb, "Chassis", cached,
-		func(c SBChassis) string { return c.UUID }, decodeSBChassis)
+	got := authoritativeList(context.Background(), sb, "Chassis", chCheckColumns, cached,
+		keyOfSBChassis, decodeSBChassis)
 	if !reflect.DeepEqual(got, cached) {
 		t.Errorf("got %+v, want cache snapshot %+v on select error", got, cached)
 	}
@@ -136,6 +136,83 @@ func TestRefreshStateRecoversDroppedNATFromCache(t *testing.T) {
 	if snap.NATIPToRouterMAC["198.51.100.50"] != "fa:16:3e:aa:aa:aa" {
 		t.Errorf("NATIPToRouterMAC[FIP] = %q, want fa:16:3e:aa:aa:aa",
 			snap.NATIPToRouterMAC["198.51.100.50"])
+	}
+}
+
+// TestAuthoritativeListRecoversStaleColumn is the regression test for a
+// dropped UPDATE: the monitor cache holds the right row (same _uuid) but a
+// stale column value. A _uuid-set comparison sees no drift; the content-key
+// check must catch it and rebuild the row from a direct select.
+func TestAuthoritativeListRecoversStaleColumn(t *testing.T) {
+	_, _, sb := newOVNClientWithFakes(t, "host-a")
+
+	// Cache holds the chassisredirect port bound to ch-a.
+	chA := "ch-a"
+	cached := []SBPortBinding{
+		{UUID: "pb-1", LogicalPort: "cr-lrp-1", Type: "chassisredirect", Chassis: &chA},
+	}
+	// The server has the same row (same _uuid) but bound to ch-b — a failover
+	// UPDATE the monitor cache dropped.
+	sb.setSelectRows("Port_Binding", ovsdb.Row{
+		"_uuid":        ovsdb.UUID{GoUUID: "pb-1"},
+		"logical_port": "cr-lrp-1",
+		"type":         "chassisredirect",
+		"chassis":      ovsdb.UUID{GoUUID: "ch-b"},
+	})
+
+	got := authoritativeList(context.Background(), sb, "Port_Binding", pbCheckColumns, cached,
+		keyOfSBPortBinding, decodeSBPortBinding)
+	if len(got) != 1 {
+		t.Fatalf("len(got) = %d, want 1", len(got))
+	}
+	if got[0].Chassis == nil || *got[0].Chassis != "ch-b" {
+		t.Errorf("stale chassis column not recovered: got %v, want ch-b", got[0].Chassis)
+	}
+}
+
+// TestRefreshStateRecoversStaleChassisBinding exercises the fix end-to-end: the
+// SB monitor cache shows the chassisredirect port bound to a peer (the router
+// looks non-local), but the server has since migrated it to this chassis. With
+// only a _uuid check the stale binding would be trusted and the FIP dropped
+// from the desired set; the content-key check recovers it.
+func TestRefreshStateRecoversStaleChassisBinding(t *testing.T) {
+	c, nb, sb := newOVNClientWithFakes(t, "host-a")
+
+	chB := "ch-b"
+	sb.setRows("Chassis",
+		&SBChassis{UUID: "ch-a", Name: "ch-a", Hostname: "host-a"},
+		&SBChassis{UUID: "ch-b", Name: "ch-b", Hostname: "host-b"},
+	)
+	// Cache view: the chassisredirect port is bound to host-b — not local.
+	sb.setRows("Port_Binding", &SBPortBinding{
+		UUID: "pb-1", LogicalPort: "cr-lrp-local", Type: "chassisredirect", Chassis: &chB,
+	})
+	// Server view: the same row (same _uuid) has migrated to host-a.
+	sb.setSelectRows("Port_Binding", ovsdb.Row{
+		"_uuid":        ovsdb.UUID{GoUUID: "pb-1"},
+		"logical_port": "cr-lrp-local",
+		"type":         "chassisredirect",
+		"chassis":      ovsdb.UUID{GoUUID: "ch-a"},
+	})
+	nb.setRows("Logical_Router_Port", &NBLogicalRouterPort{
+		UUID: "lrp-uuid-local", Name: "lrp-local",
+		MAC: "fa:16:3e:aa:aa:aa", Networks: []string{"198.51.100.1/24"},
+	})
+	nb.setRows("Logical_Router", &NBLogicalRouter{
+		UUID: "lr-local", Name: "router-local",
+		Ports: []string{"lrp-uuid-local"}, Nat: []string{"nat-fip"},
+	})
+	nb.setRows("NAT", &NBNAT{UUID: "nat-fip", Type: "dnat_and_snat", ExternalIP: "198.51.100.50"})
+
+	c.state.LocalChassisName = "host-a"
+	c.refreshState(context.Background())
+	snap := c.GetState()
+
+	if !snap.HasLocalRouters {
+		t.Fatal("HasLocalRouters = false — stale chassisredirect binding not recovered")
+	}
+	if got := snap.FIPs; len(got) != 1 || got[0] != "198.51.100.50" {
+		t.Fatalf("FIPs = %v, want [198.51.100.50]", got)
 	}
 }
 
@@ -223,7 +300,7 @@ func TestRowHelpers(t *testing.T) {
 	})
 }
 
-func TestUUIDSetsEqual(t *testing.T) {
+func TestKeySetsEqual(t *testing.T) {
 	cases := []struct {
 		name string
 		a, b map[string]bool
@@ -235,8 +312,8 @@ func TestUUIDSetsEqual(t *testing.T) {
 		{"same len different member", map[string]bool{"x": true}, map[string]bool{"y": true}, false},
 	}
 	for _, tc := range cases {
-		if got := uuidSetsEqual(tc.a, tc.b); got != tc.want {
-			t.Errorf("%s: uuidSetsEqual = %v, want %v", tc.name, got, tc.want)
+		if got := keySetsEqual(tc.a, tc.b); got != tc.want {
+			t.Errorf("%s: keySetsEqual = %v, want %v", tc.name, got, tc.want)
 		}
 	}
 }

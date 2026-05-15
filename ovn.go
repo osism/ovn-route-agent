@@ -424,14 +424,14 @@ func (o *OVNClient) refreshState(ctx context.Context) {
 	// Every table is read through cachedList, which falls back to a direct
 	// server select when the monitor cache is missing rows (see ovn_cache.go).
 	portBindings, err := cachedList(ctx, o.sbClient, "Port_Binding",
-		func(p SBPortBinding) string { return p.UUID }, decodeSBPortBinding)
+		pbCheckColumns, keyOfSBPortBinding, decodeSBPortBinding)
 	if err != nil {
 		slog.Error("failed to list port bindings", "error", err)
 		return
 	}
 
 	chassis, err := cachedList(ctx, o.sbClient, "Chassis",
-		func(c SBChassis) string { return c.UUID }, decodeSBChassis)
+		chCheckColumns, keyOfSBChassis, decodeSBChassis)
 	if err != nil {
 		slog.Error("failed to list chassis", "error", err)
 		return
@@ -468,7 +468,7 @@ func (o *OVNClient) refreshState(ctx context.Context) {
 
 	// Step 2: Build NB Logical_Router_Port name → UUID map.
 	lrps, err := cachedList(ctx, o.nbClient, "Logical_Router_Port",
-		func(p NBLogicalRouterPort) string { return p.UUID }, decodeNBLogicalRouterPort)
+		lrpCheckColumns, keyOfNBLogicalRouterPort, decodeNBLogicalRouterPort)
 	if err != nil {
 		slog.Error("failed to list logical router ports", "error", err)
 		return
@@ -492,7 +492,7 @@ func (o *OVNClient) refreshState(ctx context.Context) {
 
 	// Step 3: Find routers that own a locally-active LRP. Collect their NAT UUIDs.
 	routers, err := cachedList(ctx, o.nbClient, "Logical_Router",
-		func(r NBLogicalRouter) string { return r.UUID }, decodeNBLogicalRouter)
+		lrCheckColumns, keyOfNBLogicalRouter, decodeNBLogicalRouter)
 	if err != nil {
 		slog.Error("failed to list logical routers", "error", err)
 		return
@@ -549,7 +549,7 @@ func (o *OVNClient) refreshState(ctx context.Context) {
 
 	// Step 5: Filter NAT entries to only those belonging to locally-active routers.
 	nats, err := cachedList(ctx, o.nbClient, "NAT",
-		func(n NBNAT) string { return n.UUID }, decodeNBNAT)
+		natCheckColumns, keyOfNBNAT, decodeNBNAT)
 	if err != nil {
 		slog.Error("failed to list NAT entries", "error", err)
 		return

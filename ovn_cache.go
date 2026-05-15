@@ -4,6 +4,8 @@ import (
 	"context"
 	"fmt"
 	"log/slog"
+	"sort"
+	"strings"
 
 	"github.com/ovn-kubernetes/libovsdb/ovsdb"
 )
@@ -13,72 +15,138 @@ import (
 // =============================================================================
 //
 // refreshState builds the agent's entire view of FIPs and locally-active
-// routers from the libovsdb monitor cache. That cache occasionally drops
-// table INSERTs delivered shortly after a fresh monitor subscription (issue
-// #115): the cache then stays permanently short of rows for the lifetime of
-// the connection, and a cache-backed List() cannot see its own gap.
+// routers from the libovsdb monitor cache. That cache can drift from the OVN
+// server in two ways:
 //
-// A short cache is silently dangerous here. A missing NAT/router row shrinks
-// the desired-IP set, and ensureRoutes then deletes the corresponding FRR
-// /32 as "orphaned" — the FIP stops being advertised even though OVN itself
-// is perfectly healthy. The drain and active-lead paths already guard against
-// this for Gateway_Chassis via a direct NB select; the helpers below extend
-// the same defence to every table refreshState reads.
+//   - A dropped table INSERT delivered shortly after a fresh monitor
+//     subscription (issue #115): the row is missing from the cache entirely.
+//   - A dropped UPDATE to a row already in the cache: the row is present but
+//     a column value is stale.
 //
-// The cache stays the primary, fast path. On every refresh the row set is
-// cross-checked against a cheap server-side _uuid select; only on a genuine
-// mismatch is the slice rebuilt from a full direct select.
+// Both are silently dangerous, and the HA-failover signal lives entirely in
+// reference/set columns — Port_Binding.chassis (which chassis owns the
+// chassisredirect port), Logical_Router.nat/.ports (which FIPs belong to a
+// router), Logical_Router_Port.networks. A missing row or a stale column
+// shrinks or misdirects the desired-IP set, and ensureRoutes then withdraws
+// the FRR /32 of every FIP it no longer sees as desired — the FIP stops being
+// advertised even though OVN itself is perfectly healthy, so the node looks
+// fine but is unreachable from outside.
+//
+// The cache stays the primary, fast path. On every refresh the cache snapshot
+// is cross-checked against a server-side select of the failover-critical
+// columns: a content key is built per row from exactly those columns, so a
+// stale column value — not only a dropped or extra row — registers as a
+// mismatch. A bare _uuid comparison cannot see a dropped UPDATE because the
+// _uuid set is unchanged. Only on a genuine mismatch is the slice rebuilt from
+// a full direct select; any error reading from the server degrades gracefully
+// to the cache so a transient OVSDB blip cannot stall reconciliation.
 
-// cachedList lists a table from the monitor cache and then cross-checks the
-// row set against the OVN server. It returns a server-authoritative slice
-// whenever the monitor cache turns out to be incomplete. uuidOf extracts the
-// UUID of a cached model; decode rebuilds a model from a raw select row.
+// The *CheckColumns slices list, per table, the columns whose drift would
+// change the desired-IP set refreshState computes. The consistency check
+// selects exactly these — keeping the common in-sync round-trip cheap — and
+// the matching keyOf* helper must read only the model fields they back.
+var (
+	pbCheckColumns  = []string{"_uuid", "type", "chassis", "nat_addresses"}
+	chCheckColumns  = []string{"_uuid", "hostname"}
+	lrCheckColumns  = []string{"_uuid", "ports", "nat"}
+	lrpCheckColumns = []string{"_uuid", "mac", "networks"}
+	natCheckColumns = []string{"_uuid", "type", "external_ip"}
+)
+
+func keyOfSBPortBinding(p SBPortBinding) string {
+	chassis := ""
+	if p.Chassis != nil {
+		chassis = *p.Chassis
+	}
+	return contentKey(p.UUID, p.Type, chassis, sortedJoin(p.NatAddresses))
+}
+
+func keyOfSBChassis(c SBChassis) string {
+	return contentKey(c.UUID, c.Hostname)
+}
+
+func keyOfNBLogicalRouter(r NBLogicalRouter) string {
+	return contentKey(r.UUID, sortedJoin(r.Ports), sortedJoin(r.Nat))
+}
+
+func keyOfNBLogicalRouterPort(p NBLogicalRouterPort) string {
+	return contentKey(p.UUID, p.MAC, sortedJoin(p.Networks))
+}
+
+func keyOfNBNAT(n NBNAT) string {
+	return contentKey(n.UUID, n.Type, n.ExternalIP)
+}
+
+// contentKey joins row attributes into a single comparison key. The unit
+// separator (0x1f) cannot occur in a UUID, MAC, IP, hostname or OVN name, so
+// distinct attribute tuples always yield distinct keys.
+func contentKey(parts ...string) string {
+	return strings.Join(parts, "\x1f")
+}
+
+// sortedJoin renders a set-valued column deterministically. OVSDB sets are
+// unordered, so the monitor cache and a direct select may list the members in
+// different orders; that must not register as content drift.
+func sortedJoin(values []string) string {
+	sorted := append([]string(nil), values...)
+	sort.Strings(sorted)
+	return strings.Join(sorted, ",")
+}
+
+// cachedList lists a table from the monitor cache and then cross-checks it
+// against the OVN server. It returns a server-authoritative slice whenever the
+// monitor cache turns out to be incomplete or to hold a stale column value.
+// columns is the cheap server-side check projection; keyOf builds a content
+// key over exactly those columns; decode rebuilds a model from a raw row.
 func cachedList[T any](
 	ctx context.Context,
 	c ovsdbClient,
 	table string,
-	uuidOf func(T) string,
+	columns []string,
+	keyOf func(T) string,
 	decode func(ovsdb.Row) T,
 ) ([]T, error) {
 	var cached []T
 	if err := c.List(ctx, &cached); err != nil {
 		return nil, err
 	}
-	return authoritativeList(ctx, c, table, cached, uuidOf, decode), nil
+	return authoritativeList(ctx, c, table, columns, cached, keyOf, decode), nil
 }
 
 // authoritativeList returns the rows of table that refreshState should act on.
 // It trusts the monitor-cache snapshot (cached) unless a direct server select
-// proves it incomplete, in which case it logs the gap and rebuilds the slice
-// from a full select. Any error reading from the server degrades gracefully to
-// the cache: a transient OVSDB blip must not stall reconciliation.
+// of the failover-critical columns proves it stale, in which case it logs the
+// gap and rebuilds the slice from a full select. Any error reading from the
+// server degrades gracefully to the cache: a transient OVSDB blip must not
+// stall reconciliation.
 func authoritativeList[T any](
 	ctx context.Context,
 	c ovsdbClient,
 	table string,
+	columns []string,
 	cached []T,
-	uuidOf func(T) string,
+	keyOf func(T) string,
 	decode func(ovsdb.Row) T,
 ) []T {
-	serverUUIDs, err := serverUUIDSet(ctx, c, table)
+	serverKeys, err := serverKeySet(ctx, c, table, columns, keyOf, decode)
 	if err != nil {
 		slog.Warn("cache consistency check skipped: direct select failed, trusting monitor cache",
 			"table", table, "error", err)
 		return cached
 	}
 
-	cacheUUIDs := make(map[string]bool, len(cached))
+	cacheKeys := make(map[string]bool, len(cached))
 	for _, m := range cached {
-		cacheUUIDs[uuidOf(m)] = true
+		cacheKeys[keyOf(m)] = true
 	}
-	if uuidSetsEqual(cacheUUIDs, serverUUIDs) {
+	if keySetsEqual(cacheKeys, serverKeys) {
 		return cached
 	}
 
 	slog.Error("OVN monitor cache out of sync with the server, rebuilding from a direct select",
 		"table", table,
-		"cache_rows", len(cacheUUIDs),
-		"server_rows", len(serverUUIDs))
+		"cache_rows", len(cacheKeys),
+		"server_rows", len(serverKeys))
 
 	rows, err := directSelect(ctx, c, table, nil)
 	if err != nil {
@@ -93,19 +161,24 @@ func authoritativeList[T any](
 	return out
 }
 
-// serverUUIDSet returns the set of _uuid values currently in table on the OVN
-// server. Only the _uuid column is selected so the common (in-sync) path stays
-// cheap.
-func serverUUIDSet(ctx context.Context, c ovsdbClient, table string) (map[string]bool, error) {
-	rows, err := directSelect(ctx, c, table, []string{"_uuid"})
+// serverKeySet returns the set of content keys currently in table on the OVN
+// server. Only the failover-critical columns are selected so the common
+// (in-sync) path stays cheap; keyOf must build its key from no more than those.
+func serverKeySet[T any](
+	ctx context.Context,
+	c ovsdbClient,
+	table string,
+	columns []string,
+	keyOf func(T) string,
+	decode func(ovsdb.Row) T,
+) (map[string]bool, error) {
+	rows, err := directSelect(ctx, c, table, columns)
 	if err != nil {
 		return nil, err
 	}
 	set := make(map[string]bool, len(rows))
 	for _, row := range rows {
-		if u := rowUUID(row); u != "" {
-			set[u] = true
-		}
+		set[keyOf(decode(row))] = true
 	}
 	return set, nil
 }
@@ -133,8 +206,9 @@ func directSelect(ctx context.Context, c ovsdbClient, table string, columns []st
 	return results[0].Rows, nil
 }
 
-// uuidSetsEqual reports whether two UUID sets contain exactly the same members.
-func uuidSetsEqual(a, b map[string]bool) bool {
+// keySetsEqual reports whether two content-key sets contain exactly the same
+// members.
+func keySetsEqual(a, b map[string]bool) bool {
 	if len(a) != len(b) {
 		return false
 	}
