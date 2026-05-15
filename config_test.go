@@ -10,6 +10,17 @@ import (
 	"time"
 )
 
+// fullModeArgs prepends the OVN remote flags required for full mode to the
+// given extra flags. Tests that exercise unrelated config fields use it so
+// the operating-mode validation matrix (validateMode) does not reject an
+// otherwise-incomplete config.
+func fullModeArgs(extra ...string) []string {
+	return append([]string{
+		"--ovn-sb-remote", "tcp:10.0.0.1:6642",
+		"--ovn-nb-remote", "tcp:10.0.0.1:6641",
+	}, extra...)
+}
+
 func TestReadConfigFile(t *testing.T) {
 	content := `
 ovn_sb_remote: "tcp:10.0.0.1:6642,tcp:10.0.0.2:6642"
@@ -280,7 +291,7 @@ func TestApplyEnvConfigInvalidDuration(t *testing.T) {
 }
 
 func TestLoadConfigDefaults(t *testing.T) {
-	cfg, err := loadConfig(nil)
+	cfg, err := loadConfig(fullModeArgs())
 	if err != nil {
 		t.Fatalf("loadConfig() error: %v", err)
 	}
@@ -319,7 +330,7 @@ func TestLoadConfigDefaults(t *testing.T) {
 
 func TestLoadConfigVethLeakEnabledByDefault(t *testing.T) {
 	// VethLeakEnabled defaults to true and requires network-cidr.
-	cfg, err := loadConfig([]string{"--network-cidr", "10.0.0.0/24"})
+	cfg, err := loadConfig(fullModeArgs("--network-cidr", "10.0.0.0/24"))
 	if err != nil {
 		t.Fatalf("loadConfig() error: %v", err)
 	}
@@ -364,7 +375,7 @@ func TestLoadConfigCLIFlags(t *testing.T) {
 }
 
 func TestLoadConfigDryRunFlag(t *testing.T) {
-	cfg, err := loadConfig([]string{"--dry-run"})
+	cfg, err := loadConfig(fullModeArgs("--dry-run"))
 	if err != nil {
 		t.Fatalf("loadConfig() error: %v", err)
 	}
@@ -374,7 +385,7 @@ func TestLoadConfigDryRunFlag(t *testing.T) {
 }
 
 func TestLoadConfigDryRunDefault(t *testing.T) {
-	cfg, err := loadConfig(nil)
+	cfg, err := loadConfig(fullModeArgs())
 	if err != nil {
 		t.Fatalf("loadConfig() error: %v", err)
 	}
@@ -403,7 +414,7 @@ func TestApplyFileConfigDryRun(t *testing.T) {
 }
 
 func TestLoadConfigCleanupOnShutdownDefault(t *testing.T) {
-	cfg, err := loadConfig(nil)
+	cfg, err := loadConfig(fullModeArgs())
 	if err != nil {
 		t.Fatalf("loadConfig() error: %v", err)
 	}
@@ -413,7 +424,7 @@ func TestLoadConfigCleanupOnShutdownDefault(t *testing.T) {
 }
 
 func TestLoadConfigCleanupOnShutdownDisabledViaCLI(t *testing.T) {
-	cfg, err := loadConfig([]string{"--cleanup-on-shutdown=false"})
+	cfg, err := loadConfig(fullModeArgs("--cleanup-on-shutdown=false"))
 	if err != nil {
 		t.Fatalf("loadConfig() error: %v", err)
 	}
@@ -615,7 +626,7 @@ func TestValidateConfig(t *testing.T) {
 }
 
 func TestLoadConfigRouteTableIDCLI(t *testing.T) {
-	cfg, err := loadConfig([]string{"--route-table-id", "100"})
+	cfg, err := loadConfig(fullModeArgs("--route-table-id", "100"))
 	if err != nil {
 		t.Fatalf("loadConfig() error: %v", err)
 	}
@@ -694,7 +705,7 @@ func TestIsValidIdentifier(t *testing.T) {
 
 func TestLoadConfigVethLeakWithoutNetworkCIDR(t *testing.T) {
 	// Veth leak no longer requires network-cidr — networks are auto-discovered from OVN.
-	cfg, err := loadConfig([]string{"--veth-leak-enabled"})
+	cfg, err := loadConfig(fullModeArgs("--veth-leak-enabled"))
 	if err != nil {
 		t.Fatalf("loadConfig() error: %v", err)
 	}
@@ -704,7 +715,7 @@ func TestLoadConfigVethLeakWithoutNetworkCIDR(t *testing.T) {
 }
 
 func TestLoadConfigVethLeakDisabledWithoutNetworkCIDR(t *testing.T) {
-	cfg, err := loadConfig([]string{"--veth-leak-enabled=false"})
+	cfg, err := loadConfig(fullModeArgs("--veth-leak-enabled=false"))
 	if err != nil {
 		t.Fatalf("loadConfig() error: %v", err)
 	}
@@ -714,10 +725,10 @@ func TestLoadConfigVethLeakDisabledWithoutNetworkCIDR(t *testing.T) {
 }
 
 func TestLoadConfigVethLeakAutoProviderIP(t *testing.T) {
-	cfg, err := loadConfig([]string{
+	cfg, err := loadConfig(fullModeArgs(
 		"--veth-nexthop", "169.254.0.1",
 		"--network-cidr", "10.0.0.0/24",
-	})
+	))
 	if err != nil {
 		t.Fatalf("loadConfig() error: %v", err)
 	}
@@ -727,10 +738,10 @@ func TestLoadConfigVethLeakAutoProviderIP(t *testing.T) {
 }
 
 func TestLoadConfigVethLeakExplicitProviderIP(t *testing.T) {
-	cfg, err := loadConfig([]string{
+	cfg, err := loadConfig(fullModeArgs(
 		"--veth-provider-ip", "169.254.0.10",
 		"--network-cidr", "10.0.0.0/24",
-	})
+	))
 	if err != nil {
 		t.Fatalf("loadConfig() error: %v", err)
 	}
@@ -843,7 +854,7 @@ veth_leak_rule_priority: 3000
 }
 
 func TestLoadConfigFRRPrefixListCLI(t *testing.T) {
-	cfg, err := loadConfig([]string{"--frr-prefix-list", "ANNOUNCED-NETWORKS"})
+	cfg, err := loadConfig(fullModeArgs("--frr-prefix-list", "ANNOUNCED-NETWORKS"))
 	if err != nil {
 		t.Fatalf("loadConfig() error: %v", err)
 	}
@@ -860,7 +871,7 @@ func TestLoadConfigFRRPrefixListInvalid(t *testing.T) {
 }
 
 func TestLoadConfigStaleChassisGracePeriodDefault(t *testing.T) {
-	cfg, err := loadConfig(nil)
+	cfg, err := loadConfig(fullModeArgs())
 	if err != nil {
 		t.Fatalf("loadConfig() error: %v", err)
 	}
@@ -870,7 +881,7 @@ func TestLoadConfigStaleChassisGracePeriodDefault(t *testing.T) {
 }
 
 func TestLoadConfigStaleChassisGracePeriodCLI(t *testing.T) {
-	cfg, err := loadConfig([]string{"--stale-chassis-grace-period", "10m"})
+	cfg, err := loadConfig(fullModeArgs("--stale-chassis-grace-period", "10m"))
 	if err != nil {
 		t.Fatalf("loadConfig() error: %v", err)
 	}
@@ -880,7 +891,7 @@ func TestLoadConfigStaleChassisGracePeriodCLI(t *testing.T) {
 }
 
 func TestLoadConfigStaleChassisGracePeriodDisabled(t *testing.T) {
-	cfg, err := loadConfig([]string{"--stale-chassis-grace-period", "0s"})
+	cfg, err := loadConfig(fullModeArgs("--stale-chassis-grace-period", "0s"))
 	if err != nil {
 		t.Fatalf("loadConfig() error: %v", err)
 	}
@@ -1518,7 +1529,7 @@ func TestNextIPInSubnet(t *testing.T) {
 }
 
 func TestLoadConfigMetricsListenDefaultDisabled(t *testing.T) {
-	cfg, err := loadConfig(nil)
+	cfg, err := loadConfig(fullModeArgs())
 	if err != nil {
 		t.Fatalf("loadConfig() error: %v", err)
 	}
@@ -1528,7 +1539,7 @@ func TestLoadConfigMetricsListenDefaultDisabled(t *testing.T) {
 }
 
 func TestLoadConfigMetricsListenViaCLI(t *testing.T) {
-	cfg, err := loadConfig([]string{"--metrics-listen", "127.0.0.1:9273"})
+	cfg, err := loadConfig(fullModeArgs("--metrics-listen", "127.0.0.1:9273"))
 	if err != nil {
 		t.Fatalf("loadConfig() error: %v", err)
 	}
@@ -1569,11 +1580,182 @@ func TestLoadConfigMetricsListenInvalid(t *testing.T) {
 
 func TestLoadConfigCLIOverridesEnvMetricsListen(t *testing.T) {
 	t.Setenv("OVN_NETWORK_METRICS_LISTEN", "127.0.0.1:9000")
-	cfg, err := loadConfig([]string{"--metrics-listen", "127.0.0.1:9273"})
+	cfg, err := loadConfig(fullModeArgs("--metrics-listen", "127.0.0.1:9273"))
 	if err != nil {
 		t.Fatalf("loadConfig() error: %v", err)
 	}
 	if cfg.MetricsListen != "127.0.0.1:9273" {
 		t.Errorf("MetricsListen = %q, want %q (CLI > env)", cfg.MetricsListen, "127.0.0.1:9273")
 	}
+}
+
+// portForwardVIPs returns a minimal valid port-forward configuration for
+// operating-mode tests.
+func portForwardVIPs() []PortForwardVIP {
+	return []PortForwardVIP{
+		{
+			VIP:       "198.51.100.10",
+			ManageVIP: true,
+			Rules:     []PortForwardRule{{Proto: "tcp", Port: 443, DestAddr: "10.0.0.100"}},
+		},
+	}
+}
+
+// TestValidateMode covers the OVN-remote/port-forward matrix from issue #121:
+// the four combinations of OVN remotes and port_forwards and the mode (or
+// error) each produces.
+func TestValidateMode(t *testing.T) {
+	tests := []struct {
+		name       string
+		cfg        Config
+		wantErr    bool
+		wantPFOnly bool
+	}{
+		{
+			"both remotes set: full mode",
+			Config{OVNSBRemote: "tcp:10.0.0.1:6642", OVNNBRemote: "tcp:10.0.0.1:6641"},
+			false, false,
+		},
+		{
+			"both remotes set with port forwards: full mode",
+			Config{OVNSBRemote: "tcp:10.0.0.1:6642", OVNNBRemote: "tcp:10.0.0.1:6641", PortForwards: portForwardVIPs()},
+			false, false,
+		},
+		{
+			"no remotes, port forwards set: port-forward-only mode",
+			Config{PortForwards: portForwardVIPs()},
+			false, true,
+		},
+		{
+			"no remotes, no port forwards: error",
+			Config{},
+			true, false,
+		},
+		{
+			"only SB remote set: error",
+			Config{OVNSBRemote: "tcp:10.0.0.1:6642"},
+			true, false,
+		},
+		{
+			"only NB remote set: error",
+			Config{OVNNBRemote: "tcp:10.0.0.1:6641"},
+			true, false,
+		},
+		{
+			"only SB remote set with port forwards: error",
+			Config{OVNSBRemote: "tcp:10.0.0.1:6642", PortForwards: portForwardVIPs()},
+			true, false,
+		},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			cfg := tt.cfg
+			err := validateMode(&cfg)
+			if (err != nil) != tt.wantErr {
+				t.Fatalf("validateMode() error = %v, wantErr %v", err, tt.wantErr)
+			}
+			if err == nil && cfg.PortForwardOnly != tt.wantPFOnly {
+				t.Errorf("PortForwardOnly = %v, want %v", cfg.PortForwardOnly, tt.wantPFOnly)
+			}
+		})
+	}
+}
+
+// TestValidateModeMasquerade verifies that masquerade options depending on
+// OVN-derived state are rejected in port-forward-only mode but accepted in
+// full mode.
+func TestValidateModeMasquerade(t *testing.T) {
+	withVIP := func(mut func(*PortForwardVIP)) []PortForwardVIP {
+		v := portForwardVIPs()
+		mut(&v[0])
+		return v
+	}
+
+	t.Run("router_masquerade rejected in port-forward-only mode", func(t *testing.T) {
+		cfg := Config{PortForwards: withVIP(func(v *PortForwardVIP) { v.RouterMasquerade = true })}
+		if err := validateMode(&cfg); err == nil {
+			t.Error("expected error: router_masquerade requires OVN")
+		}
+	})
+
+	t.Run("hairpin_masquerade rejected without network_cidr", func(t *testing.T) {
+		cfg := Config{PortForwards: withVIP(func(v *PortForwardVIP) { v.HairpinMasquerade = true })}
+		if err := validateMode(&cfg); err == nil {
+			t.Error("expected error: hairpin_masquerade needs network_cidr in port-forward-only mode")
+		}
+	})
+
+	t.Run("hairpin_masquerade allowed with network_cidr", func(t *testing.T) {
+		cfg := Config{
+			NetworkCIDRs: []string{"203.0.113.0/24"},
+			PortForwards: withVIP(func(v *PortForwardVIP) { v.HairpinMasquerade = true }),
+		}
+		if err := validateMode(&cfg); err != nil {
+			t.Errorf("unexpected error: %v", err)
+		}
+	})
+
+	t.Run("router_masquerade allowed in full mode", func(t *testing.T) {
+		cfg := Config{
+			OVNSBRemote:  "tcp:10.0.0.1:6642",
+			OVNNBRemote:  "tcp:10.0.0.1:6641",
+			PortForwards: withVIP(func(v *PortForwardVIP) { v.RouterMasquerade = true }),
+		}
+		if err := validateMode(&cfg); err != nil {
+			t.Errorf("router_masquerade must be allowed in full mode: %v", err)
+		}
+	})
+}
+
+// TestLoadConfigPortForwardOnlyMode verifies that a config file with only
+// port_forwards (no OVN remotes) loads successfully and derives
+// port-forward-only mode.
+func TestLoadConfigPortForwardOnlyMode(t *testing.T) {
+	content := `
+port_forwards:
+  - vip: "198.51.100.10"
+    manage_vip: true
+    rules:
+      - proto: tcp
+        port: 443
+        dest_addr: "10.0.0.100"
+`
+	path := filepath.Join(t.TempDir(), "config.yaml")
+	if err := os.WriteFile(path, []byte(content), 0644); err != nil {
+		t.Fatalf("write test config: %v", err)
+	}
+	cfg, err := loadConfig([]string{"--config", path})
+	if err != nil {
+		t.Fatalf("loadConfig() error: %v", err)
+	}
+	if !cfg.PortForwardOnly {
+		t.Error("PortForwardOnly should be true with port_forwards and no OVN remotes")
+	}
+	if !cfg.PortForwardEnabled {
+		t.Error("PortForwardEnabled should be true")
+	}
+}
+
+// TestLoadConfigRejectsEmptyMode verifies that a config with neither OVN
+// remotes nor port_forwards is rejected with a clear error.
+func TestLoadConfigRejectsEmptyMode(t *testing.T) {
+	if _, err := loadConfig(nil); err == nil {
+		t.Error("expected error when neither OVN remotes nor port_forwards are configured")
+	}
+}
+
+// TestLoadConfigRejectsIncompleteOVN verifies that setting only one of the
+// two OVN remotes is rejected.
+func TestLoadConfigRejectsIncompleteOVN(t *testing.T) {
+	t.Run("only SB", func(t *testing.T) {
+		if _, err := loadConfig([]string{"--ovn-sb-remote", "tcp:10.0.0.1:6642"}); err == nil {
+			t.Error("expected error when only ovn-sb-remote is set")
+		}
+	})
+	t.Run("only NB", func(t *testing.T) {
+		if _, err := loadConfig([]string{"--ovn-nb-remote", "tcp:10.0.0.1:6641"}); err == nil {
+			t.Error("expected error when only ovn-nb-remote is set")
+		}
+	})
 }
