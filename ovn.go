@@ -421,14 +421,18 @@ func (o *OVNClient) GetState() OVNState {
 //	  → NB NAT (external_ip)
 func (o *OVNClient) refreshState(ctx context.Context) {
 	// Step 1: Find all chassisredirect port bindings and resolve chassis hostnames.
-	var portBindings []SBPortBinding
-	if err := o.sbClient.List(ctx, &portBindings); err != nil {
+	// Every table is read through cachedList, which falls back to a direct
+	// server select when the monitor cache is missing rows (see ovn_cache.go).
+	portBindings, err := cachedList(ctx, o.sbClient, "Port_Binding",
+		func(p SBPortBinding) string { return p.UUID }, decodeSBPortBinding)
+	if err != nil {
 		slog.Error("failed to list port bindings", "error", err)
 		return
 	}
 
-	var chassis []SBChassis
-	if err := o.sbClient.List(ctx, &chassis); err != nil {
+	chassis, err := cachedList(ctx, o.sbClient, "Chassis",
+		func(c SBChassis) string { return c.UUID }, decodeSBChassis)
+	if err != nil {
 		slog.Error("failed to list chassis", "error", err)
 		return
 	}
@@ -463,8 +467,9 @@ func (o *OVNClient) refreshState(ctx context.Context) {
 	}
 
 	// Step 2: Build NB Logical_Router_Port name → UUID map.
-	var lrps []NBLogicalRouterPort
-	if err := o.nbClient.List(ctx, &lrps); err != nil {
+	lrps, err := cachedList(ctx, o.nbClient, "Logical_Router_Port",
+		func(p NBLogicalRouterPort) string { return p.UUID }, decodeNBLogicalRouterPort)
+	if err != nil {
 		slog.Error("failed to list logical router ports", "error", err)
 		return
 	}
@@ -486,8 +491,9 @@ func (o *OVNClient) refreshState(ctx context.Context) {
 	}
 
 	// Step 3: Find routers that own a locally-active LRP. Collect their NAT UUIDs.
-	var routers []NBLogicalRouter
-	if err := o.nbClient.List(ctx, &routers); err != nil {
+	routers, err := cachedList(ctx, o.nbClient, "Logical_Router",
+		func(r NBLogicalRouter) string { return r.UUID }, decodeNBLogicalRouter)
+	if err != nil {
 		slog.Error("failed to list logical routers", "error", err)
 		return
 	}
@@ -542,8 +548,9 @@ func (o *OVNClient) refreshState(ctx context.Context) {
 	effectiveFilters := effectiveNetworkFilters(o.cfg.NetworkFilters, discoveredNets)
 
 	// Step 5: Filter NAT entries to only those belonging to locally-active routers.
-	var nats []NBNAT
-	if err := o.nbClient.List(ctx, &nats); err != nil {
+	nats, err := cachedList(ctx, o.nbClient, "NAT",
+		func(n NBNAT) string { return n.UUID }, decodeNBNAT)
+	if err != nil {
 		slog.Error("failed to list NAT entries", "error", err)
 		return
 	}
