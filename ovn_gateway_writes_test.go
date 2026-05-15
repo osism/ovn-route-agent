@@ -1043,6 +1043,73 @@ func TestRestoreDrainedGateways_ListErrorIsLoggedNotPanicking(t *testing.T) {
 	}
 }
 
+// TestRestoreDrainedGateways_FallsBackToServerSelectOnCacheMiss covers the
+// issue #115 race on the startup restore path: the NB monitor cache is missing
+// the local Gateway_Chassis row, so the cache scan finds nothing to restore.
+// RestoreDrainedGateways must fall back to a direct OVSDB select and lift the
+// drained row back to standby priority — otherwise the chassis stays at
+// priority 0 and out of the HA group until a later restart happens to deliver
+// a complete cache.
+func TestRestoreDrainedGateways_FallsBackToServerSelectOnCacheMiss(t *testing.T) {
+	c, nb, _ := newOVNClientWithFakes(t, "host-a")
+
+	// Cache has only a peer row — the local Gateway_Chassis INSERT was dropped.
+	nb.setRows("Gateway_Chassis",
+		&NBGatewayChassis{UUID: "g2", Name: "lrp-a_host-b", ChassisName: "host-b", Priority: 1},
+	)
+	// Server-side state (visible to OperationSelect) still has the drained
+	// local row.
+	nb.setSelectRows("Gateway_Chassis", ovsdb.Row{
+		"_uuid":        ovsdb.UUID{GoUUID: "g1"},
+		"name":         "lrp-a_host-a",
+		"chassis_name": "host-a",
+		"priority":     float64(0),
+	})
+
+	c.RestoreDrainedGateways(context.Background(), "host-a")
+
+	tx := nb.recordedTransacts()
+	if len(tx) != 2 {
+		t.Fatalf("expected two transacts (select fallback + restore update), got %d: %+v", len(tx), tx)
+	}
+	if len(tx[0]) != 1 || tx[0][0].Op != ovsdb.OperationSelect || tx[0][0].Table != "Gateway_Chassis" {
+		t.Fatalf("expected first transact to be select on Gateway_Chassis, got %+v", tx[0])
+	}
+	if len(tx[0][0].Where) != 1 || tx[0][0].Where[0].Column != "chassis_name" || tx[0][0].Where[0].Value != "host-a" {
+		t.Errorf("select must filter on chassis_name == host-a, got %+v", tx[0][0].Where)
+	}
+	updates := findOps(t, tx, 1, ovsdb.OperationUpdate, "Gateway_Chassis")
+	if len(updates) != 1 {
+		t.Fatalf("expected one restore update from the fallback, got %d: %+v", len(updates), tx[1])
+	}
+	if updates[0].UUID != "g1" {
+		t.Errorf("update should target the row recovered from the server (g1), got %q", updates[0].UUID)
+	}
+	if got, ok := updates[0].Row["priority"].(int); !ok || got != 1 {
+		t.Errorf("restore op must set priority=1, got %#v", updates[0].Row["priority"])
+	}
+}
+
+// TestRestoreDrainedGateways_NoFallbackWhenLocalRowPresent asserts that a
+// present local row suppresses the select fallback: the cache is trusted and
+// no extra OVSDB select is emitted.
+func TestRestoreDrainedGateways_NoFallbackWhenLocalRowPresent(t *testing.T) {
+	c, nb, _ := newOVNClientWithFakes(t, "host-a")
+	nb.setRows("Gateway_Chassis",
+		&NBGatewayChassis{UUID: "g1", Name: "lrp-a_host-a", ChassisName: "host-a", Priority: 0},
+	)
+
+	c.RestoreDrainedGateways(context.Background(), "host-a")
+
+	for _, batch := range nb.recordedTransacts() {
+		for _, op := range batch {
+			if op.Op == ovsdb.OperationSelect {
+				t.Errorf("unexpected select fallback while the cache has the local row: %+v", op)
+			}
+		}
+	}
+}
+
 // =============================================================================
 // ListManagedRouteChassis
 // =============================================================================

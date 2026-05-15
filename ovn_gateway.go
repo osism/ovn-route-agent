@@ -716,6 +716,16 @@ func (o *OVNClient) DrainGateways(ctx context.Context, localChassisName string) 
 // strictly higher priority via EnsureActivePriorityLead, which prevents
 // reverse failover even when both chassis would otherwise have the same
 // priority. This should be called on startup before the first reconciliation.
+//
+// RestoreDrainedGateways runs immediately after Connect(), exactly when the NB
+// monitor cache is most exposed to the issue #115 INSERT-drop race. When the
+// cache shows no row at all for this chassis it falls back to a direct NB
+// select, the same defence DrainGateways and EnsureActivePriorityLead already
+// use: a drained row hidden by the cache would otherwise leave the chassis
+// stuck at priority 0 forever. It never rejoins the HA group, and
+// EnsureActivePriorityLead — which only boosts the active chassis — can never
+// lift a standby off 0, so the loss of redundancy is permanent until a restart
+// happens to deliver a complete cache.
 func (o *OVNClient) RestoreDrainedGateways(ctx context.Context, localChassisName string) {
 	var gwChassisList []NBGatewayChassis
 	if err := o.nbClient.List(ctx, &gwChassisList); err != nil {
@@ -723,12 +733,27 @@ func (o *OVNClient) RestoreDrainedGateways(ctx context.Context, localChassisName
 		return
 	}
 
-	var allOps []ovsdb.Operation
-	for _, gwc := range gwChassisList {
-		if gwc.ChassisName != localChassisName || gwc.Priority != 0 {
-			continue
-		}
+	toRestore, hasLocalRow := filterRestoreCandidates(gwChassisList, localChassisName)
 
+	if !hasLocalRow {
+		slog.Warn("restore-drain: cache has no Gateway_Chassis row for this chassis, querying NB directly",
+			"local_chassis_name", localChassisName,
+			"cache_count", len(gwChassisList))
+		serverList, err := o.selectLocalGatewayChassis(ctx, localChassisName)
+		if err != nil {
+			slog.Error("restore-drain: cache miss + NB select fallback failed", "error", err)
+			return
+		}
+		toRestore, _ = filterRestoreCandidates(serverList, localChassisName)
+		if len(toRestore) > 0 {
+			slog.Info("restore-drain: NB select recovered Gateway_Chassis rows hidden by the cache",
+				"local_chassis_name", localChassisName, "recovered", len(toRestore))
+		}
+	}
+
+	var allOps []ovsdb.Operation
+	for i := range toRestore {
+		gwc := toRestore[i]
 		gwc.Priority = 1
 		ops, err := o.nbClient.Where(&gwc).Update(&gwc, &gwc.Priority)
 		if err != nil {
@@ -746,6 +771,25 @@ func (o *OVNClient) RestoreDrainedGateways(ctx context.Context, localChassisName
 	if err := o.transactOps(ctx, allOps); err != nil {
 		slog.Error("restore-drain: failed to restore gateway chassis priorities", "error", err)
 	}
+}
+
+// filterRestoreCandidates returns the Gateway_Chassis rows that must be lifted
+// back to standby priority (those drained to 0 for this chassis) and reports
+// whether the input contained any row at all for localChassisName. The "row
+// present at all" signal lets the caller tell "nothing to restore because the
+// chassis was never drained" apart from "nothing to restore because the local
+// row is missing from an incomplete cache" (issue #115).
+func filterRestoreCandidates(gwChassisList []NBGatewayChassis, localChassisName string) (toRestore []NBGatewayChassis, hasLocalRow bool) {
+	for _, gwc := range gwChassisList {
+		if gwc.ChassisName != localChassisName {
+			continue
+		}
+		hasLocalRow = true
+		if gwc.Priority == 0 {
+			toRestore = append(toRestore, gwc)
+		}
+	}
+	return toRestore, hasLocalRow
 }
 
 // filterDrainCandidates returns the Gateway_Chassis rows that must have
