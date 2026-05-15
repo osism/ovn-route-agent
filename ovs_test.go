@@ -162,6 +162,12 @@ func TestOVSCmdNoWrapper(t *testing.T) {
 
 func TestEnsureOVSFlowsWithCachedDiscovery(t *testing.T) {
 	rec := newOVSRecorder()
+	// EnsureOVSFlows re-validates the cached patch port on every call; here
+	// it still resolves to ofport 42, so no full rediscovery (list-ports) runs.
+	rec.on(
+		[]string{"ovs-vsctl", "get", "Interface", "patch-provnet-0", "ofport"},
+		"42\n", nil,
+	)
 	rm := &RouteManager{
 		bridgeDev:       "br-ex",
 		cachedPatchPort: "patch-provnet-0",
@@ -174,14 +180,18 @@ func TestEnsureOVSFlowsWithCachedDiscovery(t *testing.T) {
 		t.Fatalf("EnsureOVSFlows() error: %v", err)
 	}
 
-	// Expect: 1 del-flows + 2 add-flows (IPv4 + IPv6 MAC-tweak).
-	if len(rec.calls) != 3 {
-		t.Fatalf("expected 3 OVS commands, got %d: %v", len(rec.calls), rec.calls)
+	// Expect: 1 ofport validation + 1 del-flows + 2 add-flows (IPv4 + IPv6).
+	if len(rec.calls) != 4 {
+		t.Fatalf("expected 4 OVS commands, got %d: %v", len(rec.calls), rec.calls)
 	}
 
+	wantValidate := []string{"ovs-vsctl", "get", "Interface", "patch-provnet-0", "ofport"}
+	if !reflect.DeepEqual(rec.calls[0], wantValidate) {
+		t.Errorf("first call = %v, want %v", rec.calls[0], wantValidate)
+	}
 	wantDel := []string{"ovs-ofctl", "del-flows", "br-ex", "cookie=0x999/-1"}
-	if !reflect.DeepEqual(rec.calls[0], wantDel) {
-		t.Errorf("first call = %v, want %v", rec.calls[0], wantDel)
+	if !reflect.DeepEqual(rec.calls[1], wantDel) {
+		t.Errorf("second call = %v, want %v", rec.calls[1], wantDel)
 	}
 
 	flows := rec.findAddFlows()
@@ -241,6 +251,10 @@ func TestEnsureOVSFlowsTolersDelFailure(t *testing.T) {
 	// subsequent add-flow calls.
 	rec := newOVSRecorder()
 	rec.on(
+		[]string{"ovs-vsctl", "get", "Interface", "patch-provnet-0", "ofport"},
+		"42\n", nil,
+	)
+	rec.on(
 		[]string{"ovs-ofctl", "del-flows", "br-ex", "cookie=0x999/-1"},
 		"some output", errors.New("transient ofctl error"),
 	)
@@ -263,6 +277,10 @@ func TestEnsureOVSFlowsTolersDelFailure(t *testing.T) {
 
 func TestEnsureOVSFlowsAddFailurePropagates(t *testing.T) {
 	rec := newOVSRecorder()
+	rec.on(
+		[]string{"ovs-vsctl", "get", "Interface", "patch-provnet-0", "ofport"},
+		"42\n", nil,
+	)
 	// First add-flow (IPv4) fails — function must return an error.
 	rec.on(
 		[]string{"ovs-ofctl", "add-flow", "br-ex",
@@ -283,6 +301,45 @@ func TestEnsureOVSFlowsAddFailurePropagates(t *testing.T) {
 	}
 	if !strings.Contains(err.Error(), "add IPv4 MAC-tweak flow") {
 		t.Errorf("expected wrapped IPv4 error, got: %v", err)
+	}
+}
+
+// TestEnsureOVSFlowsRediscoversWhenOfportChanges covers the core of the
+// patch-port staleness fix: the cached patch port now resolves to a different
+// ofport (as if ovn-controller had recreated it). EnsureOVSFlows must drop the
+// stale cache and rediscover, rather than keep installing flows for a dead
+// in_port. Rediscovery runs through discoverPatchPort + getOFPort and then
+// fails at GetBridgeMAC (no real bridge in a unit test) — which proves the
+// stale cache was abandoned instead of trusted.
+func TestEnsureOVSFlowsRediscoversWhenOfportChanges(t *testing.T) {
+	rec := newOVSRecorder()
+	rec.on(
+		[]string{"ovs-vsctl", "get", "Interface", "patch-provnet-0", "ofport"},
+		"99\n", nil,
+	)
+	rec.on(
+		[]string{"ovs-vsctl", "list-ports", "br-ex"},
+		"patch-provnet-0\n", nil,
+	)
+	rec.on(
+		[]string{"ovs-vsctl", "--if-exists", "get", "Interface", "patch-provnet-0", "type"},
+		"patch\n", nil,
+	)
+	rm := &RouteManager{
+		bridgeDev:       "br-ex",
+		cachedPatchPort: "patch-provnet-0",
+		cachedOfport:    "42",
+		cachedBridgeMAC: "aa:bb:cc:dd:ee:ff",
+		execOVSHook:     rec.hook(),
+	}
+
+	err := rm.EnsureOVSFlows()
+	if err == nil || !strings.Contains(err.Error(), "get bridge MAC") {
+		t.Fatalf("expected rediscovery to reach GetBridgeMAC, got: %v", err)
+	}
+	if rm.cachedPatchPort != "" || rm.cachedOfport != "" {
+		t.Errorf("stale cache must be cleared on rediscovery: patch=%q ofport=%q",
+			rm.cachedPatchPort, rm.cachedOfport)
 	}
 }
 
