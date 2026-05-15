@@ -532,6 +532,82 @@ func TestEnsureActivePriorityLead_FallsBackToServerSelectOnCacheMiss(t *testing.
 	}
 }
 
+// gatewayChassisUpdates returns the Gateway_Chassis priority updates recorded
+// on the fake NB client.
+func gatewayChassisUpdates(tx [][]ovsdb.Operation) []ovsdb.Operation {
+	var updates []ovsdb.Operation
+	for _, batch := range tx {
+		for _, op := range batch {
+			if op.Op == ovsdb.OperationUpdate && op.Table == "Gateway_Chassis" {
+				updates = append(updates, op)
+			}
+		}
+	}
+	return updates
+}
+
+// TestEnsureActivePriorityLead_SkipsBoostWhenCRPortMovedAway covers the
+// anti-ratchet guard: the local Gateway_Chassis row trails the peer, so the
+// reconcile snapshot would boost — but SB shows the chassisredirect port has
+// already migrated to the peer. Boosting a no-longer-active chassis would
+// create a higher-priority tie, so the boost must be skipped.
+func TestEnsureActivePriorityLead_SkipsBoostWhenCRPortMovedAway(t *testing.T) {
+	c, nb, sb := newOVNClientWithFakes(t, "host-a")
+
+	nb.setRows("Gateway_Chassis",
+		&NBGatewayChassis{UUID: "g1", Name: "lrp-a_host-a", ChassisName: "host-a", Priority: 1},
+		&NBGatewayChassis{UUID: "g2", Name: "lrp-a_host-b", ChassisName: "host-b", Priority: 5},
+	)
+	sb.setRows("Chassis",
+		&SBChassis{UUID: "ch-a", Name: "ch-a", Hostname: "host-a"},
+		&SBChassis{UUID: "ch-b", Name: "ch-b", Hostname: "host-b"},
+	)
+	// The chassisredirect port for lrp-a is bound to host-b, not host-a.
+	sb.setRows("Port_Binding", &SBPortBinding{
+		UUID: "pb-1", LogicalPort: "cr-lrp-a", Type: "chassisredirect", Chassis: strPtr("ch-b"),
+	})
+
+	err := c.EnsureActivePriorityLead(context.Background(),
+		[]LocalRouterInfo{{LRPName: "lrp-a", CRPort: "cr-lrp-a"}}, "host-a")
+	if err != nil {
+		t.Fatalf("EnsureActivePriorityLead: %v", err)
+	}
+
+	if got := gatewayChassisUpdates(nb.recordedTransacts()); len(got) != 0 {
+		t.Errorf("must not boost when the chassisredirect port moved away, got %+v", got)
+	}
+}
+
+// TestEnsureActivePriorityLead_BoostsWhenCRPortConfirmedLocal is the companion:
+// the same trailing priority, but SB confirms the chassisredirect port is
+// still bound here, so the boost proceeds.
+func TestEnsureActivePriorityLead_BoostsWhenCRPortConfirmedLocal(t *testing.T) {
+	c, nb, sb := newOVNClientWithFakes(t, "host-a")
+
+	nb.setRows("Gateway_Chassis",
+		&NBGatewayChassis{UUID: "g1", Name: "lrp-a_host-a", ChassisName: "host-a", Priority: 1},
+		&NBGatewayChassis{UUID: "g2", Name: "lrp-a_host-b", ChassisName: "host-b", Priority: 5},
+	)
+	sb.setRows("Chassis", &SBChassis{UUID: "ch-a", Name: "ch-a", Hostname: "host-a"})
+	sb.setRows("Port_Binding", &SBPortBinding{
+		UUID: "pb-1", LogicalPort: "cr-lrp-a", Type: "chassisredirect", Chassis: strPtr("ch-a"),
+	})
+
+	err := c.EnsureActivePriorityLead(context.Background(),
+		[]LocalRouterInfo{{LRPName: "lrp-a", CRPort: "cr-lrp-a"}}, "host-a")
+	if err != nil {
+		t.Fatalf("EnsureActivePriorityLead: %v", err)
+	}
+
+	updates := gatewayChassisUpdates(nb.recordedTransacts())
+	if len(updates) != 1 {
+		t.Fatalf("expected one boost when the port is locally bound, got %d: %+v", len(updates), updates)
+	}
+	if got, ok := updates[0].Row["priority"].(int); !ok || got != 6 {
+		t.Errorf("expected boost to 6 (max peer 5 + 1), got %#v", updates[0].Row["priority"])
+	}
+}
+
 // =============================================================================
 // RemoveManagedNBEntries
 // =============================================================================
