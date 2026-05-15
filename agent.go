@@ -573,12 +573,15 @@ func (a *Agent) ensureRoutes(desiredIPs []string) {
 		}
 	}
 
-	// Only trigger a BGP soft-refresh when routes were removed. For
-	// additions FRR's normal route redistribution announces the new
-	// static routes automatically. A blanket "clear ip bgp * soft out"
-	// re-evaluates outbound policy for ALL routes; doing this on every
-	// addition risks disrupting existing BGP announcements.
-	if len(delFRR) > 0 {
+	// Trigger a BGP soft-refresh whenever FRR routes were added or
+	// removed. On additions this pushes the new /32s out immediately
+	// instead of waiting for FRR's redistribution timing — critical on
+	// the takeover chassis during an HA failover, where every extra
+	// second of delay is external downtime. "clear ip bgp ... soft out"
+	// only re-evaluates outbound policy and re-sends; it never withdraws
+	// a route, so re-announcing the existing set alongside the new ones
+	// is harmless.
+	if len(addFRR) > 0 || len(delFRR) > 0 {
 		if err := a.routing.RefreshBGP(); err != nil {
 			slog.Warn("BGP soft-refresh failed, peers may wait for MRAI timer", "error", err)
 		}
