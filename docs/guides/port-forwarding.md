@@ -16,6 +16,10 @@ fwmarks, VRF crossing, packet-flow diagrams — see
 - **IP forwarding** on the veth interfaces — enabled automatically by the
   agent at startup.
 
+Port forwarding works whether or not the node is an OVN gateway. A node that
+should *only* expose VIPs can run with no OVN remotes configured at all — see
+[port-forward-only mode](configuration#port-forward-only-mode).
+
 ## Example configuration
 
 ```yaml
