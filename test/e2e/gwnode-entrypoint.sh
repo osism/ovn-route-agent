@@ -97,6 +97,27 @@ setup_vrf() {
     ip link set "${VRF_NAME}" up
 }
 
+setup_loopback() {
+    # The agent's port-forward feature manages VIP /32 addresses on a
+    # loopback device inside the provider VRF (default port_forward_dev:
+    # `loopback1`). reconcilePortForwardVIPs() looks the device up
+    # unconditionally as soon as `port_forwards:` is present in the
+    # config — even when no VIP has `manage_vip: true` — so the agent
+    # exits with "find device loopback1: Link not found" on startup if
+    # the device is missing. Production hosts provision it via
+    # systemd-networkd; the lab does not have systemd-networkd, so we
+    # create it here as a dummy interface enslaved to ${VRF_NAME}.
+    # Mirrors test/integration/setup.sh:create_loopback1 (the
+    # integration harness has the same requirement). Idempotent: re-runs
+    # on container restart simply re-assert the existing device.
+    log "ensuring loopback1 dummy device in ${VRF_NAME}"
+    if ! ip link show loopback1 >/dev/null 2>&1; then
+        ip link add loopback1 type dummy
+    fi
+    ip link set loopback1 master "${VRF_NAME}" 2>/dev/null || true
+    ip link set loopback1 up
+}
+
 start_frr() {
     log "starting FRR"
     # watchfrr keeps state under /var/tmp/frr; stale entries from a
@@ -149,6 +170,7 @@ main() {
     configure_ovs
     start_ovn_controller
     setup_vrf
+    setup_loopback
     start_frr
     configure_frr
 
