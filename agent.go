@@ -13,7 +13,10 @@ import (
 
 // Agent is the main OVN route synchronization agent.
 type Agent struct {
-	cfg     Config
+	cfg Config
+	// ovn is the OVN database client. It is nil in port-forward-only mode
+	// (cfg.PortForwardOnly), where the agent runs as a standalone VIP
+	// service without any OVN connection.
 	ovn     *OVNClient
 	routing *RouteManager
 
@@ -60,7 +63,11 @@ func NewAgent(cfg Config) (*Agent, error) {
 		staleCleanupJitter: time.Duration(rand.Int63n(int64(maxStaleCleanupJitter))),
 	}
 
-	a.ovn = NewOVNClient(cfg, a.triggerReconcile)
+	// In port-forward-only mode there is no OVN connection; a.ovn stays nil
+	// and every OVN-dependent step is gated on cfg.PortForwardOnly.
+	if !cfg.PortForwardOnly {
+		a.ovn = NewOVNClient(cfg, a.triggerReconcile)
+	}
 
 	return a, nil
 }
@@ -98,19 +105,24 @@ func connectWithRetry(ctx context.Context, connect func(context.Context) error, 
 // Run starts the agent: connects to OVN, runs initial reconciliation,
 // then loops on events and periodic reconciliation.
 func (a *Agent) Run(ctx context.Context) error {
-	// Verify that the bridge device exists and is up before proceeding.
-	if err := a.routing.CheckBridgeDevice(); err != nil {
-		return fmt.Errorf("bridge device check failed: %w", err)
-	}
+	// Bridge setup exists for FIP ARP resolution and is OVN-gateway
+	// specific. In port-forward-only mode the node need not have br-ex, so
+	// the bridge device, its link-local IP and proxy ARP are all skipped.
+	if !a.cfg.PortForwardOnly {
+		// Verify that the bridge device exists and is up before proceeding.
+		if err := a.routing.CheckBridgeDevice(); err != nil {
+			return fmt.Errorf("bridge device check failed: %w", err)
+		}
 
-	// Add a link-local IP to br-ex so the kernel can ARP on the interface.
-	if err := a.routing.EnsureBridgeIP(a.cfg.BridgeIP); err != nil {
-		return fmt.Errorf("ensure bridge IP: %w", err)
-	}
+		// Add a link-local IP to br-ex so the kernel can ARP on the interface.
+		if err := a.routing.EnsureBridgeIP(a.cfg.BridgeIP); err != nil {
+			return fmt.Errorf("ensure bridge IP: %w", err)
+		}
 
-	// Enable proxy ARP so the kernel responds to ARP requests for FIP addresses.
-	if err := a.routing.EnableProxyARP(); err != nil {
-		return fmt.Errorf("enable proxy ARP: %w", err)
+		// Enable proxy ARP so the kernel responds to ARP requests for FIP addresses.
+		if err := a.routing.EnableProxyARP(); err != nil {
+			return fmt.Errorf("enable proxy ARP: %w", err)
+		}
 	}
 
 	// Set up veth VRF leak for route leaking between default VRF and provider VRF.
@@ -123,21 +135,25 @@ func (a *Agent) Run(ctx context.Context) error {
 		return fmt.Errorf("port forward setup: %w", err)
 	}
 
-	if a.cfg.GatewayPort == "" {
-		slog.Info("tracking all chassisredirect ports (multi-router mode)")
+	if a.cfg.PortForwardOnly {
+		slog.Info("port-forward-only mode: serving configured VIPs without an OVN connection")
 	} else {
-		slog.Info("tracking single chassisredirect port", "gateway_port", a.cfg.GatewayPort)
-	}
+		if a.cfg.GatewayPort == "" {
+			slog.Info("tracking all chassisredirect ports (multi-router mode)")
+		} else {
+			slog.Info("tracking single chassisredirect port", "gateway_port", a.cfg.GatewayPort)
+		}
 
-	// Connect to OVN with retry.
-	if err := connectWithRetry(ctx, a.ovn.Connect, ovnConnectRetryInterval); err != nil {
-		return err
-	}
-	defer a.ovn.Close()
+		// Connect to OVN with retry.
+		if err := connectWithRetry(ctx, a.ovn.Connect, ovnConnectRetryInterval); err != nil {
+			return err
+		}
+		defer a.ovn.Close()
 
-	// Restore any gateway chassis priorities that were drained by a previous run.
-	if a.cfg.DrainOnShutdown {
-		a.ovn.RestoreDrainedGateways(ctx, a.ovn.GetState().LocalChassisName)
+		// Restore any gateway chassis priorities that were drained by a previous run.
+		if a.cfg.DrainOnShutdown {
+			a.ovn.RestoreDrainedGateways(ctx, a.ovn.GetState().LocalChassisName)
+		}
 	}
 
 	// Initial reconciliation
@@ -161,7 +177,8 @@ func (a *Agent) Run(ctx context.Context) error {
 		case <-ctx.Done():
 			// Drain must happen BEFORE cleanup and BEFORE OVN connection close.
 			// Use a fresh context since the parent ctx is already cancelled.
-			if a.cfg.DrainOnShutdown {
+			// Drain is OVN-specific and is skipped in port-forward-only mode.
+			if !a.cfg.PortForwardOnly && a.cfg.DrainOnShutdown {
 				drainCtx, drainCancel := context.WithTimeout(context.Background(), a.cfg.DrainTimeout)
 				slog.Info("drain mode active, migrating gateways away", "timeout", a.cfg.DrainTimeout)
 				drainStart := time.Now()
@@ -207,7 +224,13 @@ func (a *Agent) reconcile(ctx context.Context, trigger string) {
 		recordReconcile(trigger, time.Since(start))
 	}()
 
-	state := a.ovn.GetState()
+	// In port-forward-only mode there is no OVN client; a zero-value
+	// OVNState (no local routers, no SNAT IPs, no discovered networks)
+	// drives the rest of the cycle through the port-forward-only path.
+	var state OVNState
+	if a.ovn != nil {
+		state = a.ovn.GetState()
+	}
 
 	// Compute effective network filters for this cycle.
 	a.effectiveFilters = a.computeEffectiveNetworks(state.DiscoveredNetworks)
@@ -268,7 +291,13 @@ func (a *Agent) reconcile(ctx context.Context, trigger string) {
 		slog.Debug("desired IP list", "ips", desiredIPs)
 	}
 
-	if state.HasLocalRouters {
+	switch {
+	case a.cfg.PortForwardOnly:
+		// Port-forward-only mode: no OVN state to act on. OVS flows,
+		// gateway routing, and veth-leak/prefix-list network
+		// reconciliation are all OVN-driven and skipped entirely — only
+		// port forwarding and the VIP routes below are managed.
+	case state.HasLocalRouters:
 		// Ensure OVS MAC-tweak flows are in place (only when active).
 		if err := a.routing.EnsureOVSFlows(); err != nil {
 			slog.Error("failed to ensure OVS flows", "error", err)
@@ -310,7 +339,7 @@ func (a *Agent) reconcile(ctx context.Context, trigger string) {
 		if err := a.routing.ReconcileFRRPrefixList(a.effectiveFilters); err != nil {
 			slog.Error("failed to reconcile FRR prefix-list", "error", err)
 		}
-	} else {
+	default:
 		// No locally active routers — remove per-network veth leak and prefix-list entries.
 		if err := a.routing.ReconcileVethLeakNetworks(nil); err != nil {
 			slog.Error("failed to clean veth leak networks", "error", err)
@@ -341,7 +370,10 @@ func (a *Agent) reconcile(ctx context.Context, trigger string) {
 	// Check for stale chassis entries from dead nodes (runs on every agent).
 	// This runs after gateway routing reconciliation so that a surviving agent
 	// creates its own routes before removing entries from dead chassis.
-	a.cleanupStaleChassis(ctx, state.AllChassisNames)
+	// Skipped in port-forward-only mode: there is no OVN SB Chassis table.
+	if !a.cfg.PortForwardOnly {
+		a.cleanupStaleChassis(ctx, state.AllChassisNames)
+	}
 }
 
 // cleanupStaleChassis detects chassis that have disappeared from the SB Chassis
@@ -429,14 +461,24 @@ func (a *Agent) ensureRoutes(desiredIPs []string) {
 		desiredSet[ip] = true
 	}
 
+	// Kernel routes live on the provider bridge (br-ex). In
+	// port-forward-only mode the node need not have br-ex, so only FRR
+	// static routes are managed — the VIP is reachable as a local address
+	// on port_forward_dev, and the FRR route handles BGP announcement.
+	manageKernel := !a.cfg.PortForwardOnly
+
 	// Collect current state so we only add what is actually missing.
 	currentKernelSet := make(map[string]bool)
-	currentKernel, err := a.routing.ListKernelRoutes()
-	if err != nil {
-		slog.Error("failed to list kernel routes", "error", err)
-	} else {
-		for _, ip := range currentKernel {
-			currentKernelSet[ip] = true
+	var currentKernel []string
+	if manageKernel {
+		var err error
+		currentKernel, err = a.routing.ListKernelRoutes()
+		if err != nil {
+			slog.Error("failed to list kernel routes", "error", err)
+		} else {
+			for _, ip := range currentKernel {
+				currentKernelSet[ip] = true
+			}
 		}
 	}
 
@@ -453,7 +495,7 @@ func (a *Agent) ensureRoutes(desiredIPs []string) {
 	// Collect missing and stale routes, then apply in batches.
 	var addFRR []string
 	for _, ip := range desiredIPs {
-		needsKernel := !currentKernelSet[ip]
+		needsKernel := manageKernel && !currentKernelSet[ip]
 		needsFRR := !currentFRRSet[ip]
 
 		if !needsKernel && !needsFRR {
@@ -558,16 +600,19 @@ func (a *Agent) removeAllRoutes(reason string) {
 		}
 	}
 
-	// Remove kernel routes.
-	currentKernel, err := a.routing.ListKernelRoutes()
-	if err != nil {
-		slog.Error("failed to list kernel routes", "error", err)
-	} else {
-		for _, ip := range currentKernel {
-			if a.isManaged(ip) {
-				slog.Info("removing kernel route", "ip", ip, "reason", reason)
-				if err := a.routing.DelKernelRoute(ip); err != nil {
-					slog.Error("failed to remove kernel route", "ip", ip, "error", err)
+	// Remove kernel routes. Skipped in port-forward-only mode, which does
+	// not manage kernel routes on the provider bridge.
+	if !a.cfg.PortForwardOnly {
+		currentKernel, err := a.routing.ListKernelRoutes()
+		if err != nil {
+			slog.Error("failed to list kernel routes", "error", err)
+		} else {
+			for _, ip := range currentKernel {
+				if a.isManaged(ip) {
+					slog.Info("removing kernel route", "ip", ip, "reason", reason)
+					if err := a.routing.DelKernelRoute(ip); err != nil {
+						slog.Error("failed to remove kernel route", "ip", ip, "error", err)
+					}
 				}
 			}
 		}
@@ -589,11 +634,15 @@ func (a *Agent) cleanup() {
 		slog.Error("failed to cleanup FRR prefix-list", "error", err)
 	}
 
-	if err := a.routing.RemoveOVSFlows(); err != nil {
-		slog.Error("failed to remove OVS flows", "error", err)
-	}
-	if err := a.routing.CleanupRoutingTable(); err != nil {
-		slog.Error("failed to flush routing table", "error", err)
+	// OVS flows and the dedicated kernel routing table are OVN-gateway
+	// specific and never created in port-forward-only mode.
+	if !a.cfg.PortForwardOnly {
+		if err := a.routing.RemoveOVSFlows(); err != nil {
+			slog.Error("failed to remove OVS flows", "error", err)
+		}
+		if err := a.routing.CleanupRoutingTable(); err != nil {
+			slog.Error("failed to flush routing table", "error", err)
+		}
 	}
 	// Tear down port forwarding before veth leak (DNAT return route uses veth).
 	if err := a.routing.TeardownPortForward(); err != nil {
@@ -601,6 +650,11 @@ func (a *Agent) cleanup() {
 	}
 	if err := a.routing.TeardownVethLeak(); err != nil {
 		slog.Error("failed to tear down veth VRF leak", "error", err)
+	}
+
+	// The bridge IP and managed OVN NB entries only exist in full mode.
+	if a.cfg.PortForwardOnly {
+		return
 	}
 	if err := a.routing.RemoveBridgeIP(a.cfg.BridgeIP); err != nil {
 		slog.Error("failed to remove bridge IP", "error", err)
@@ -636,15 +690,19 @@ func (a *Agent) verifyRoutes(desiredIPs []string) int {
 		frrSet[ip] = true
 	}
 
-	// Re-read current kernel routes.
-	currentKernel, err := a.routing.ListKernelRoutes()
-	if err != nil {
-		slog.Error("post-change kernel route verification failed", "error", err)
-		return 0
-	}
-	kernelSet := make(map[string]bool, len(currentKernel))
-	for _, ip := range currentKernel {
-		kernelSet[ip] = true
+	// Re-read current kernel routes. In port-forward-only mode kernel
+	// routes are not managed (see ensureRoutes), so this is skipped.
+	manageKernel := !a.cfg.PortForwardOnly
+	kernelSet := make(map[string]bool)
+	if manageKernel {
+		currentKernel, err := a.routing.ListKernelRoutes()
+		if err != nil {
+			slog.Error("post-change kernel route verification failed", "error", err)
+			return 0
+		}
+		for _, ip := range currentKernel {
+			kernelSet[ip] = true
+		}
 	}
 
 	var reAddFRR []string
@@ -657,7 +715,7 @@ func (a *Agent) verifyRoutes(desiredIPs []string) int {
 			slog.Warn("FRR route missing after route change, re-adding", "ip", ip)
 			reAddFRR = append(reAddFRR, ip)
 		}
-		if !kernelSet[ip] {
+		if manageKernel && !kernelSet[ip] {
 			slog.Warn("kernel route missing after route change, re-adding", "ip", ip)
 			if err := a.routing.AddKernelRoute(ip); err != nil {
 				slog.Error("failed to re-add kernel route", "ip", ip, "error", err)

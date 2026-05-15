@@ -741,3 +741,103 @@ func TestReconcileCompletesPromptlyOnCancelledContext(t *testing.T) {
 		t.Errorf("effectiveFilters = %v, want [198.51.100.0/24]", a.effectiveFilters)
 	}
 }
+
+// portForwardOnlyConfig returns a minimal port-forward-only config (no OVN
+// remotes) suitable for the agent tests below.
+func portForwardOnlyConfig() Config {
+	return Config{
+		PortForwardOnly:    true,
+		PortForwardEnabled: true,
+		DryRun:             true,
+		CleanupOnShutdown:  true,
+		DrainOnShutdown:    true, // must be ignored: there is no OVN to drain
+		ReconcileInterval:  time.Hour,
+		VethNexthop:        "169.254.0.1",
+		VRFName:            "vrf-provider",
+		PortForwards: []PortForwardVIP{
+			{
+				VIP:       "198.51.100.10",
+				ManageVIP: true,
+				Rules:     []PortForwardRule{{Proto: "tcp", Port: 443, DestAddr: "10.0.0.100"}},
+			},
+		},
+	}
+}
+
+// TestNewAgentPortForwardOnlyHasNoOVNClient verifies that NewAgent does not
+// construct an OVN client in port-forward-only mode — the agent runs as a
+// standalone VIP service with no OVN connection.
+func TestNewAgentPortForwardOnlyHasNoOVNClient(t *testing.T) {
+	a, err := NewAgent(portForwardOnlyConfig())
+	if err != nil {
+		t.Fatalf("NewAgent() error: %v", err)
+	}
+	if a.ovn != nil {
+		t.Error("OVN client must not be created in port-forward-only mode")
+	}
+}
+
+// TestReconcilePortForwardOnly drives a reconcile cycle with no OVN client.
+// The cycle must complete without panicking on the nil client, derive an
+// empty OVN state, and leave effectiveFilters empty (nothing discovered).
+func TestReconcilePortForwardOnly(t *testing.T) {
+	cfg := portForwardOnlyConfig()
+	rm := NewRouteManager(cfg)
+	a := &Agent{
+		cfg:            cfg,
+		routing:        rm,
+		reconcileCh:    make(chan struct{}, 1),
+		missingChassis: make(map[string]time.Time),
+	}
+
+	a.reconcile(context.Background(), "test")
+
+	if len(a.effectiveFilters) != 0 {
+		t.Errorf("effectiveFilters should be empty in port-forward-only mode, got %v", a.effectiveFilters)
+	}
+}
+
+// TestCleanupPortForwardOnly verifies that cleanup() runs the port-forward
+// teardown path without dereferencing the nil OVN client (OVN NB cleanup is
+// skipped in port-forward-only mode).
+func TestCleanupPortForwardOnly(t *testing.T) {
+	cfg := portForwardOnlyConfig()
+	a := &Agent{
+		cfg:     cfg,
+		routing: NewRouteManager(cfg),
+	}
+	// Must not panic: a.ovn is nil and RemoveManagedNBEntries must be skipped.
+	a.cleanup()
+}
+
+// TestAgentRunPortForwardOnly exercises Run end-to-end in port-forward-only
+// mode with a pre-cancelled context: the agent starts (veth/port-forward
+// setup, startup reconcile), then the cancelled context drives it straight
+// into shutdown cleanup. It must never touch OVN and must return nil.
+func TestAgentRunPortForwardOnly(t *testing.T) {
+	cfg := portForwardOnlyConfig()
+	cfg.VethLeakEnabled = true
+
+	a, err := NewAgent(cfg)
+	if err != nil {
+		t.Fatalf("NewAgent() error: %v", err)
+	}
+	if a.ovn != nil {
+		t.Fatal("OVN client must not be created in port-forward-only mode")
+	}
+
+	ctx, cancel := context.WithCancel(context.Background())
+	cancel() // shut down immediately after the startup reconcile
+
+	done := make(chan error, 1)
+	go func() { done <- a.Run(ctx) }()
+
+	select {
+	case err := <-done:
+		if err != nil {
+			t.Fatalf("Run() returned error: %v", err)
+		}
+	case <-time.After(2 * time.Second):
+		t.Fatal("Run() did not return within 2s in port-forward-only mode")
+	}
+}
