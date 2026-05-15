@@ -144,6 +144,11 @@ type Config struct {
 	VethLeakTableID      int    // Routing table for leak default route (default: 200)
 	VethLeakRulePriority int    // Policy rule priority (default: 2000)
 
+	// PortForwardOnly is derived by validateMode: true when no OVN remotes
+	// are configured but port_forwards are. In this mode the agent runs as
+	// a standalone VIP service and skips all OVN-dependent work.
+	PortForwardOnly bool
+
 	// Port forwarding (DNAT) settings
 	PortForwardEnabled      bool             // derived: len(PortForwards) > 0
 	PortForwardDev          string           // loopback device for VIP addresses (default: "loopback1")
@@ -344,7 +349,60 @@ func loadConfig(args []string) (Config, error) {
 		return Config{}, err
 	}
 
+	// Derive the operating mode (full vs port-forward-only) and reject
+	// invalid OVN/port-forward combinations.
+	if err := validateMode(&cfg); err != nil {
+		return Config{}, err
+	}
+
 	return cfg, nil
+}
+
+// validateMode derives the agent's operating mode from the presence of OVN
+// remotes and port-forward configuration, setting Config.PortForwardOnly and
+// rejecting invalid combinations:
+//
+//	ovn_sb_remote + ovn_nb_remote   port_forwards   mode
+//	------------------------------- --------------- -----------------------
+//	both set                        any             full mode
+//	both empty                      non-empty       port-forward-only mode
+//	both empty                      empty           error — nothing to do
+//	exactly one set                 any             error — incomplete OVN
+//
+// In port-forward-only mode it additionally rejects masquerade options that
+// depend on OVN-derived state: router_masquerade has no router-SNAT-IP source
+// without OVN, and hairpin_masquerade needs an explicit network_cidr because
+// provider CIDRs are otherwise auto-discovered from OVN.
+func validateMode(cfg *Config) error {
+	sbSet := cfg.OVNSBRemote != ""
+	nbSet := cfg.OVNNBRemote != ""
+
+	switch {
+	case sbSet && nbSet:
+		cfg.PortForwardOnly = false
+	case !sbSet && !nbSet:
+		if len(cfg.PortForwards) == 0 {
+			return fmt.Errorf("nothing to do: set ovn-sb-remote and ovn-nb-remote for full mode, or configure port_forwards for port-forward-only mode")
+		}
+		cfg.PortForwardOnly = true
+	default:
+		return fmt.Errorf("incomplete OVN configuration: ovn-sb-remote and ovn-nb-remote must both be set, or both be empty to run in port-forward-only mode")
+	}
+
+	if !cfg.PortForwardOnly {
+		return nil
+	}
+
+	for i, pf := range cfg.PortForwards {
+		if pf.RouterMasquerade {
+			return fmt.Errorf("port_forwards[%d] (vip=%s): router_masquerade requires an OVN connection — router SNAT IPs cannot be discovered in port-forward-only mode", i, pf.VIP)
+		}
+		if pf.HairpinMasquerade && len(cfg.NetworkCIDRs) == 0 {
+			return fmt.Errorf("port_forwards[%d] (vip=%s): hairpin_masquerade in port-forward-only mode requires network_cidr to be set — provider CIDRs cannot be auto-discovered without OVN", i, pf.VIP)
+		}
+	}
+
+	return nil
 }
 
 func validateConfig(cfg *Config) error {
