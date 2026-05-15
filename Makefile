@@ -3,7 +3,7 @@ VERSION   ?= $(shell git describe --tags --always --dirty 2>/dev/null || echo "d
 LDFLAGS   := -s -w -X main.version=$(VERSION)
 GOFLAGS   := -trimpath
 
-.PHONY: all build build-static clean fmt vet test test-integration install docs-gen docs-gen-check e2e-images e2e-up e2e-down e2e-install-tools e2e-baseline e2e-failover e2e-hairpin e2e-pf-external e2e-stale-chassis
+.PHONY: all build build-static clean fmt vet test test-integration install docs-gen docs-gen-check e2e-images e2e-up e2e-down e2e-install-tools e2e-baseline e2e-failover e2e-hairpin e2e-pf-external e2e-pf-hairpin e2e-stale-chassis
 
 # Containerlab E2E harness. See test/e2e/README.md for the topology and
 # acceptance criteria (issue #44).
@@ -13,6 +13,7 @@ E2E_BASELINE    := test/e2e/scenarios/baseline.sh
 E2E_FAILOVER    := test/e2e/scenarios/failover.sh
 E2E_HAIRPIN     := test/e2e/scenarios/hairpin.sh
 E2E_PF_EXTERNAL := test/e2e/scenarios/pf-external.sh
+E2E_PF_HAIRPIN  := test/e2e/scenarios/pf-hairpin.sh
 E2E_STALE       := test/e2e/scenarios/stale-chassis.sh
 E2E_GWNODE_TAG  := ovn-network-agent/gwnode:e2e
 E2E_CENTRAL_TAG := ovn-network-agent/central:e2e
@@ -159,6 +160,20 @@ e2e-hairpin:
 # so a subsequent `make e2e-baseline` keeps passing.
 e2e-pf-external:
 	$(E2E_PF_EXTERNAL)
+
+# Run the port-forward hairpin scenario (issue #110) against a lab that
+# is already up. Adds a co-located workload (vmc behind FIP_C on
+# gateway-1) and a tenant-shim OVS internal port that gives the
+# chassis kernel a routed path into ls0, then drives two phases
+# against the agent's `hairpin_masquerade` flag: phase 1 (off) must
+# time out because the backend reply bypasses the chassis conntrack,
+# phase 2 (on) must succeed because the masquerade rule re-routes the
+# reply through the chassis. Each phase restarts the gateway-1
+# container so the agent reloads its config; the scenario's own EXIT
+# trap restores the baseline agent config and removes every NB/kernel
+# row added here so a subsequent `make e2e-baseline` keeps passing.
+e2e-pf-hairpin:
+	$(E2E_PF_HAIRPIN)
 
 # Run the stale-chassis cleanup scenario (issue #111) against a lab
 # that is already up. Hard-kills the priority-30 chassis (SIGKILL, no
