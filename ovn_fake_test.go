@@ -39,10 +39,12 @@ type fakeOVSDBClient struct {
 
 	// selectRows, when non-nil, supplies rows for OperationSelect ops keyed
 	// by table name, bypassing the cache view exposed via setRows/List. The
-	// drain fallback path uses Transact(OperationSelect) to read directly
-	// from the NB server when the cache appears incomplete (issue #115);
-	// tests populate this to simulate the "server has the row, cache does
-	// not" race.
+	// drain fallback and refreshState's cache-consistency guard use
+	// Transact(OperationSelect) to read directly from the server when the
+	// cache appears incomplete (issue #115); tests populate this to simulate
+	// the "server has the row, cache does not" race. When a table has no
+	// entry here, Transact synthesises a minimal _uuid-only row per cached
+	// model, i.e. the server view is modelled as identical to the cache.
 	selectRows map[string][]ovsdb.Row
 
 	// onTransact is invoked synchronously for each Transact call (after the
@@ -184,7 +186,6 @@ func (f *fakeOVSDBClient) Transact(_ context.Context, ops ...ovsdb.Operation) ([
 	f.mu.Lock()
 	f.transacts = append(f.transacts, append([]ovsdb.Operation(nil), ops...))
 	hook := f.onTransact
-	selectRows := f.selectRows
 	f.mu.Unlock()
 
 	if hook != nil {
@@ -196,10 +197,24 @@ func (f *fakeOVSDBClient) Transact(_ context.Context, ops ...ovsdb.Operation) ([
 	if f.opResults != nil {
 		return f.opResults, nil
 	}
+
+	f.mu.Lock()
+	defer f.mu.Unlock()
 	results := make([]ovsdb.OperationResult, len(ops))
 	for i, op := range ops {
-		if op.Op == ovsdb.OperationSelect {
-			results[i].Rows = append([]ovsdb.Row(nil), selectRows[op.Table]...)
+		if op.Op != ovsdb.OperationSelect {
+			continue
+		}
+		if rows, ok := f.selectRows[op.Table]; ok {
+			results[i].Rows = append([]ovsdb.Row(nil), rows...)
+			continue
+		}
+		// No explicit override: model the server view as identical to the
+		// cache. refreshState's consistency check only reads _uuid here, so
+		// one minimal row per cached model is enough to signal "no drift".
+		for _, m := range f.rows[op.Table] {
+			results[i].Rows = append(results[i].Rows,
+				ovsdb.Row{"_uuid": ovsdb.UUID{GoUUID: uuidOfModel(m)}})
 		}
 	}
 	return results, nil
