@@ -621,6 +621,10 @@ func (o *OVNClient) CleanupStaleChassisManagedEntries(ctx context.Context, stale
 // SB Port_Binding table until all gateways have moved away or the context
 // deadline is exceeded.
 //
+// Once the ports have migrated, it holds for cfg.DrainSettleDelay before
+// returning (see settleAfterDrain) so the caller does not withdraw this
+// chassis' BGP routes before the takeover chassis is ready to forward.
+//
 // On the next startup, RestoreDrainedGateways sets drained entries back to
 // priority 1 (standby level) so the chassis rejoins the HA group.
 // EnsureActivePriorityLead prevents reverse failover by ensuring the
@@ -697,6 +701,7 @@ func (o *OVNClient) DrainGateways(ctx context.Context, localChassisName string) 
 		}
 		if remaining == 0 {
 			slog.Info("drain: complete, all gateways migrated away")
+			o.settleAfterDrain(ctx)
 			return nil
 		}
 		slog.Info("drain: waiting for gateway migration", "remaining_gateways", remaining)
@@ -707,6 +712,31 @@ func (o *OVNClient) DrainGateways(ctx context.Context, localChassisName string) 
 			return nil
 		case <-ticker.C:
 		}
+	}
+}
+
+// settleAfterDrain pauses for cfg.DrainSettleDelay after the drain has
+// confirmed that all chassisredirect ports migrated away. During the hold
+// this chassis still advertises its FIP /32 routes and keeps its OVS flows,
+// so it continues forwarding external traffic — hairpinning to the new
+// gateway chassis over the tunnel — while the takeover chassis finishes its
+// OVN flow programming, reconcile and BGP advertisement. Without the hold,
+// cleanup() would withdraw the routes the instant the ports moved, before
+// the takeover chassis is ready, blackholing external traffic for the gap.
+//
+// The wait is bounded by ctx (the drain context), so the settle never
+// pushes total shutdown past drain_timeout. A delay of 0 disables the hold.
+func (o *OVNClient) settleAfterDrain(ctx context.Context) {
+	if o.cfg.DrainSettleDelay <= 0 {
+		return
+	}
+	slog.Info("drain: holding before cleanup so the takeover chassis can settle",
+		"settle_delay", o.cfg.DrainSettleDelay)
+	timer := time.NewTimer(o.cfg.DrainSettleDelay)
+	defer timer.Stop()
+	select {
+	case <-ctx.Done():
+	case <-timer.C:
 	}
 }
 

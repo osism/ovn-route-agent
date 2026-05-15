@@ -944,6 +944,53 @@ func TestDrainGateways_FallbackReturnsErrorOnTransactFailure(t *testing.T) {
 	}
 }
 
+// TestDrainGateways_SettleDelayHoldsBeforeReturn verifies that once the SB
+// shows all chassisredirect ports migrated away, DrainGateways holds for
+// cfg.DrainSettleDelay before returning so the caller does not withdraw BGP
+// routes before the takeover chassis is ready.
+func TestDrainGateways_SettleDelayHoldsBeforeReturn(t *testing.T) {
+	c, nb, sb := newOVNClientWithFakes(t, "host-a")
+	c.cfg.DrainSettleDelay = 80 * time.Millisecond
+
+	nb.setRows("Gateway_Chassis",
+		&NBGatewayChassis{UUID: "g1", Name: "lrp-a_host-a", ChassisName: "host-a", Priority: 5},
+	)
+	// SB shows no chassisredirect ports for host-a → first poll returns 0.
+	sb.setRows("Chassis", &SBChassis{UUID: "ch-a", Name: "ch-a", Hostname: "host-a"})
+
+	start := time.Now()
+	if err := c.DrainGateways(context.Background(), "host-a"); err != nil {
+		t.Fatalf("DrainGateways: %v", err)
+	}
+	elapsed := time.Since(start)
+	if elapsed < c.cfg.DrainSettleDelay {
+		t.Errorf("drain returned after %v, want at least the settle delay %v", elapsed, c.cfg.DrainSettleDelay)
+	}
+	if elapsed > 2*time.Second {
+		t.Errorf("drain blocked too long: %v (settle delay is %v)", elapsed, c.cfg.DrainSettleDelay)
+	}
+}
+
+// TestDrainGateways_SettleDelaySkippedWhenNothingToDrain ensures the settle
+// hold only applies after an actual migration: when there is nothing to
+// drain (non-HA / single-chassis / already drained) the function still
+// returns immediately even with a long settle delay configured.
+func TestDrainGateways_SettleDelaySkippedWhenNothingToDrain(t *testing.T) {
+	c, nb, _ := newOVNClientWithFakes(t, "host-a")
+	c.cfg.DrainSettleDelay = 30 * time.Second
+	nb.setRows("Gateway_Chassis",
+		&NBGatewayChassis{UUID: "g1", ChassisName: "host-b", Priority: 5},
+	)
+
+	start := time.Now()
+	if err := c.DrainGateways(context.Background(), "host-a"); err != nil {
+		t.Fatalf("DrainGateways: %v", err)
+	}
+	if elapsed := time.Since(start); elapsed > time.Second {
+		t.Errorf("drain held for %v with nothing to drain; settle delay must not apply", elapsed)
+	}
+}
+
 // TestSelectLocalGatewayChassis_DecodesRowFields covers the rowToGatewayChassis
 // decoder for the priority types it must accept: float64 (JSON wire format)
 // and int (in-process fakes / mappers).
