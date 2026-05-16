@@ -210,6 +210,14 @@ type OVNClient struct {
 	// loopDone is closed when refreshLoop exits. Set by Connect() before
 	// starting the loop; nil before Connect() succeeds.
 	loopDone chan struct{}
+
+	// failoverObservedAt holds the wall-clock time (UnixNano) at which a
+	// chassisredirect change was first observed in the immediate-refresh
+	// path. The takeover reconcile consumes it via takeFailoverObservedAt
+	// to record the failover-announce latency metric. Atomic because it is
+	// stamped from cache event-handler goroutines and read by the reconcile
+	// loop; 0 means no observation is pending.
+	failoverObservedAt atomic.Int64
 }
 
 func NewOVNClient(cfg Config, onChange func()) *OVNClient {
@@ -733,11 +741,30 @@ func (o *OVNClient) immediateStateRefresh() {
 	if !o.ready.Load() {
 		return // not fully connected yet
 	}
+	// Stamp the first chassisredirect observation of this failover window so
+	// the takeover reconcile can measure the announce latency. CompareAndSwap
+	// keeps the earliest timestamp; takeFailoverObservedAt clears it back to 0
+	// once a reconcile has consumed it.
+	o.failoverObservedAt.CompareAndSwap(0, time.Now().UnixNano())
 	select {
 	case o.immediateCh <- struct{}{}:
 	default:
 		// already queued
 	}
+}
+
+// takeFailoverObservedAt atomically consumes the timestamp stamped by
+// immediateStateRefresh on the most recent chassisredirect change, returning
+// the zero Time when nothing is pending. The reconcile loop calls this once
+// per cycle: the stamp lives only until the next reconcile, so a
+// chassisredirect change observed by a chassis that is not the failover
+// target cannot leak into a later, unrelated announce.
+func (o *OVNClient) takeFailoverObservedAt() time.Time {
+	ns := o.failoverObservedAt.Swap(0)
+	if ns == 0 {
+		return time.Time{}
+	}
+	return time.Unix(0, ns)
 }
 
 // =============================================================================

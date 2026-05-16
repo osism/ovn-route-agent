@@ -919,6 +919,38 @@ func TestImmediateStateRefreshIgnoresNotReady(t *testing.T) {
 	if got := len(c.immediateCh); got != 0 {
 		t.Errorf("immediateCh should remain empty when not ready, got len = %d", got)
 	}
+	if !c.takeFailoverObservedAt().IsZero() {
+		t.Error("a not-ready immediateStateRefresh must not stamp a failover timestamp")
+	}
+}
+
+// TestImmediateStateRefreshStampsFailoverObservedAt verifies that the
+// immediate-refresh path records the chassisredirect-observed timestamp and
+// that repeated observations keep the earliest one until it is consumed.
+func TestImmediateStateRefreshStampsFailoverObservedAt(t *testing.T) {
+	c, _, _ := newOVNClientWithFakes(t, "host-a")
+	c.ready.Store(true)
+
+	before := time.Now()
+	c.immediateStateRefresh()
+	first := time.Unix(0, c.failoverObservedAt.Load())
+	if first.Before(before) || first.After(time.Now()) {
+		t.Errorf("failoverObservedAt = %v, want within the call window", first)
+	}
+
+	// A second observation before the first is consumed keeps the earliest.
+	c.immediateStateRefresh()
+	if got := time.Unix(0, c.failoverObservedAt.Load()); !got.Equal(first) {
+		t.Errorf("second observation changed the timestamp: %v != %v", got, first)
+	}
+
+	// takeFailoverObservedAt consumes and clears the stamp.
+	if got := c.takeFailoverObservedAt(); !got.Equal(first) {
+		t.Errorf("takeFailoverObservedAt = %v, want %v", got, first)
+	}
+	if !c.takeFailoverObservedAt().IsZero() {
+		t.Error("takeFailoverObservedAt must return the zero Time once consumed")
+	}
 }
 
 // TestRefreshLoopDebouncePath drives the loop through the full debounce →
