@@ -298,7 +298,13 @@ S>* 198.51.100.99/32 [1/0] via 169.254.0.1, veth-default, weight 1, 00:00:01
 	a := &Agent{routing: rm, effectiveFilters: []*net.IPNet{cidr}}
 
 	// Desired: 198.51.100.10 (new) and 198.51.100.20 (already in FRR).
-	a.ensureRoutes([]string{"198.51.100.10", "198.51.100.20"})
+	res := a.ensureRoutes([]string{"198.51.100.10", "198.51.100.20"})
+	if !res.changed {
+		t.Error("routeSyncResult.changed = false, want true (routes were added and removed)")
+	}
+	if !res.announced {
+		t.Error("routeSyncResult.announced = false, want true (an FRR route was added)")
+	}
 
 	var sawAdd, sawDel, sawRefresh bool
 	for _, c := range rec.calls {
@@ -323,6 +329,56 @@ S>* 198.51.100.99/32 [1/0] via 169.254.0.1, veth-default, weight 1, 00:00:01
 	}
 	if !sawRefresh {
 		t.Errorf("expected BGP refresh after deletes, got calls: %v", rec.calls)
+	}
+}
+
+// TestEnsureRoutesKeepsAnnounceSeparateFromRouteAdd verifies that a takeover
+// reconcile with only additions issues the FRR route-add and the BGP
+// soft-refresh as two separate vtysh invocations. Bundling them into one
+// process makes the soft-refresh race the static→BGP redistribution, so the
+// freshly added /32s miss the immediate re-advertise (issue #131 follow-up).
+func TestEnsureRoutesKeepsAnnounceSeparateFromRouteAdd(t *testing.T) {
+	rec := newVtyshRecorder()
+	// FRR has no static routes yet — every desired route is a pure addition.
+	rec.on(
+		[]string{"vtysh", "-c", "show ip route vrf vrf-provider static"},
+		"",
+		nil,
+	)
+	rm := &RouteManager{
+		bridgeDev:     "ovnagent-nonexistent-br",
+		vrfName:       "vrf-provider",
+		vethNexthop:   "169.254.0.1",
+		execVtyshHook: rec.hook(),
+	}
+	a := &Agent{routing: rm}
+
+	res := a.ensureRoutes([]string{"198.51.100.10", "198.51.100.20"})
+	if !res.announced || !res.changed {
+		t.Fatalf("routeSyncResult = %+v, want changed+announced", res)
+	}
+
+	var addCall, refreshCall, bundled int
+	for _, c := range rec.calls {
+		joined := strings.Join(c, " ")
+		hasAdd := strings.Contains(joined, "ip route 198.51.100.10/32") &&
+			!strings.Contains(joined, "no ip route")
+		hasRefresh := strings.Contains(joined, "clear ip bgp vrf vrf-provider")
+		if hasAdd {
+			addCall++
+		}
+		if hasRefresh {
+			refreshCall++
+		}
+		if hasAdd && hasRefresh {
+			bundled++
+		}
+	}
+	if addCall != 1 || refreshCall != 1 {
+		t.Errorf("expected one route-add and one BGP refresh call, got add=%d refresh=%d (calls: %v)", addCall, refreshCall, rec.calls)
+	}
+	if bundled != 0 {
+		t.Errorf("route-add and BGP refresh must not share a vtysh call: %v", rec.calls)
 	}
 }
 
@@ -739,6 +795,93 @@ func TestReconcileCompletesPromptlyOnCancelledContext(t *testing.T) {
 	// would leave the agent half-initialised on the next tick.
 	if len(a.effectiveFilters) != 1 || a.effectiveFilters[0].String() != "198.51.100.0/24" {
 		t.Errorf("effectiveFilters = %v, want [198.51.100.0/24]", a.effectiveFilters)
+	}
+}
+
+// takeoverAgent builds an Agent whose OVN state has one locally-active
+// router, so a reconcile cycle takes the HasLocalRouters branch and the
+// announce adds the router's FIP /32 to FRR. The RouteManager is in
+// dry-run, so the FRR/kernel helpers are no-ops.
+func takeoverAgent(t *testing.T) (*Agent, *OVNClient) {
+	t.Helper()
+	_, cidr, _ := net.ParseCIDR("198.51.100.0/24")
+	rm := &RouteManager{
+		bridgeDev:   "br-ex",
+		vrfName:     "vrf-provider",
+		vethNexthop: "169.254.0.1",
+		dryRun:      true,
+	}
+	c, _, _ := newOVNClientWithFakes(t, "host-a")
+	c.state.LocalRouters = []LocalRouterInfo{{
+		RouterName:  "router1",
+		LRPName:     "lrp-abc",
+		LRPMAC:      "aa:aa:aa:aa:aa:aa",
+		LRPNetworks: []string{"198.51.100.0/24"},
+	}}
+	c.state.HasLocalRouters = true
+	c.state.DiscoveredNetworks = []*net.IPNet{cidr}
+	a := &Agent{
+		cfg:            Config{},
+		ovn:            c,
+		routing:        rm,
+		reconcileCh:    make(chan struct{}, 1),
+		missingChassis: make(map[string]time.Time),
+	}
+	return a, c
+}
+
+// failoverAnnounceSampleCount returns the observation count of the
+// ovn_network_agent_failover_announce_seconds histogram.
+func failoverAnnounceSampleCount(t *testing.T, m *metricsRegistry) uint64 {
+	t.Helper()
+	got, _ := m.registry.Gather()
+	for _, mf := range got {
+		if mf.GetName() == "ovn_network_agent_failover_announce_seconds" {
+			return mf.GetMetric()[0].GetHistogram().GetSampleCount()
+		}
+	}
+	t.Fatal("failover_announce_seconds histogram missing from registry")
+	return 0
+}
+
+// TestReconcileRecordsFailoverAnnounceMetric verifies that a takeover
+// reconcile triggered by a chassisredirect change records the
+// failover-announce latency, and consumes the timestamp exactly once.
+func TestReconcileRecordsFailoverAnnounceMetric(t *testing.T) {
+	m := withTestMetrics(t)
+	a, c := takeoverAgent(t)
+
+	// A chassisredirect change was observed ~400ms ago.
+	c.failoverObservedAt.Store(time.Now().Add(-400 * time.Millisecond).UnixNano())
+
+	a.reconcile(context.Background(), "event")
+	if got := failoverAnnounceSampleCount(t, m); got != 1 {
+		t.Fatalf("failover_announce_seconds count after takeover = %d, want 1", got)
+	}
+
+	// The timestamp is consumed: a follow-up reconcile with no new
+	// observation must not record another sample.
+	a.reconcile(context.Background(), "event")
+	if got := failoverAnnounceSampleCount(t, m); got != 1 {
+		t.Errorf("failover_announce_seconds count after second reconcile = %d, want 1", got)
+	}
+}
+
+// TestReconcileSkipsFailoverMetricOnStartup verifies that the startup
+// reconcile never records a failover-announce sample, even though it adds
+// FRR routes — startup is not a failover.
+func TestReconcileSkipsFailoverMetricOnStartup(t *testing.T) {
+	m := withTestMetrics(t)
+	a, c := takeoverAgent(t)
+	c.failoverObservedAt.Store(time.Now().UnixNano())
+
+	a.reconcile(context.Background(), "startup")
+	if got := failoverAnnounceSampleCount(t, m); got != 0 {
+		t.Errorf("failover_announce_seconds count after startup = %d, want 0", got)
+	}
+	// The startup cycle still consumes the timestamp so it cannot leak.
+	if !c.takeFailoverObservedAt().IsZero() {
+		t.Error("startup reconcile must consume the failover timestamp")
 	}
 }
 
