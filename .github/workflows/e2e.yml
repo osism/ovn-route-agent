@@ -142,6 +142,72 @@ jobs:
         if: always()
         run: make e2e-down
 
+  failover-strict:
+    name: HA failover (strict ~2s outage budget)
+    runs-on: ubuntu-latest
+    # Runs in parallel with failover (both gate on baseline) so a
+    # failover-latency regression is reported in isolation from the
+    # plain re-election path. Same 15-minute budget — the strict
+    # variant adds only the ~40s ping-flood window of issue #131 on
+    # top of the baseline gate.
+    needs: baseline
+    timeout-minutes: 15
+
+    env:
+      E2E_TOPOLOGY: test/e2e/topology.clab.yml
+      LAB: ovn-e2e
+
+    steps:
+      - uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6
+
+      - name: Install containerlab
+        run: bash -c "$(curl -sL https://get.containerlab.dev)"
+
+      # See the baseline job for the rationale; same modules required.
+      - name: Load required kernel modules
+        run: |
+          set -euo pipefail
+          sudo modprobe openvswitch
+          if ! sudo modprobe vrf 2>/dev/null; then
+            sudo apt-get update -qq
+            sudo apt-get install -y "linux-modules-extra-$(uname -r)"
+            sudo modprobe vrf
+          fi
+
+      - name: Bring the lab up
+        run: make e2e-up
+
+      - name: Run strict failover scenario
+        # LOSS_BUDGET switches failover.sh into the strict variant: a
+        # 0.1s-spaced ping flood from client-1 is captured with tcpdump
+        # across the re-election and the largest reply gap must stay
+        # within the budget (issue #131). The pcap is directed into the
+        # shared artifact root so collect-artifacts.sh and the uploader
+        # both pick it up. `runner.temp` is only available at step
+        # scope, not the job-level env block.
+        env:
+          LOSS_BUDGET: "2"
+          ARTIFACTS_DIR: ${{ runner.temp }}/e2e-artifacts/failover-strict
+        run: ./test/e2e/scenarios/failover.sh
+
+      - name: Collect failure artifacts
+        if: failure()
+        run: |
+          ./test/e2e/scenarios/collect-artifacts.sh "${RUNNER_TEMP}/e2e-artifacts"
+
+      - name: Upload failure artifacts
+        if: failure()
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7
+        with:
+          name: e2e-artifacts-failover-strict-${{ github.run_id }}-${{ github.run_attempt }}
+          path: ${{ runner.temp }}/e2e-artifacts
+          if-no-files-found: warn
+          retention-days: 7
+
+      - name: Tear the lab down
+        if: always()
+        run: make e2e-down
+
   hairpin:
     name: Same-chassis hairpin (two FIPs on master)
     runs-on: ubuntu-latest
